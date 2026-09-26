@@ -32,7 +32,6 @@ import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
-import { createDanmuOverlayForHost } from "@/components/player/danmuOverlay";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useFollow, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
@@ -1027,7 +1026,9 @@ export function MainPlayer({
         if (!isSessionActive(sessionId)) return;
         if (mpvOk) {
           try {
-            const overlay = createDanmuOverlayForHost(
+            // 动态 import：danmu.js 依赖 window，不能静态引入（SSR 预渲染会崩）
+            const overlayMod: any = await import("@/components/player/danmuOverlay");
+            const overlay = overlayMod.createDanmuOverlayForHost(
               playerContainerRef.current,
               danmuSettings,
               isDanmuEnabled
