@@ -1,6 +1,6 @@
 [package]
 name = "dtv_x"
-version = "0.1.0"
+version = "0.1.1"
 description = "DTV X - Live Stream Client"
 authors = ["cookie-kangd"]
 edition = "2021"
@@ -38,7 +38,7 @@ window-vibrancy = "0.7.1"
  urlencoding = "2.1.0"
  percent-encoding = "2.1"
  serde_urlencoded = "0.7"
- reqwest = { version = "0.11", features = ["json", "stream", "cookies", "brotli", "gzip", "blocking"] }
+ reqwest = { version = "0.12", features = ["json", "stream", "cookies", "brotli", "gzip", "blocking"] }
  actix-web = "4"
  actix-cors = "0.7"
  awc = { version = "3.4.0", features = ["tls-rustls-0_22"] }

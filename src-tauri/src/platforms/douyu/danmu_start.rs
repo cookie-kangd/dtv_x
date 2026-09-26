@@ -200,7 +200,26 @@ impl DanmakuClient {
         let mut backoff_secs = 1u64;
 
         loop {
-            let outcome = self.run_connection(&mut stop_rx).await?;
+            // 连接建立阶段失败（TCP/TLS/握手）也走退避重试，避免监听器永久死亡
+            let outcome = match self.run_connection(&mut stop_rx).await {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!(
+                        "[Douyu Danmaku {}] Connection failed: {}. Retrying in {}s.",
+                        self.room_id, e, backoff_secs
+                    );
+                    let sleep_fut = sleep(Duration::from_secs(backoff_secs));
+                    tokio::select! {
+                        _ = sleep_fut => {}
+                        _ = &mut stop_rx => {
+                            eprintln!("[Douyu Danmaku {}] Stop signal received during backoff.", self.room_id);
+                            break;
+                        }
+                    }
+                    backoff_secs = (backoff_secs * 2).min(30);
+                    continue;
+                }
+            };
             match outcome {
                 ConnectionOutcome::Stop => {
                     eprintln!("[Douyu Danmaku {}] Listener stopped.", self.room_id);

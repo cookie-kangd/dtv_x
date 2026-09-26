@@ -134,6 +134,14 @@ impl BiliLiveClient {
         );
         if head_1.operation == 5 || head_1.operation == 8 {
             loop {
+                // 边界保护：帧头(16B)与整帧必须都完整落在缓冲区内，
+                // 残包/截断帧直接丢弃，避免网络数据驱动的切片 panic
+                if (head_1.pack_len as usize) < 16
+                    || offset + 16 > resv.len()
+                    || offset + (head_1.pack_len as usize) > resv.len()
+                {
+                    break;
+                }
                 let body: &[u8] = &resv[offset + 16..offset + (head_1.pack_len as usize)];
                 ws_debug!(
                     "[websocket] chunk offset={} pack_len={} ver={} op={}",
@@ -148,6 +156,9 @@ impl BiliLiveClient {
                 }
                 offset += head_1.pack_len as usize;
                 if offset >= resv.len() {
+                    break;
+                }
+                if offset + 16 > resv.len() {
                     break;
                 }
                 let temp_head = &resv[offset..(offset + 16)];

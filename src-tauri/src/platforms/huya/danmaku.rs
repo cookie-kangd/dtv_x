@@ -135,6 +135,8 @@ pub async fn start_huya_danmaku_listener(
         let mut backoff_secs = 1u64;
 
         loop {
+            // 记录本轮尝试起点：若连接稳定存活超过 60s 才断线，说明网络已恢复，重置退避
+            let attempt_started = std::time::Instant::now();
             let result: anyhow::Result<ConnectionOutcome> = async {
                 let (ws_url, reg_data) = get_ws_info_tars(&room_id_clone)
                     .await
@@ -209,7 +211,7 @@ pub async fn start_huya_danmaku_listener(
             }
             .await;
 
-            match result {
+            match &result {
                 Ok(ConnectionOutcome::Stop) => break,
                 Ok(ConnectionOutcome::Disconnected) => {
                     warn!(
@@ -223,6 +225,13 @@ pub async fn start_huya_danmaku_listener(
                         e, backoff_secs
                     );
                 }
+            }
+
+            // 稳定运行超过 60s 后才断线：重置退避，下次断线立即快速重连
+            if matches!(&result, Ok(ConnectionOutcome::Disconnected))
+                && attempt_started.elapsed().as_secs() >= 60
+            {
+                backoff_secs = 1;
             }
 
             let sleep_fut = sleep(Duration::from_secs(backoff_secs));
