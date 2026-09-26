@@ -2431,3 +2431,95 @@ video.xgplayer-video {
 :root[data-theme="light"] .streamer-info-offline {
   border-bottom: 1px solid var(--border-color-light, #e0e0e0);
 }
+
+/* ===================== MPV 内核模式 ===================== */
+
+/* 播放期间：HTML 根背景透明，露出底下的 mpv 原生子窗口 */
+body.mpv-active,
+html.mpv-active {
+  background: transparent !important;
+}
+
+/* 视频区域祖先链上的背景全部清空（"透明洞"路径），JS 运行时逐层打标 */
+html.mpv-active .mpv-hole {
+  background: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+/* mpv 模式弹幕层：绝对定位铺满视频区域 */
+.video-player.mpv-mode .player-danmu-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  pointer-events: none;
+}
+
+/* mpv 控制条（替代 xgplayer 控制栏） */
+.mpv-controls {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: rgba(20, 20, 24, 0.82);
+  color: #fff;
+  backdrop-filter: blur(8px);
+  user-select: none;
+}
+
+.mpv-controls button,
+.mpv-controls select {
+  background: transparent;
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mpv-controls button {
+  min-width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+
+.mpv-controls button:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.mpv-controls select {
+  height: 28px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0 6px;
+}
+
+.mpv-controls select option {
+  color: #111;
+  background: #fff;
+}
+
+.mpv-controls .mpv-volume {
+  width: 80px;
+  accent-color: #4d9fff;
+  cursor: pointer;
+}
+
+.mpv-controls .mpv-engine-badge {
+  font-size: 11px;
+  font-weight: 800;
+  color: #4d9fff;
+  padding: 2px 8px;
+  border: 1px solid rgba(77, 159, 255, 0.5);
+  border-radius: 999px;
+  white-space: nowrap;
+}

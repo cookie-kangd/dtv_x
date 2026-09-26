@@ -1,6 +1,6 @@
 [package]
 name = "dtv_x"
-version = "0.1.1"
+version = "0.1.2"
 description = "DTV X - Live Stream Client"
 authors = ["cookie-kangd"]
 edition = "2021"
@@ -31,7 +31,6 @@ window-vibrancy = "0.7.1"
  tokio = { version = "1.37.0", features = ["full"] }
  tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
  url = "2.4"
- openssl-sys = { version = "0.9", features = ["vendored"] }
  native-tls = "0.2"
  rand = "0.8"
  futures-util = "0.3"
@@ -72,6 +71,16 @@ anyhow = "1.0"
 rfd = "0.15"
 local-ip-address = "0.6"
 mdns-sd = "0.13"
+# MPV 播放内核：运行时加载 libmpv-2.dll + 原生视频子窗口
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
 
 [profile.release]
 panic = "unwind"

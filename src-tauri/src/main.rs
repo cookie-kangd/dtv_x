@@ -17,6 +17,7 @@ mod sync_transfer;
 mod platforms;
 mod proxy;
 mod version_check;
+mod mpv_player;
 use platforms::common::{DouyinDanmakuState, FollowHttpClient, HuyaDanmakuState};
 use platforms::douyin::danmu::signature::generate_douyin_ms_token;
 use platforms::douyin::fetch_douyin_partition_rooms;
@@ -179,6 +180,16 @@ fn main() {
     panic::set_hook(Box::new(|info| {
         eprintln!("[panic] {}", info);
     }));
+    // 关键修复：禁用 WebView2/Chromium 的后台节流（计时器节流、遮挡判定、渲染降级）。
+    // 否则应用挂后台/最小化时 hls.js/flv.js 的拉流与保活计时器被冻结 → 直播断流卡住，
+    // 必须切回前台手动刷新。此环境变量在 WebView2 控制器创建前设置即可生效。
+    #[cfg(target_os = "windows")]
+    {
+        env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion",
+        );
+    }
     // Create a new HTTP client instance to be managed by Tauri
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
@@ -223,6 +234,7 @@ fn main() {
             .manage(StreamUrlStore::default())
             .manage(proxy::ProxyServerHandle::default())
             .manage(platforms::bilibili::state::BilibiliState::default())
+            .manage(mpv_player::MpvManager::default())
             .manage(lan_sync::LanSyncServerState::default())
             .invoke_handler(tauri::generate_handler![
                 get_stream_url_cmd,
@@ -276,6 +288,14 @@ fn main() {
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,
                 version_check::check_version_cmd,
+                mpv_player::mpv_is_available_cmd,
+                mpv_player::mpv_play_cmd,
+                mpv_player::mpv_stop_cmd,
+                mpv_player::mpv_set_rect_cmd,
+                mpv_player::mpv_pause_cmd,
+                mpv_player::mpv_set_volume_cmd,
+                mpv_player::mpv_set_mute_cmd,
+                mpv_player::mpv_time_pos_cmd,
             ])
             .run(tauri::generate_context!())
             .expect("error while running tauri application");

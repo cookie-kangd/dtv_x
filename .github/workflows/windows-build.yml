@@ -27,14 +27,23 @@ jobs:
 
       - name: Install protobuf (Windows)
         run: |
-          choco install protoc
+          choco install protoc --no-progress -y
           echo "C:\ProgramData\chocolatey\lib\protoc\tools" >> $env:GITHUB_PATH
 
-      - name: Install OpenSSL build prerequisites (Windows)
+      - name: Download libmpv-2.dll (MPV 播放内核)
+        shell: pwsh
         run: |
-          choco install strawberryperl nasm -y
-          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
-          echo "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
+          $headers = @{ "User-Agent" = "dtv-x-ci" }
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -Headers $headers
+          $asset = $rel.assets | Where-Object { $_.name -like "mpv-dev-x86_64-*.7z" } | Select-Object -First 1
+          if (-not $asset) { throw "mpv-dev asset not found" }
+          Write-Host "Downloading $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile mpv-dev.7z -UserAgent "dtv-x-ci"
+          $sz = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sz)) { choco install 7zip --no-progress -y; $sz = "7z" }
+          & $sz e mpv-dev.7z -osrc-tauri libmpv-2.dll -y
+          if (-not (Test-Path "src-tauri/libmpv-2.dll")) { throw "libmpv-2.dll extraction failed" }
+          Get-Item "src-tauri/libmpv-2.dll" | Select-Object Name, Length
 
       - name: Set rusty_v8 archive (Windows)
         run: |
@@ -95,3 +104,11 @@ jobs:
           args: --bundles nsis
           releaseDraft: false
           prerelease: false
+
+      - name: 写入中文更新说明（覆盖 release body）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          gh release edit "$TAG" --repo "${{ github.repository }}" --notes-file RELEASE_NOTES.md

@@ -63,6 +63,17 @@ export const ensureDanmuOverlayHost = (player: Player): HTMLElement | null => {
   return host;
 };
 
+// MPV 模式：在任意 DOM 容器上创建弹幕宿主（不依赖 xgplayer 实例）
+const ensureOverlayHostInContainer = (container: HTMLElement): HTMLElement | null => {
+  let host = container.querySelector('.player-danmu-overlay') as HTMLElement | null;
+  if (!host) {
+    host = document.createElement('div');
+    host.className = 'player-danmu-overlay';
+    container.appendChild(host);
+  }
+  return host;
+};
+
 export const applyDanmuOverlayPreferences = (
   overlay: DanmuOverlayInstance | null,
   danmuSettings: DanmuUserSettings,
@@ -137,6 +148,208 @@ export const syncDanmuEnabledState = (
   }
 };
 
+const createDanmuInstance = (
+  overlayHost: HTMLElement,
+  media: any,
+  settings: DanmuUserSettings,
+) => {
+  const initialFontSizePx = parseFontSizePx(settings.fontSize);
+  const initialChannelSize = computeChannelSize(initialFontSizePx);
+  const initialAreaEnd = sanitizeDanmuArea(settings.area);
+
+  return new DanmuJs({
+    container: overlayHost,
+    containerStyle: { zIndex: 7 },
+    player: media,
+    comments: [],
+    area: { start: 0, end: initialAreaEnd, lines: computeAreaLines(overlayHost, settings) },
+    channelSize: initialChannelSize,
+    mouseControl: false,
+    mouseControlPause: false,
+    // Increase horizontal gap slightly to reduce bursts; keeps no-overlap stable under load.
+    bOffset: 800,
+    chaseEffect: true,
+    // Delay initialization until explicitly enabled to save CPU/GPU on startup.
+    defaultOff: true,
+  } as any);
+};
+
+// 构建弹幕实例（xgplayer 模式与 MPV 模式共用）。
+// apply/sync 的 playerRoot 传宿主的父容器（querySelector 不含自身）。
+const buildOverlayInstance = (
+  danmu: any,
+  overlayHost: HTMLElement,
+  danmuSettings: DanmuUserSettings,
+  isDanmuEnabled: boolean,
+): DanmuOverlayInstance => {
+  let currentEnabled = isDanmuEnabled;
+  let currentSettings: DanmuUserSettings = { ...danmuSettings };
+  let currentOpacity = currentEnabled ? sanitizeDanmuOpacity(currentSettings.opacity) : 0;
+
+  let started = false;
+  const ensureStarted = () => {
+    if (started) return;
+    try {
+      danmu.start();
+      started = true;
+    } catch (error) {
+      console.warn('[Player] Failed to start danmu.js:', error);
+    }
+  };
+
+  const overlay: DanmuOverlayInstance = {
+    sendComment: (comment) => {
+      try {
+        if (!currentEnabled || currentOpacity <= 0) {
+          return;
+        }
+
+        ensureStarted();
+
+        // 高密度时做轻量限流（优先保证不重叠/不卡顿）。
+        try {
+          const bullets = (danmu as any)?.state?.bullets;
+          const bulletCount = Array.isArray(bullets) ? bullets.length : 0;
+          const maxBullets = computeMaxBullets(overlayHost, currentSettings);
+          if (bulletCount > maxBullets) {
+            return;
+          }
+        } catch {
+          // ignore density checks
+        }
+
+        const id = comment.id || `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        const duration = clamp(Number(comment.duration ?? currentSettings.duration ?? 12000), 5000, 60000);
+        const mode = comment.mode === 'top' || comment.mode === 'bottom' || comment.mode === 'scroll' ? comment.mode : 'scroll';
+        const fontSizePx = parseFontSizePx(currentSettings.fontSize);
+        const mergedStyle = {
+          fontSize: `${fontSizePx}px`,
+          color: comment.style?.color || currentSettings.color || '#ffffff',
+          ...(comment.style ?? {}),
+        };
+
+        danmu.sendComment({ id, txt: comment.txt, duration, mode, style: mergedStyle } as any);
+      } catch (error) {
+        console.warn('[Player] Failed emitting danmu.js comment:', error);
+      }
+    },
+    clear: () => {
+      try {
+        const state: any = (danmu as any)?.state;
+        if (state?.bullets && Array.isArray(state.bullets)) {
+          state.bullets.splice(0, state.bullets.length);
+        }
+        if (state?.comments && Array.isArray(state.comments)) {
+          state.comments.splice(0, state.comments.length);
+        }
+      } catch {
+        // ignore internal state clearing
+      }
+      try {
+        overlayHost.innerHTML = '';
+      } catch {
+        // ignore DOM clearing
+      }
+    },
+    play: () => {
+      currentEnabled = true;
+      currentOpacity = sanitizeDanmuOpacity(currentSettings.opacity);
+      ensureStarted();
+      try {
+        danmu.play();
+      } catch {}
+    },
+    pause: () => {
+      currentEnabled = false;
+      currentOpacity = 0;
+      try {
+        danmu.pause();
+      } catch {}
+    },
+    stop: () => {
+      try {
+        danmu.stop();
+      } catch {}
+    },
+    start: () => {
+      ensureStarted();
+    },
+    hide: (mode?: string) => {
+      ensureStarted();
+      try {
+        danmu.hide?.(mode);
+      } catch {}
+    },
+    show: (mode?: string) => {
+      ensureStarted();
+      try {
+        danmu.show?.(mode);
+      } catch {}
+    },
+    setOpacity: (opacity: number) => {
+      const next = Math.max(0, Math.min(1, opacity));
+      currentOpacity = currentEnabled ? next : 0;
+      overlayHost.style.setProperty('--danmu-opacity', String(currentOpacity));
+      try {
+        danmu.setOpacity?.(currentOpacity);
+      } catch {
+        // ignore
+      }
+    },
+    setFontSize: (size: number | string) => {
+      const next = typeof size === 'string' ? parseInt(size, 10) : size;
+      if (!Number.isFinite(next)) return;
+      currentSettings = { ...currentSettings, fontSize: `${next}px` };
+      try {
+        danmu.setFontSize?.(next, computeChannelSize(next));
+      } catch {
+        // ignore
+      }
+      try {
+        danmu.setArea?.({ start: 0, end: sanitizeDanmuArea(currentSettings.area), lines: computeAreaLines(overlayHost, currentSettings) });
+      } catch {
+        // ignore
+      }
+    },
+    setAllDuration: (_mode: string, duration: number) => {
+      if (!Number.isFinite(duration) || duration <= 0) return;
+      currentSettings = { ...currentSettings, duration };
+      try {
+        danmu.setAllDuration?.('scroll', duration);
+        danmu.setAllDuration?.('top', duration);
+        danmu.setAllDuration?.('bottom', duration);
+      } catch {
+        // ignore
+      }
+    },
+    setArea: (area) => {
+      const end = sanitizeDanmuArea(area?.end ?? currentSettings.area);
+      currentSettings = { ...currentSettings, area: end };
+      try {
+        danmu.setArea?.({ start: 0, end, lines: area?.lines ?? computeAreaLines(overlayHost, currentSettings) });
+      } catch {
+        // ignore
+      }
+    },
+    setPlayRate: (mode: string, rate: number) => {
+      try {
+        (danmu as any).setPlayRate?.(mode, rate);
+      } catch {
+        // ignore
+      }
+    },
+  };
+
+  applyDanmuOverlayPreferences(overlay, danmuSettings, isDanmuEnabled, overlayHost.parentElement as HTMLElement);
+  syncDanmuEnabledState(overlay, danmuSettings, isDanmuEnabled, overlayHost.parentElement as HTMLElement);
+
+  if (isDanmuEnabled) {
+    ensureStarted();
+  }
+
+  return overlay;
+};
+
 export const createDanmuOverlay = (
   player: Player | null,
   danmuSettings: DanmuUserSettings,
@@ -157,195 +370,50 @@ export const createDanmuOverlay = (
 
   try {
     const media = (player as any).video || (player as any).media || undefined;
-
-    let currentEnabled = isDanmuEnabled;
-    let currentSettings: DanmuUserSettings = { ...danmuSettings };
-    let currentOpacity = currentEnabled ? sanitizeDanmuOpacity(currentSettings.opacity) : 0;
-
-    const initialFontSizePx = parseFontSizePx(currentSettings.fontSize);
-    const initialChannelSize = computeChannelSize(initialFontSizePx);
-    const initialAreaEnd = sanitizeDanmuArea(currentSettings.area);
-
-    const danmu = new DanmuJs({
-      container: overlayHost,
-      containerStyle: { zIndex: 7 },
-      player: media,
-      comments: [],
-      area: { start: 0, end: initialAreaEnd, lines: computeAreaLines(overlayHost, currentSettings) },
-      channelSize: initialChannelSize,
-      mouseControl: false,
-      mouseControlPause: false,
-      // Increase horizontal gap slightly to reduce bursts; keeps no-overlap stable under load.
-      bOffset: 800,
-      chaseEffect: true,
-      // Delay initialization until explicitly enabled to save CPU/GPU on startup.
-      defaultOff: true,
-    } as any);
-
-    let started = false;
-    const ensureStarted = () => {
-      if (started) return;
-      try {
-        danmu.start();
-        started = true;
-      } catch (error) {
-        console.warn('[Player] Failed to start danmu.js:', error);
-      }
-    };
-
-    const overlay: DanmuOverlayInstance = {
-      sendComment: (comment) => {
-        try {
-          if (!currentEnabled || currentOpacity <= 0) {
-            return;
-          }
-
-          ensureStarted();
-
-          // 高密度时做轻量限流（优先保证不重叠/不卡顿）。
-          try {
-            const bullets = (danmu as any)?.state?.bullets;
-            const bulletCount = Array.isArray(bullets) ? bullets.length : 0;
-            const maxBullets = computeMaxBullets(overlayHost, currentSettings);
-            if (bulletCount > maxBullets) {
-              return;
-            }
-          } catch {
-            // ignore density checks
-          }
-
-          const id = comment.id || `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-          const duration = clamp(Number(comment.duration ?? currentSettings.duration ?? 12000), 5000, 60000);
-          const mode = comment.mode === 'top' || comment.mode === 'bottom' || comment.mode === 'scroll' ? comment.mode : 'scroll';
-          const fontSizePx = parseFontSizePx(currentSettings.fontSize);
-          const mergedStyle = {
-            fontSize: `${fontSizePx}px`,
-            color: comment.style?.color || currentSettings.color || '#ffffff',
-            ...(comment.style ?? {}),
-          };
-
-          danmu.sendComment({ id, txt: comment.txt, duration, mode, style: mergedStyle } as any);
-        } catch (error) {
-          console.warn('[Player] Failed emitting danmu.js comment:', error);
-        }
-      },
-      clear: () => {
-        try {
-          const state: any = (danmu as any)?.state;
-          if (state?.bullets && Array.isArray(state.bullets)) {
-            state.bullets.splice(0, state.bullets.length);
-          }
-          if (state?.comments && Array.isArray(state.comments)) {
-            state.comments.splice(0, state.comments.length);
-          }
-        } catch {
-          // ignore internal state clearing
-        }
-        try {
-          overlayHost.innerHTML = '';
-        } catch {
-          // ignore DOM clearing
-        }
-      },
-      play: () => {
-        currentEnabled = true;
-        currentOpacity = sanitizeDanmuOpacity(currentSettings.opacity);
-        ensureStarted();
-        try {
-          danmu.play();
-        } catch {}
-      },
-      pause: () => {
-        currentEnabled = false;
-        currentOpacity = 0;
-        try {
-          danmu.pause();
-        } catch {}
-      },
-      stop: () => {
-        try {
-          danmu.stop();
-        } catch {}
-      },
-      start: () => {
-        ensureStarted();
-      },
-      hide: (mode?: string) => {
-        ensureStarted();
-        try {
-          danmu.hide?.(mode);
-        } catch {}
-      },
-      show: (mode?: string) => {
-        ensureStarted();
-        try {
-          danmu.show?.(mode);
-        } catch {}
-      },
-      setOpacity: (opacity: number) => {
-        const next = Math.max(0, Math.min(1, opacity));
-        currentOpacity = currentEnabled ? next : 0;
-        overlayHost.style.setProperty('--danmu-opacity', String(currentOpacity));
-        try {
-          danmu.setOpacity?.(currentOpacity);
-        } catch {
-          // ignore
-        }
-      },
-      setFontSize: (size: number | string) => {
-        const next = typeof size === 'string' ? parseInt(size, 10) : size;
-        if (!Number.isFinite(next)) return;
-        currentSettings = { ...currentSettings, fontSize: `${next}px` };
-        try {
-          danmu.setFontSize?.(next, computeChannelSize(next));
-        } catch {
-          // ignore
-        }
-        try {
-          danmu.setArea?.({ start: 0, end: sanitizeDanmuArea(currentSettings.area), lines: computeAreaLines(overlayHost, currentSettings) });
-        } catch {
-          // ignore
-        }
-      },
-      setAllDuration: (_mode: string, duration: number) => {
-        if (!Number.isFinite(duration) || duration <= 0) return;
-        currentSettings = { ...currentSettings, duration };
-        try {
-          danmu.setAllDuration?.('scroll', duration);
-          danmu.setAllDuration?.('top', duration);
-          danmu.setAllDuration?.('bottom', duration);
-        } catch {
-          // ignore
-        }
-      },
-      setArea: (area) => {
-        const end = sanitizeDanmuArea(area?.end ?? currentSettings.area);
-        currentSettings = { ...currentSettings, area: end };
-        try {
-          danmu.setArea?.({ start: 0, end, lines: area?.lines ?? computeAreaLines(overlayHost, currentSettings) });
-        } catch {
-          // ignore
-        }
-      },
-      setPlayRate: (mode: string, rate: number) => {
-        try {
-          (danmu as any).setPlayRate?.(mode, rate);
-        } catch {
-          // ignore
-        }
-      },
-    };
-
-    applyDanmuOverlayPreferences(overlay, danmuSettings, isDanmuEnabled, player.root as HTMLElement);
-    syncDanmuEnabledState(overlay, danmuSettings, isDanmuEnabled, player.root as HTMLElement);
-
-    if (isDanmuEnabled) {
-      ensureStarted();
-    }
-
-    return overlay;
+    const danmu = createDanmuInstance(overlayHost, media, danmuSettings);
+    return buildOverlayInstance(danmu, overlayHost, danmuSettings, isDanmuEnabled);
   } catch (error) {
     console.error('[Player] Failed to initialize danmu.js overlay:', error);
+    return null;
+  }
+};
+
+// MPV 内核模式：视频由原生 libmpv 渲染（WebView2 透明露出），
+// 弹幕层挂在播放容器 DOM 上，用一个"假 video"对象喂给 danmu.js（直播场景不需要时间轴同步）。
+export const createDanmuOverlayForHost = (
+  container: HTMLElement | null,
+  danmuSettings: DanmuUserSettings,
+  isDanmuEnabled: boolean,
+): DanmuOverlayInstance | null => {
+  if (!container) {
+    return null;
+  }
+
+  try {
+    const overlayHost = ensureOverlayHostInContainer(container);
+    if (!overlayHost) {
+      return null;
+    }
+
+    overlayHost.innerHTML = '';
+    overlayHost.style.setProperty('--danmu-stroke-color', danmuSettings.strokeColor);
+    overlayHost.style.setProperty('--danmu-opacity', String(isDanmuEnabled ? sanitizeDanmuOpacity(danmuSettings.opacity) : 0));
+
+    // 假 video：danmu.js 只用它做时间轴/播放状态同步，直播弹幕逐条推送，不依赖真实媒体元素
+    const fakeMedia: any = {
+      currentTime: 0,
+      playbackRate: 1,
+      paused: false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+      getBoundingClientRect: () => container.getBoundingClientRect()
+    };
+
+    const danmu = createDanmuInstance(overlayHost, fakeMedia, danmuSettings);
+    return buildOverlayInstance(danmu, overlayHost, danmuSettings, isDanmuEnabled);
+  } catch (error) {
+    console.error('[Player] Failed to initialize danmu.js overlay for MPV mode:', error);
     return null;
   }
 };

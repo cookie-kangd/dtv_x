@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, m } from "framer-motion";
-import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, ThumbsUp, X } from "lucide-react";
+import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -86,7 +86,15 @@ export function Navbar({
   const [isWindows, setIsWindows] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
 
-  const [donateOpen, setDonateOpen] = useState(false);
+  const [playerEngine, setPlayerEngine] = useState<"mpv" | "webview">("mpv");
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("dtv_player_engine");
+      setPlayerEngine(saved === "webview" ? "webview" : "mpv");
+    } catch {
+      // ignore
+    }
+  }, []);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [lanSyncOpen, setLanSyncOpen] = useState(false);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
@@ -673,11 +681,20 @@ export function Navbar({
           // eslint-disable-next-line react/no-unknown-property
           data-tauri-drag-region="false"
           className={styles.navIconBtn}
-          title="打赏支持"
-          aria-label="打赏"
-          onClick={() => setDonateOpen(true)}
+          title={`播放内核：${playerEngine === "mpv" ? "MPV（点击切换为 WebView2）" : "WebView2（点击切换为 MPV）"}`}
+          aria-label="切换播放内核"
+          onClick={() => {
+            const next = playerEngine === "mpv" ? "webview" : "mpv";
+            setPlayerEngine(next);
+            try {
+              window.localStorage.setItem("dtv_player_engine", next);
+            } catch {
+              // ignore
+            }
+            window.dispatchEvent(new CustomEvent("dtv-x:engine-changed", { detail: { engine: next } }));
+          }}
         >
-          <ThumbsUp size={18} />
+          <span className={styles.versionText}>{playerEngine === "mpv" ? "MPV" : "WEB"}</span>
         </button>
 
         <button
@@ -717,40 +734,6 @@ export function Navbar({
           </div>
         ) : null}
       </div>
-
-      <AnimatePresence>
-        {donateOpen ? (
-          <m.div
-            className={styles.overlayBackdrop}
-            // eslint-disable-next-line react/no-unknown-property
-            data-tauri-drag-region="false"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onMouseDown={() => setDonateOpen(false)}
-          >
-            <m.div
-              className={styles.overlayCard}
-              initial={{ opacity: 0, y: 10, scale: 0.985 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 8, scale: 0.99 }}
-              transition={{ type: "spring", stiffness: 520, damping: 44, mass: 0.7 }}
-              onMouseDown={(e) => e.stopPropagation()}
-            >
-              <div className={styles.overlayHeader}>
-                <div className={styles.overlayTitle}>打赏支持</div>
-                <button type="button" className={styles.overlayClose} onClick={() => setDonateOpen(false)} aria-label="关闭">
-                  <X size={16} />
-                </button>
-              </div>
-              <div className={styles.overlayBody}>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img className={styles.qrImage} src="/wechat.jpg" alt="微信赞赏码" />
-              </div>
-            </m.div>
-          </m.div>
-        ) : null}
-      </AnimatePresence>
 
       <AnimatePresence>
         {updateOpen ? (

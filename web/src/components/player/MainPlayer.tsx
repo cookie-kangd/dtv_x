@@ -32,6 +32,7 @@ import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
+import { createDanmuOverlayForHost } from "@/components/player/danmuOverlay";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useFollow, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
@@ -579,6 +580,239 @@ export function MainPlayer({
     return follow.isFollowed(fp, roomId);
   }, [follow, platform, roomId]);
 
+  // ===== MPV 内核模式（默认；启动失败自动回退 WebView2） =====
+  const engineRef = useRef<"mpv" | "webview">("mpv");
+  const [engine, setEngine] = useState<"mpv" | "webview">("mpv");
+  const [mpvActive, setMpvActive] = useState(false);
+  const [mpvPaused, setMpvPaused] = useState(false);
+  const [mpvMuted, setMpvMuted] = useState(false);
+  const [mpvVolume, setMpvVolume] = useState<number>(() => {
+    const v = loadStoredVolume();
+    return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : 100;
+  });
+  const mpvHoleMarkedRef = useRef<HTMLElement[]>([]);
+  const mpvUnlistenRef = useRef<(() => void) | null>(null);
+  const mpvResizeObserverRef = useRef<ResizeObserver | null>(null);
+
+  const setEnginePersist = useCallback((next: "mpv" | "webview", persist = true) => {
+    engineRef.current = next;
+    setEngine(next);
+    if (persist) {
+      try {
+        window.localStorage.setItem("dtv_player_engine", next);
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("dtv_player_engine");
+      setEnginePersist(saved === "webview" ? "webview" : "mpv", false);
+    } catch {
+      // ignore
+    }
+  }, [setEnginePersist]);
+
+  // "透明洞"：把视频容器的祖先链背景全部清空，让 WebView2 透出底下的 mpv 原生窗口
+  const applyMpvHole = useCallback(() => {
+    const container = playerContainerRef.current;
+    if (!container) return;
+    const marked: HTMLElement[] = [];
+    let cur: HTMLElement | null = container;
+    while (cur) {
+      if (cur !== document.body && cur !== document.documentElement) {
+        cur.classList.add("mpv-hole");
+        marked.push(cur);
+      }
+      cur = cur.parentElement;
+    }
+    mpvHoleMarkedRef.current = marked;
+    document.body.classList.add("mpv-active");
+    document.documentElement.classList.add("mpv-active");
+    container.classList.add("mpv-mode");
+  }, []);
+
+  const clearMpvHole = useCallback(() => {
+    mpvHoleMarkedRef.current.forEach((el) => el.classList.remove("mpv-hole"));
+    mpvHoleMarkedRef.current = [];
+    document.body.classList.remove("mpv-active");
+    document.documentElement.classList.remove("mpv-active");
+    playerContainerRef.current?.classList.remove("mpv-mode");
+  }, []);
+
+  const computeMpvRect = useCallback(() => {
+    const container = playerContainerRef.current;
+    if (!container) return null;
+    const r = container.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return null;
+    return {
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      width: Math.round(r.width),
+      height: Math.round(r.height)
+    };
+  }, []);
+
+  const stopMpvSession = useCallback(async () => {
+    try {
+      mpvResizeObserverRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    mpvResizeObserverRef.current = null;
+    try {
+      mpvUnlistenRef.current?.();
+    } catch {
+      // ignore
+    }
+    mpvUnlistenRef.current = null;
+    try {
+      await invoke("mpv_stop_cmd");
+    } catch {
+      // ignore
+    }
+    clearMpvHole();
+    setMpvActive(false);
+    setMpvPaused(false);
+  }, [clearMpvHole]);
+
+  const mpvHeadersForPlatform = useCallback((p: Platform): Record<string, string> => {
+    if (p === Platform.BILIBILI) {
+      return { Referer: "https://live.bilibili.com/", Origin: "https://live.bilibili.com" };
+    }
+    if (p === Platform.DOUYIN) {
+      return { Referer: "https://live.douyin.com/" };
+    }
+    return {};
+  }, []);
+
+  // 启动 mpv 会话 + watchdog：15s 内 time-pos 未走动视为失败（返回 false → 回退 WebView2）
+  const tryStartMpv = useCallback(
+    async (sessionId: number, url: string): Promise<boolean> => {
+      const container = playerContainerRef.current;
+      if (!container || !isSessionActive(sessionId)) return false;
+      try {
+        const available = await invoke<boolean>("mpv_is_available_cmd");
+        if (!available) {
+          console.warn("[MPV] libmpv-2.dll 不可用，回退 WebView2 内核");
+          return false;
+        }
+        const rect = computeMpvRect();
+        if (!rect) return false;
+        try {
+          await invoke("mpv_stop_cmd");
+        } catch {
+          // ignore
+        }
+        applyMpvHole();
+        await invoke("mpv_play_cmd", {
+          url,
+          headers: mpvHeadersForPlatform(platform),
+          rect
+        });
+        if (!isSessionActive(sessionId)) return false;
+
+        // 尺寸跟随（窗口缩放/最大化/全屏）
+        mpvResizeObserverRef.current = new ResizeObserver(() => {
+          const next = computeMpvRect();
+          if (next) {
+            void invoke("mpv_set_rect_cmd", { rect: next }).catch(() => {});
+          }
+        });
+        mpvResizeObserverRef.current.observe(container);
+
+        // 直播流结束/空闲 → 自动重新拉流
+        mpvUnlistenRef.current = await listen("mpv-event", (e) => {
+          const payload = (e as unknown as TauriEvent<{ kind: string }>).payload;
+          if (!payload?.kind) return;
+          if (payload.kind === "end" || payload.kind === "idle") {
+            if (engineRef.current === "mpv" && !disposedRef.current) {
+              void reloadStreamRef.current?.("refresh");
+            }
+          }
+        });
+
+        // watchdog：确认真的在播
+        const deadline = Date.now() + 15000;
+        let playing = false;
+        while (Date.now() < deadline) {
+          if (!isSessionActive(sessionId)) return false;
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const t = await invoke<number | null>("mpv_time_pos_cmd").catch(() => null);
+          if (t != null && t > 0.5) {
+            playing = true;
+            break;
+          }
+        }
+        if (!playing) {
+          console.warn("[MPV] 15s 内未开始播放，自动回退 WebView2 内核");
+          await stopMpvSession();
+          return false;
+        }
+        setMpvActive(true);
+        void invoke("mpv_set_volume_cmd", { volume: mpvVolume }).catch(() => {});
+        return true;
+      } catch (err) {
+        console.warn("[MPV] 启动失败，回退 WebView2 内核:", err);
+        try {
+          await stopMpvSession();
+        } catch {
+          // ignore
+        }
+        return false;
+      }
+    },
+    [applyMpvHole, computeMpvRect, isSessionActive, mpvHeadersForPlatform, mpvVolume, platform, stopMpvSession]
+  );
+
+  // mpv 直播流事件（end/idle）兜底自动刷新（tryStartMpv 内的 listener 销毁前的兜底）
+  useEffect(() => {
+    const un = listen("mpv-event", (e) => {
+      const payload = (e as unknown as TauriEvent<{ kind: string }>).payload;
+      if (!payload?.kind) return;
+      if (payload.kind === "end" || payload.kind === "idle") {
+        if (engineRef.current === "mpv" && !disposedRef.current) {
+          void reloadStreamRef.current?.("refresh");
+        }
+      }
+    });
+    return () => {
+      void un.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
+  // 引擎切换（Navbar 触发）：若正在播放则用新内核重载
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ engine?: "mpv" | "webview" }>).detail;
+      if (detail?.engine !== "mpv" && detail?.engine !== "webview") return;
+      setEnginePersist(detail.engine, false);
+      void reloadStreamRef.current?.("refresh");
+    };
+    window.addEventListener("dtv-x:engine-changed", handler);
+    return () => window.removeEventListener("dtv-x:engine-changed", handler);
+  }, [setEnginePersist]);
+
+  // WebView2 内核模式：切回前台时若视频意外暂停则自动恢复（后台节流已由 Rust 侧禁用，这里是兜底）
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      if (engineRef.current !== "webview") return;
+      try {
+        const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
+        if (video && video.paused && !video.ended && video.readyState > 0) {
+          void video.play().catch(() => {});
+        }
+      } catch {
+        // ignore
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
   const destroyPlayer = useCallback(() => {
     try {
       unlistenRef.current?.();
@@ -609,6 +843,24 @@ export function MainPlayer({
     danmuSettingsPluginRef.current = null;
     qualityPluginRef.current = null;
     linePluginRef.current = null;
+
+    // MPV 内核清理
+    try {
+      mpvResizeObserverRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    mpvResizeObserverRef.current = null;
+    try {
+      mpvUnlistenRef.current?.();
+    } catch {
+      // ignore
+    }
+    mpvUnlistenRef.current = null;
+    void invoke("mpv_stop_cmd").catch(() => {});
+    clearMpvHole();
+    setMpvActive(false);
+    setMpvPaused(false);
 
     setIsFullScreen(false);
   }, []);
@@ -768,6 +1020,30 @@ export function MainPlayer({
         throw new Error("播放器容器初始化失败，请刷新页面重试。");
       }
       if (!isSessionActive(sessionId)) return;
+
+      // ===== MPV 内核（默认）：原生 libmpv 渲染视频，WebView2 只画 UI/弹幕 =====
+      if (engineRef.current === "mpv") {
+        const mpvOk = await tryStartMpv(sessionId, url);
+        if (!isSessionActive(sessionId)) return;
+        if (mpvOk) {
+          try {
+            const overlay = createDanmuOverlayForHost(
+              playerContainerRef.current,
+              danmuSettings,
+              isDanmuEnabled
+            ) as DanmuOverlayInstance | null;
+            danmuOverlayRef.current = overlay;
+          } catch (e) {
+            console.warn("[MPV] danmaku overlay init failed:", e);
+          }
+          const backendRoomId = danmakuBackendRoomIdOverride || roomId;
+          const filterRoomId = danmakuFilterRoomIdOverride || backendRoomId;
+          await startDanmaku(sessionId, danmuOverlayRef.current, platform, backendRoomId, filterRoomId);
+          return;
+        }
+        // MPV 启动失败 → 本次会话回退 WebView2 内核（不覆盖用户持久化的内核选择）
+        setEnginePersist("webview", false);
+      }
 
       const isHlsPlayback = (streamType || "").toLowerCase() === "hls" || url.toLowerCase().includes(".m3u8");
 
@@ -1012,7 +1288,7 @@ export function MainPlayer({
       await startDanmaku(sessionId, overlay, platform, backendRoomId, filterRoomId);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentLine, currentQuality, danmuSettings, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku]
+    [currentLine, currentQuality, danmuSettings, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku, tryStartMpv, setEnginePersist]
   );
 
   const reloadStream = useCallback(
@@ -1449,6 +1725,80 @@ export function MainPlayer({
               </div>
 
               <div ref={playerContainerRef} className="video-player" />
+
+              {engine === "mpv" && mpvActive ? (
+                <div className="mpv-controls" data-tauri-drag-region="false">
+                  <span className="mpv-engine-badge">MPV</span>
+                  <button
+                    type="button"
+                    title={mpvPaused ? "播放" : "暂停"}
+                    onClick={() => {
+                      const next = !mpvPaused;
+                      setMpvPaused(next);
+                      void invoke("mpv_pause_cmd", { paused: next }).catch(() => {});
+                    }}
+                  >
+                    {mpvPaused ? "▶" : "❚❚"}
+                  </button>
+                  <button
+                    type="button"
+                    title={mpvMuted ? "取消静音" : "静音"}
+                    onClick={() => {
+                      const next = !mpvMuted;
+                      setMpvMuted(next);
+                      void invoke("mpv_set_mute_cmd", { muted: next }).catch(() => {});
+                    }}
+                  >
+                    {mpvMuted ? "🔇" : "🔊"}
+                  </button>
+                  <input
+                    className="mpv-volume"
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={mpvVolume}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setMpvVolume(v);
+                      void invoke("mpv_set_volume_cmd", { volume: v }).catch(() => {});
+                      if (mpvMuted) {
+                        setMpvMuted(false);
+                        void invoke("mpv_set_mute_cmd", { muted: false }).catch(() => {});
+                      }
+                    }}
+                  />
+                  <select
+                    value={currentQuality}
+                    title="清晰度"
+                    onChange={(e) => {
+                      const q = e.target.value;
+                      if (q === currentQualityRef.current) return;
+                      setCurrentQuality(q);
+                      try {
+                        window.localStorage.setItem(`${platform}_preferred_quality`, q);
+                      } catch {
+                        // ignore
+                      }
+                    }}
+                  >
+                    {qualityOptions.map((q) => (
+                      <option key={q} value={q}>
+                        {q}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" title="刷新直播流" onClick={() => void reloadStreamRef.current?.("refresh")}>
+                    ⟳
+                  </button>
+                  <button
+                    type="button"
+                    title={isFullScreen ? "退出全屏" : "全屏"}
+                    onClick={() => setIsFullScreen(!isFullScreen)}
+                  >
+                    {isFullScreen ? "⤡" : "⛶"}
+                  </button>
+                </div>
+              ) : null}
 
               {isLoadingStream ? (
                 <div className="loading-player" style={{ position: "absolute", inset: 0, zIndex: 20 }}>
