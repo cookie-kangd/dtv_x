@@ -200,26 +200,34 @@ impl DanmakuClient {
         let mut backoff_secs = 1u64;
 
         loop {
-            // 连接建立阶段失败（TCP/TLS/握手）也走退避重试，避免监听器永久死亡
-            let outcome = match self.run_connection(&mut stop_rx).await {
-                Ok(o) => o,
-                Err(e) => {
-                    eprintln!(
-                        "[Douyu Danmaku {}] Connection failed: {}. Retrying in {}s.",
-                        self.room_id, e, backoff_secs
-                    );
-                    let sleep_fut = sleep(Duration::from_secs(backoff_secs));
-                    tokio::select! {
-                        _ = sleep_fut => {}
-                        _ = &mut stop_rx => {
-                            eprintln!("[Douyu Danmaku {}] Stop signal received during backoff.", self.room_id);
-                            break;
-                        }
-                    }
-                    backoff_secs = (backoff_secs * 2).min(30);
-                    continue;
+            // 连接建立阶段失败（TCP/TLS/握手）也走退避重试，避免监听器永久死亡。
+            // 注意：Box<dyn Error> 非 Send，必须在本 match 内就地消化掉错误值，
+            // 不能让该临时值跨越后面的 select! await 点（否则整个 async 块不满足 Send）。
+            let mut outcome_opt: Option<ConnectionOutcome> = None;
+            let retry_msg: Option<String> = match self.run_connection(&mut stop_rx).await {
+                Ok(o) => {
+                    outcome_opt = Some(o);
+                    None
                 }
+                Err(e) => Some(format!(
+                    "[Douyu Danmaku {}] Connection failed: {}. Retrying in {}s.",
+                    self.room_id, e, backoff_secs
+                )),
             };
+            if let Some(msg) = retry_msg {
+                eprintln!("{}", msg);
+                let sleep_fut = sleep(Duration::from_secs(backoff_secs));
+                tokio::select! {
+                    _ = sleep_fut => {}
+                    _ = &mut stop_rx => {
+                        eprintln!("[Douyu Danmaku {}] Stop signal received during backoff.", self.room_id);
+                        break;
+                    }
+                }
+                backoff_secs = (backoff_secs * 2).min(30);
+                continue;
+            }
+            let outcome = outcome_opt.unwrap();
             match outcome {
                 ConnectionOutcome::Stop => {
                     eprintln!("[Douyu Danmaku {}] Listener stopped.", self.room_id);
