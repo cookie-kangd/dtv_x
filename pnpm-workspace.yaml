@@ -1,3 +1,10 @@
 packages:
   - "web"
 
+# pnpm v10 起只认这里的 onlyBuiltDependencies（package.json 里的同名字段已废弃）
+onlyBuiltDependencies:
+  - core-js
+  - es5-ext
+  - esbuild
+  - sharp
+
