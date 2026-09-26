@@ -52,6 +52,11 @@ struct MpvEvent {
     data: *mut c_void,
 }
 
+// 事件线程持有裸指针的包装（mpv 官方支持跨线程 command/属性访问，仅 wait_event 限单线程）
+#[repr(transparent)]
+struct SendMpvHandle(*mut MpvHandle);
+unsafe impl Send for SendMpvHandle {}
+
 #[derive(Clone, Copy)]
 struct Symbols {
     create: unsafe extern "C" fn() -> *mut MpvHandle,
@@ -166,8 +171,8 @@ unsafe fn create_video_child(parent_hwnd: isize, rect: &MpvRect) -> Result<isize
     use windows_sys::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassW, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, WS_CHILD, WS_VISIBLE, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, RegisterClassW, SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, WS_CHILD, WS_VISIBLE, WNDCLASSW,
     };
 
     static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -230,7 +235,7 @@ fn apply_webview_transparent(app: &AppHandle, transparent: bool) {
     if let Some(window) = app.get_webview_window("main") {
         // 播放时透明（露出 mpv），停止时恢复白色不透明底
         let color = if transparent { (0u8, 0u8, 0u8, 0u8) } else { (255u8, 255u8, 255u8, 255u8) };
-        match window.set_background_color(Some(color)) {
+        match window.set_background_color(Some(color.into())) {
             Ok(_) => {}
             Err(e) => eprintln!("[MPV] set_background_color({}) failed: {}", transparent, e),
         }
@@ -327,13 +332,14 @@ unsafe fn start_session(
     let ev_app = app.clone();
     let ev_stop = stop_flag.clone();
     let ev_syms = syms;
-    let ev_handle = handle;
+    let ev_handle = SendMpvHandle(handle);
     let thread = std::thread::spawn(move || {
+        let ev_handle = ev_handle;
         loop {
             if ev_stop.load(Ordering::Relaxed) {
                 break;
             }
-            let ev = unsafe { (ev_syms.wait_event)(ev_handle, 0.2) };
+            let ev = unsafe { (ev_syms.wait_event)(ev_handle.0, 0.2) };
             if ev.is_null() {
                 continue;
             }
