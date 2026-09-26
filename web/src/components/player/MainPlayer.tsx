@@ -117,7 +117,7 @@ function maybeAppendHevcInstallHint(rawMessage: string) {
   const hvc1Supported = supportsMseType(hvc1);
 
   if (!hev1Supported && !hvc1Supported) {
-    return `${msg}\n\n提示：检测到当前环境不支持 HEVC(H.265) 解码（hev1/hvc1 均不支持）。\n请安装 Microsoft.HEVCVideoExtension 插件后重启软件。\n下载地址：https://github.com/chen-zeong/DTV/releases\n（按 release 提示下载并安装对应插件）`;
+    return `${msg}\n\n提示：检测到当前环境不支持 HEVC(H.265) 解码（hev1/hvc1 均不支持）。\n请安装 Microsoft.HEVCVideoExtension 插件后重启软件。\n下载地址：https://github.com/cookie-kangd/dtv_x/releases\n（按 release 提示下载并安装对应插件）`;
   }
 
   return msg;

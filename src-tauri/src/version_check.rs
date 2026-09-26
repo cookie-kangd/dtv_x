@@ -35,23 +35,13 @@ fn is_remote_newer(remote: &str, local: &str) -> bool {
 #[tauri::command]
 pub async fn check_version_cmd(
     app_handle: tauri::AppHandle,
-    client: State<'_, reqwest::Client>,
+    _client: State<'_, reqwest::Client>,
 ) -> Result<VersionCheckResponse, String> {
     let local_version = app_handle.package_info().version.to_string();
 
-    // Not critical: if it fails, do not retry and do not error.
-    let remote: Option<RemoteVersionInfo> = match client
-        .get("https://dtv-version.c-zeong.workers.dev/")
-        .header("Accept", "application/json")
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => match resp.json::<RemoteVersionInfo>().await {
-            Ok(v) if !v.version.trim().is_empty() => Some(v),
-            _ => None,
-        },
-        _ => None,
-    };
+    // dtv_x fork: 已切断上游（chen-zeong/DTV）的更新检查通道，
+    // 避免误提示用户去升级官方版本。后续可改为指向本仓库的更新通道。
+    let remote: Option<RemoteVersionInfo> = None;
 
     let has_update = remote
         .as_ref()

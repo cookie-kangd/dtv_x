@@ -137,7 +137,7 @@ impl DouyinLiveWebFetcher {
         // Ensure room_id has been resolved before collecting cookies
         self.resolve_room_info().await?;
 
-        if let Ok(cookie) = std::env::var("DTV_DOUYIN_COOKIE") {
+        if let Ok(cookie) = std::env::var("DTVX_DOUYIN_COOKIE") {
             let cookie = cookie.trim().to_string();
             if !cookie.is_empty() {
                 self.dy_cookie = Some(cookie);

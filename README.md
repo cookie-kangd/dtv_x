@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="images/icon.png" alt="DTV" width="128">
-  <h1>DTV</h1>
+  <img src="images/icon.png" alt="DTV_X" width="128">
+  <h1>DTV_X</h1>
   <p>基于 Tauri 2.0 的跨平台斗鱼、虎牙、抖音、bilibili直播桌面客户端</p>
 </div>
 
@@ -65,7 +65,7 @@
 
 ## 安装方式
 
-可以在 [release](https://github.com/chen-zeong/dtv/releases) 目录下载对应系统的安装包, 也可以通过源码编译安装
+可以在 [release](https://github.com/cookie-kangd/dtv_x/releases) 目录下载对应系统的安装包, 也可以通过源码编译安装
 
 ## 编译
 

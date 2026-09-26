@@ -26,7 +26,7 @@ type VersionInfo = {
   published_at?: string;
 };
 
-const GITHUB_RELEASES_URL = "https://github.com/chen-zeong/DTV/releases";
+const GITHUB_RELEASES_URL = "https://github.com/cookie-kangd/dtv_x/releases";
 
 const basePlatforms: Array<{ id: Exclude<UiPlatform, "custom">; name: string }> = [
   { id: "douyu", name: "斗鱼" },

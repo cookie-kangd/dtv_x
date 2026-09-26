@@ -128,16 +128,16 @@ jobs:
           RUSTY_V8_MIRROR: https://github.com/denoland/rusty_v8/releases/download
         with:
           tagName: ${{ github.event.inputs.version || github.ref_name }}
-          releaseName: 'DTV ${{ github.event.inputs.version || github.ref_name }}'
+          releaseName: 'DTV_X ${{ github.event.inputs.version || github.ref_name }}'
           releaseBody: |
             ## 🎉 DTV Release ${{ github.event.inputs.version || github.ref_name }}
             
             ### 📦 安装包下载
-            - **macOS (Apple Silicon)**: DTV_${{ github.event.inputs.version || github.ref_name }}_aarch64.dmg
-            - **macOS (Intel)**: DTV_${{ github.event.inputs.version || github.ref_name }}_x64.dmg
-            - **Windows**: DTV_${{ github.event.inputs.version || github.ref_name }}_x64-setup.exe
-            - **Linux (AppImage)**: DTV_${{ github.event.inputs.version || github.ref_name }}_amd64.AppImage
-            - **Linux (Deb)**: DTV_${{ github.event.inputs.version || github.ref_name }}_amd64.deb
+            - **macOS (Apple Silicon)**: DTV_X_${{ github.event.inputs.version || github.ref_name }}_aarch64.dmg
+            - **macOS (Intel)**: DTV_X_${{ github.event.inputs.version || github.ref_name }}_x64.dmg
+            - **Windows**: DTV_X_${{ github.event.inputs.version || github.ref_name }}_x64-setup.exe
+            - **Linux (AppImage)**: DTV_X_${{ github.event.inputs.version || github.ref_name }}_amd64.AppImage
+            - **Linux (Deb)**: DTV_X_${{ github.event.inputs.version || github.ref_name }}_amd64.deb
             
             ### 🔧 安装说明
             - **macOS**: 下载对应架构的 .dmg 文件，双击安装

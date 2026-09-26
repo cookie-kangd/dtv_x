@@ -83,12 +83,12 @@ jobs:
           RUSTY_V8_MIRROR: https://github.com/denoland/rusty_v8/releases/download
         with:
           tagName: ${{ github.event.inputs.version || github.ref_name }}
-          releaseName: 'DTV ${{ github.event.inputs.version || github.ref_name }}'
+          releaseName: 'DTV_X ${{ github.event.inputs.version || github.ref_name }}'
           releaseBody: |
             ## 🎉 DTV Release ${{ github.event.inputs.version || github.ref_name }}
             
             ### 📦 安装包下载
-            - **Windows**: DTV_${{ github.event.inputs.version || github.ref_name }}_x64-setup.exe
+            - **Windows**: DTV_X_${{ github.event.inputs.version || github.ref_name }}_x64-setup.exe
             
             ### 🔧 安装说明
             - **Windows**: 下载 .exe 文件，右键以管理员身份运行

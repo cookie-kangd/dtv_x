@@ -7,8 +7,8 @@ import { MotionProvider } from "@/components/motion/MotionProvider";
 import { TauriIndexHtmlFix } from "@/components/app/TauriIndexHtmlFix";
 
 export const metadata: Metadata = {
-  title: "DTV",
-  description: "DTV - Tauri Live Client"
+  title: "DTV_X",
+  description: "DTV_X - Tauri Live Client"
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

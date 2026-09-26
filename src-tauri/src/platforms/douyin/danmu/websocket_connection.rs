@@ -40,7 +40,7 @@ fn build_wss_query(cursor: &str, internal_ext: &str, user_unique_id: &str, room_
 }
 
 fn douyin_ws_hosts() -> Vec<String> {
-    let env_hosts = std::env::var("DTV_DOUYIN_WS_HOSTS").ok();
+    let env_hosts = std::env::var("DTVX_DOUYIN_WS_HOSTS").ok();
     if let Some(raw) = env_hosts {
         let hosts: Vec<String> = raw
             .split(',')

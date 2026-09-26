@@ -20,7 +20,7 @@ pub const LAN_SYNC_MDNS_SERVICE_TYPE: &str = "_dtv-lan-sync._tcp.local.";
 pub const LAN_SYNC_HTTP_PATH: &str = "/dtv-sync";
 
 fn fixed_token() -> String {
-    std::env::var("DTV_LAN_SYNC_TOKEN").unwrap_or_else(|_| "dtv".to_string())
+    std::env::var("DTVX_LAN_SYNC_TOKEN").unwrap_or_else(|_| "dtv".to_string())
 }
 
 fn normalize_token_value(raw: Option<String>) -> String {

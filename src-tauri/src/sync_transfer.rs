@@ -93,7 +93,7 @@ pub fn export_lan_sync_json_to_desktop(
 #[tauri::command]
 pub fn pick_lan_sync_json_import(app: tauri::AppHandle) -> Result<Option<ImportedJsonFile>, String> {
     let desktop = app.path().desktop_dir().ok();
-    let mut dialog = rfd::FileDialog::new().add_filter("DTV Sync", &["json"]);
+    let mut dialog = rfd::FileDialog::new().add_filter("DTV_X Sync", &["json"]);
     if let Some(dir) = desktop {
         dialog = dialog.set_directory(dir);
     }
