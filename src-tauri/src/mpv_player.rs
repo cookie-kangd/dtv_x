@@ -2,10 +2,15 @@
 //
 // 设计要点：
 // - libmpv-2.dll 运行时加载（libloading）：DLL 缺失 / 初始化失败一律返回 Err，前端自动回退 WebView2 内核
-// - 视频窗口：主窗口下的原生子窗口，z-order 压到最底（WebView2 之下）；
-//   WebView2 与窗口在创建时就开启透明（tauri.conf.json transparent:true），
-//   播放时视频区域 DOM 背景清空（"透明洞"，由 player.css + JS 打标控制），露出 mpv 画面
-// - 弹幕 / 控制条仍是 WebView2 里的 DOM，覆盖在视频上方（弹幕层在洞内、控制条自带背景）
+// - 视频窗口：主窗口下的原生子窗口，z-order 置于 WebView2 **之上**（HWND_TOP）。
+//   画面显示不依赖 WebView2 透明（此前"透明洞"方案连续两版不可靠，已废弃），
+//   DOM（直播间界面/弹幕层等）不可能挡住视频；控制条由前端在视频矩形下方的
+//   预留条带内渲染（不在 mpv 窗口矩形内，天然可见）
+// - 子窗口在**主线程**上创建：主线程常驻消息泵，跨线程 SetWindowPos/ShowWindow 才安全。
+//   此前在 spawn_blocking 临时线程上创建窗口，线程归还线程池后不泵消息，
+//   任何跨线程窗口操作都会永久阻塞（"退出直播间整个应用卡死"的根因），已修复
+// - mpv_stop_cmd 立即返回，销毁放后台线程分离执行：直播流 teardown 可能耗时，
+//   绝不阻塞命令；隐藏视频窗口带"代际守卫"，防止藏掉新会话正在用的窗口
 // - 事件线程 200ms 超时轮询 mpv_wait_event，把 START/END/IDLE/SHUTDOWN 广播给前端；
 //   前端另有 watchdog 轮询 mpv_time_pos_cmd 判断"真的在播"
 //
@@ -14,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -83,31 +88,57 @@ unsafe impl Send for MpvSession {}
 unsafe impl Sync for MpvSession {}
 
 impl MpvSession {
-    fn shutdown(mut self) {
+    /// 停止事件线程并销毁 mpv 句柄。
+    /// 直播流的 teardown（断开网络、join 解复用线程）可能耗时 1~2 秒，
+    /// 调用方自行决定在哪个线程等待（命令路径一律放后台线程）。
+    fn terminate(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(t) = self.event_thread.take() {
-            let _ = t.join();
-        }
         unsafe {
             (self.syms.terminate_destroy)(self.handle);
         }
-        // 子窗口持久复用：不能跨线程 DestroyWindow（Win32 限定窗口只能由创建线程销毁，
-        // 而 mpv_play_cmd 跑在 spawn_blocking 线程、stop 跑在异步运行时线程）。
-        // 跨线程 ShowWindow 是合法的（异步投递），隐藏即可；窗口留给下一次会话复用。
-        #[cfg(windows)]
-        hide_video_child(self.child_hwnd);
+        // terminate_destroy 会唤醒事件线程（SHUTDOWN 事件），join 只是等它退出；
+        // 必须在丢弃 _lib 之前完成，否则事件线程还在 DLL 里执行会直接崩
+        if let Some(t) = self.event_thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
-// 持久子窗口句柄：整个进程生命周期只创建一次，各会话复用，退出时随进程回收
+// 持久子窗口句柄：整个进程生命周期只创建一次（主线程上创建），各会话复用，退出时随进程回收
 #[cfg(windows)]
 static PERSISTENT_CHILD_HWND: OnceLock<isize> = OnceLock::new();
+
+// 会话代际计数：每次 mpv_play_cmd 递增。用于 stop 后台销毁时判断
+// "期间是否有新会话启动"，避免把新会话正在使用的视频窗口隐藏掉
+static SESSION_GEN: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
 fn hide_video_child(hwnd: isize) {
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-    unsafe { ShowWindow(hwnd as HWND, SW_HIDE) };
+    // ShowWindowAsync：异步投递，不等待目标线程处理（跨线程安全）
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE};
+    unsafe { ShowWindowAsync(hwnd as HWND, SW_HIDE) };
+}
+
+// 显示子窗口并置于 WebView2 之上（视频可见性不依赖任何透明机制）
+#[cfg(windows)]
+fn show_child_top(hwnd: isize, rect: &MpvRect) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindowAsync, HWND_TOP, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SW_SHOW,
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            HWND_TOP,
+            rect.x.max(0),
+            rect.y.max(0),
+            rect.width.max(2),
+            rect.height.max(2),
+            SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+        ShowWindowAsync(hwnd as HWND, SW_SHOW);
+    }
 }
 
 #[cfg(windows)]
@@ -180,14 +211,14 @@ unsafe fn mpv_command(syms: &Symbols, h: *mut MpvHandle, args: &[&str]) -> Resul
     }
 }
 
+// 仅在主线程上调用（acquire_video_child 通过 run_on_main_thread 进入）
 #[cfg(windows)]
-unsafe fn create_video_child(parent_hwnd: isize, rect: &MpvRect) -> Result<isize, String> {
+unsafe fn create_video_child_impl(parent_hwnd: isize, rect: &MpvRect) -> Result<isize, String> {
     use windows_sys::Win32::Foundation::{GetLastError, HWND};
     use windows_sys::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassW, SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, WS_CHILD, WS_VISIBLE, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, RegisterClassW, WS_CHILD, WS_VISIBLE, WNDCLASSW,
     };
 
     static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -223,16 +254,9 @@ unsafe fn create_video_child(parent_hwnd: isize, rect: &MpvRect) -> Result<isize
         return Err(format!("CreateWindowExW failed, GetLastError={}", unsafe { GetLastError() }));
     }
 
-    // z-order 压到最底：mpv 位于 WebView2 之下，WebView2 透明区域露出 mpv 画面
-    unsafe {
-        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    }
+    // z-order 置顶：mpv 位于 WebView2 之上，DOM 不可能挡住视频
+    show_child_top(hwnd as isize, rect);
     Ok(hwnd as isize)
-}
-
-#[cfg(not(windows))]
-unsafe fn create_video_child(_parent_hwnd: isize, _rect: &MpvRect) -> Result<isize, String> {
-    Err("MPV engine is only supported on Windows".into())
 }
 
 // 主窗口 HWND：tauri 返回 windows crate 的 HWND（新类型，repr(transparent)）。
@@ -245,47 +269,36 @@ fn main_window_hwnd(app: &AppHandle) -> Result<isize, String> {
     Ok(as_isize)
 }
 
-// WebView2 透明由 tauri.conf.json 的 `"transparent": true` 在创建时一次性开启（wry 会在
-// controller 创建阶段与 init_webview 两次写入 DefaultBackgroundColor(0,0,0,0)，这是唯一
-// 经过验证可靠的透明路径）。运行时 `set_background_color` 在 Windows 上还会同时把
-// "窗口层"背景改为不透明色（alpha 被忽略），行为不可控，故不再运行时切换——
-// DOM 侧由 player.css 的 `body.mpv-active` / `.mpv-hole` 负责"透明洞"的开关。
-
-static CREATE_LOCK: Mutex<()> = Mutex::new(());
-
-// 获取（或创建）持久视频子窗口：复用时重新定位并显示
+// 获取（或创建）持久视频子窗口。创建必须在主线程完成（主线程常驻消息泵，
+// 之后任何线程对它的跨线程操作才不会死锁）；复用路径同样经主线程重定位+显示。
 #[cfg(windows)]
-unsafe fn acquire_video_child(parent_hwnd: isize, rect: &MpvRect) -> Result<isize, String> {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SW_SHOW,
-    };
-
+fn acquire_video_child(app: &AppHandle, rect: &MpvRect) -> Result<isize, String> {
     if let Some(&existing) = PERSISTENT_CHILD_HWND.get() {
-        unsafe {
-            // 复用时一次性完成"重新定位 + 显示 + 压回 z-order 最底"。
-            // 必须再次压底：WebView2 在会话切换中可能被系统/前端操作提到更高 z-order，
-            // 一旦盖住 mpv 子窗口就会出现"只有声音没有画面"。
-            SetWindowPos(
-                existing as HWND,
-                HWND_BOTTOM,
-                rect.x.max(0),
-                rect.y.max(0),
-                rect.width.max(2),
-                rect.height.max(2),
-                SWP_NOACTIVATE,
-            );
-            ShowWindow(existing as HWND, SW_SHOW);
-        }
+        let window = app.get_webview_window("main").ok_or("main window not found")?;
+        let r = *rect;
+        window
+            .run_on_main_thread(move || show_child_top(existing, &r))
+            .map_err(|e| e.to_string())?;
         return Ok(existing);
     }
-    let hwnd = unsafe { create_video_child(parent_hwnd, rect)? };
+
+    let parent = main_window_hwnd(app)?;
+    let window = app.get_webview_window("main").ok_or("main window not found")?;
+    let r = *rect;
+    let (tx, rx) = std::sync::mpsc::channel();
+    window
+        .run_on_main_thread(move || {
+            let res = unsafe { create_video_child_impl(parent, &r) };
+            let _ = tx.send(res);
+        })
+        .map_err(|e| e.to_string())?;
+    let hwnd = rx.recv().map_err(|e| e.to_string())??;
     let _ = PERSISTENT_CHILD_HWND.set(hwnd);
     Ok(hwnd)
 }
 
 #[cfg(not(windows))]
-unsafe fn acquire_video_child(_parent_hwnd: isize, _rect: &MpvRect) -> Result<isize, String> {
+fn acquire_video_child(_app: &AppHandle, _rect: &MpvRect) -> Result<isize, String> {
     Err("MPV engine is only supported on Windows".into())
 }
 
@@ -299,23 +312,22 @@ unsafe fn start_session(
 ) -> Result<(), String> {
     let _create_guard = CREATE_LOCK.lock().map_err(|e| e.to_string())?;
 
-    // 停掉旧会话
+    // 停掉旧会话（同步等待：新旧会话共用同一个视频子窗口，且旧 mpv 的 DLL
+    // 句柄必须在其事件线程退出后才能释放）。不隐藏子窗口——新会话马上复用。
     {
         let mut g = sessions.lock().map_err(|e| e.to_string())?;
-        if let Some(old) = g.take() {
-            old.shutdown();
+        if let Some(mut old) = g.take() {
+            old.terminate();
         }
     }
 
     let (lib, syms) = unsafe { load_symbols() }?;
-    let parent = main_window_hwnd(app)?;
-    let child = unsafe { acquire_video_child(parent, rect) }?;
+    let child = acquire_video_child(app, rect)?;
 
     // 出错统一清理：销毁 mpv 句柄（子窗口保留隐藏，供下次复用）
     macro_rules! fail {
         ($handle:expr, $err:expr) => {{
             unsafe { (syms.terminate_destroy)($handle) };
-            #[cfg(windows)]
             hide_video_child(child);
             return Err($err);
         }};
@@ -421,6 +433,8 @@ unsafe fn start_session(
     Err("MPV engine is only supported on Windows".into())
 }
 
+static CREATE_LOCK: Mutex<()> = Mutex::new(());
+
 fn with_session<R>(
     manager: &MpvManager,
     f: impl FnOnce(Option<&MpvSession>) -> R,
@@ -455,6 +469,8 @@ pub async fn mpv_play_cmd(
     {
         let sessions = manager.0.clone();
         let hmap = headers.unwrap_or_default();
+        // 新会话开始：代际 +1（让在途的后台销毁跳过"隐藏视频窗口"）
+        SESSION_GEN.fetch_add(1, Ordering::SeqCst);
         let res = tokio::task::spawn_blocking(move || {
             unsafe { start_session(&app, &sessions, &url, &hmap, &rect) }
         })
@@ -470,17 +486,32 @@ pub async fn mpv_play_cmd(
 }
 
 #[tauri::command]
-pub async fn mpv_stop_cmd(app: AppHandle, manager: State<'_, MpvManager>) -> Result<(), String> {
-    // app 保留在签名中以兼容既有前端调用；透明/背景恢复已全部由 DOM 侧 CSS 处理
-    let _ = &app;
-    let old = {
-        let mut g = manager.0.lock().map_err(|e| e.to_string())?;
-        g.take()
-    };
-    if let Some(s) = old {
-        s.shutdown();
+pub async fn mpv_stop_cmd(manager: State<'_, MpvManager>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let old = {
+            let mut g = manager.0.lock().map_err(|e| e.to_string())?;
+            g.take()
+        };
+        if let Some(mut s) = old {
+            // 立即返回，销毁放后台线程分离执行：直播流 teardown 可能耗时 1~2s，
+            // 阻塞命令会让前端 await 挂住（"退出直播间卡死"的直接来源之一）
+            let gen = SESSION_GEN.load(Ordering::SeqCst);
+            std::thread::spawn(move || {
+                s.terminate();
+                // 期间没有新会话启动才隐藏视频窗口，防止藏掉新会话正在用的窗口
+                if SESSION_GEN.load(Ordering::SeqCst) == gen {
+                    hide_video_child(s.child_hwnd);
+                }
+            });
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let _ = manager;
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -489,7 +520,7 @@ pub async fn mpv_set_rect_cmd(manager: State<'_, MpvManager>, rect: MpvRect) -> 
     {
         use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+            SetWindowPos, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
         };
         with_session(&manager, |s| {
             if let Some(sess) = s {
@@ -501,7 +532,7 @@ pub async fn mpv_set_rect_cmd(manager: State<'_, MpvManager>, rect: MpvRect) -> 
                         rect.y,
                         rect.width.max(2),
                         rect.height.max(2),
-                        SWP_NOZORDER | SWP_NOACTIVATE,
+                        SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE,
                     );
                 }
             }

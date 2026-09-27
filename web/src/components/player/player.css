@@ -2433,29 +2433,11 @@ video.xgplayer-video {
 }
 
 /* ===================== MPV 内核模式 ===================== */
+/* 视频位于原生子窗口（WebView2 之上），无需透明洞；控制条渲染在视频矩形
+   下方的预留条带内（高度 48px，与 MainPlayer.tsx 的 MPV_CONTROL_STRIP_PX 一致），
+   是普通 DOM 区域，天然可见可点击 */
 
-/* 播放期间：HTML 根背景透明，露出底下的 mpv 原生子窗口 */
-body.mpv-active,
-html.mpv-active {
-  background: transparent !important;
-}
-
-/* 视频区域祖先链上的背景全部清空（"透明洞"路径），JS 运行时逐层打标 */
-html.mpv-active .mpv-hole {
-  background: transparent !important;
-  background-image: none !important;
-  box-shadow: none !important;
-}
-
-/* mpv 模式弹幕层：绝对定位铺满视频区域 */
-.video-player.mpv-mode .player-danmu-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 7;
-  pointer-events: none;
-}
-
-/* mpv 控制条（替代 xgplayer 控制栏，视觉与交互对齐 xgplayer：全宽渐变底栏 + 自动隐藏） */
+/* mpv 控制条（常驻不显示隐藏，视觉对齐 xgplayer 控制栏） */
 .mpv-controls {
   position: absolute;
   left: 0;
@@ -2468,16 +2450,10 @@ html.mpv-active .mpv-hole {
   gap: 12px;
   height: 48px;
   padding: 0 14px;
-  background: linear-gradient(to top, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0.38) 60%, transparent);
+  background: linear-gradient(to top, rgba(6, 8, 12, 0.96), rgba(10, 14, 22, 0.88));
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
   color: #fff;
   user-select: none;
-  transition: transform 0.24s ease, opacity 0.24s ease;
-}
-
-.mpv-controls.mpv-controls-hidden {
-  transform: translateY(100%);
-  opacity: 0;
-  pointer-events: none;
 }
 
 .mpv-controls-group {
@@ -2562,7 +2538,12 @@ html.mpv-active .mpv-hole {
   white-space: nowrap;
 }
 
-/* mpv 弹幕开关（对齐 xgplayer 的 .xgplayer-danmu-toggle） */
+/* mpv 弹幕开关（mpv 模式下置灰禁用：原生视频层之上无法叠加 DOM 弹幕） */
+.mpv-controls .mpv-danmu-toggle.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .mpv-controls .mpv-danmu-toggle {
   gap: 8px;
   height: 32px;

@@ -44,6 +44,9 @@ declare global {
 
 const qualityOptions = ["原画", "高清", "标清"] as const;
 
+// MPV 模式下视频矩形底部预留的控制条高度（CSS px，需与 player.css 的 .mpv-controls 高度一致）
+const MPV_CONTROL_STRIP_PX = 48;
+
 const PLAYER_DRAG_EXCLUDED_SELECTOR = [
   // App chrome / topbar (主播信息栏 & 关闭/关注按钮等)
   ".player-topbar",
@@ -589,26 +592,8 @@ export function MainPlayer({
     const v = loadStoredVolume();
     return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : 100;
   });
-  const mpvHoleMarkedRef = useRef<HTMLElement[]>([]);
   const mpvUnlistenRef = useRef<(() => void) | null>(null);
   const mpvResizeObserverRef = useRef<ResizeObserver | null>(null);
-  // 控制条自动隐藏（对齐 xgplayer 行为：鼠标停止移动 2.6s 后滑出隐藏）
-  const [mpvControlsVisible, setMpvControlsVisible] = useState(true);
-  const mpvHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const bumpMpvControls = useCallback(() => {
-    setMpvControlsVisible(true);
-    if (mpvHideTimerRef.current) clearTimeout(mpvHideTimerRef.current);
-    mpvHideTimerRef.current = setTimeout(() => setMpvControlsVisible(false), 2600);
-  }, []);
-
-  const hideMpvControls = useCallback(() => {
-    if (mpvHideTimerRef.current) {
-      clearTimeout(mpvHideTimerRef.current);
-      mpvHideTimerRef.current = null;
-    }
-    setMpvControlsVisible(false);
-  }, []);
 
   const setEnginePersist = useCallback((next: "mpv" | "webview", persist = true) => {
     engineRef.current = next;
@@ -631,38 +616,14 @@ export function MainPlayer({
     }
   }, [setEnginePersist]);
 
-  // "透明洞"：把视频容器的祖先链背景全部清空，让 WebView2 透出底下的 mpv 原生窗口
-  const applyMpvHole = useCallback(() => {
-    const container = playerContainerRef.current;
-    if (!container) return;
-    const marked: HTMLElement[] = [];
-    let cur: HTMLElement | null = container;
-    while (cur) {
-      if (cur !== document.body && cur !== document.documentElement) {
-        cur.classList.add("mpv-hole");
-        marked.push(cur);
-      }
-      cur = cur.parentElement;
-    }
-    mpvHoleMarkedRef.current = marked;
-    document.body.classList.add("mpv-active");
-    document.documentElement.classList.add("mpv-active");
-    container.classList.add("mpv-mode");
-  }, []);
-
-  const clearMpvHole = useCallback(() => {
-    mpvHoleMarkedRef.current.forEach((el) => el.classList.remove("mpv-hole"));
-    mpvHoleMarkedRef.current = [];
-    document.body.classList.remove("mpv-active");
-    document.documentElement.classList.remove("mpv-active");
-    playerContainerRef.current?.classList.remove("mpv-mode");
-  }, []);
-
+  // 视频子窗口矩形。MPV 模式下视频位于原生层（WebView2 之上），
+  // DOM 控制条放在视频下方的预留条带内（不在 mpv 窗口矩形内，天然可见）
   const computeMpvRect = useCallback(() => {
     const container = playerContainerRef.current;
     if (!container) return null;
     const r = container.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) return null;
+    const usable = r.height - MPV_CONTROL_STRIP_PX;
+    if (r.width < 2 || usable < 2) return null;
     // getBoundingClientRect 返回 CSS 逻辑像素；Win32 子窗口定位用的是物理像素。
     // 高 DPI（125%/150% 缩放）下必须乘 devicePixelRatio，否则视频窗口会错位/缩小甚至完全看不到。
     const dpr = window.devicePixelRatio || 1;
@@ -670,7 +631,7 @@ export function MainPlayer({
       x: Math.round(r.left * dpr),
       y: Math.round(r.top * dpr),
       width: Math.round(r.width * dpr),
-      height: Math.round(r.height * dpr)
+      height: Math.round(usable * dpr)
     };
   }, []);
 
@@ -692,10 +653,9 @@ export function MainPlayer({
     } catch {
       // ignore
     }
-    clearMpvHole();
     setMpvActive(false);
     setMpvPaused(false);
-  }, [clearMpvHole]);
+  }, []);
 
   const mpvHeadersForPlatform = useCallback((p: Platform): Record<string, string> => {
     if (p === Platform.BILIBILI) {
@@ -725,7 +685,6 @@ export function MainPlayer({
         } catch {
           // ignore
         }
-        applyMpvHole();
         await invoke("mpv_play_cmd", {
           url,
           headers: mpvHeadersForPlatform(platform),
@@ -763,7 +722,6 @@ export function MainPlayer({
           return false;
         }
         setMpvActive(true);
-        setMpvControlsVisible(true);
         void invoke("mpv_set_volume_cmd", { volume: mpvVolume }).catch(() => {});
         return true;
       } catch (err) {
@@ -776,7 +734,7 @@ export function MainPlayer({
         return false;
       }
     },
-    [applyMpvHole, computeMpvRect, isSessionActive, mpvHeadersForPlatform, mpvVolume, platform, stopMpvSession]
+    [computeMpvRect, isSessionActive, mpvHeadersForPlatform, mpvVolume, platform, stopMpvSession]
   );
 
   // mpv 直播流事件（end/idle）兜底自动刷新（tryStartMpv 内的 listener 销毁前的兜底）
@@ -869,16 +827,9 @@ export function MainPlayer({
       // ignore
     }
     mpvUnlistenRef.current = null;
-    if (mpvHideTimerRef.current) {
-      clearTimeout(mpvHideTimerRef.current);
-      mpvHideTimerRef.current = null;
-    }
     void invoke("mpv_stop_cmd").catch(() => {});
-    clearMpvHole();
     setMpvActive(false);
     setMpvPaused(false);
-    setMpvControlsVisible(true);
-
     setIsFullScreen(false);
   }, []);
 
@@ -1038,26 +989,13 @@ export function MainPlayer({
       }
       if (!isSessionActive(sessionId)) return;
 
-      // ===== MPV 内核（默认）：原生 libmpv 渲染视频，WebView2 只画 UI/弹幕 =====
+      // ===== MPV 内核（默认）：原生 libmpv 渲染视频，WebView2 只画 UI =====
       if (engineRef.current === "mpv") {
         const mpvOk = await tryStartMpv(sessionId, url);
         if (!isSessionActive(sessionId)) return;
         if (mpvOk) {
-          try {
-            // 动态 import：danmu.js 依赖 window，不能静态引入（SSR 预渲染会崩）
-            const overlayMod: any = await import("@/components/player/danmuOverlay");
-            const overlay = overlayMod.createDanmuOverlayForHost(
-              playerContainerRef.current,
-              danmuSettings,
-              isDanmuEnabled
-            ) as DanmuOverlayInstance | null;
-            danmuOverlayRef.current = overlay;
-          } catch (e) {
-            console.warn("[MPV] danmaku overlay init failed:", e);
-          }
-          const backendRoomId = danmakuBackendRoomIdOverride || roomId;
-          const filterRoomId = danmakuFilterRoomIdOverride || backendRoomId;
-          await startDanmaku(sessionId, danmuOverlayRef.current, platform, backendRoomId, filterRoomId);
+          // MPV 模式：视频位于原生层（WebView2 之上），DOM 弹幕无法覆盖在画面上，
+          // 且跳过弹幕解析可显著降低 CPU 占用。需要弹幕请在导航栏切换 WebView2 内核。
           return;
         }
         // MPV 启动失败 → 本次会话回退 WebView2 内核（不覆盖用户持久化的内核选择）
@@ -1743,20 +1681,10 @@ export function MainPlayer({
                 </div>
               </div>
 
-              <div
-                ref={playerContainerRef}
-                className="video-player"
-                onMouseMove={engine === "mpv" && mpvActive ? bumpMpvControls : undefined}
-                onMouseLeave={engine === "mpv" && mpvActive ? hideMpvControls : undefined}
-              />
+              <div ref={playerContainerRef} className="video-player" />
 
               {engine === "mpv" && mpvActive ? (
-                <div
-                  className={`mpv-controls ${mpvControlsVisible ? "" : "mpv-controls-hidden"}`}
-                  data-tauri-drag-region="false"
-                  onMouseMove={bumpMpvControls}
-                  onMouseLeave={hideMpvControls}
-                >
+                <div className="mpv-controls" data-tauri-drag-region="false">
                   <div className="mpv-controls-group">
                     <span className="mpv-engine-badge">MPV</span>
                     <button
@@ -1811,18 +1739,17 @@ export function MainPlayer({
                     </button>
                   </div>
                   <div className="mpv-controls-group">
-                    <button
-                      type="button"
-                      className={`mpv-danmu-toggle ${isDanmuEnabled ? "" : "is-off"}`}
-                      title={isDanmuEnabled ? "关闭弹幕" : "开启弹幕"}
-                      onClick={() => setIsDanmuEnabled(!isDanmuEnabled)}
+                    {/* MPV 模式视频在原生层之上，DOM 弹幕无法覆盖画面——置灰占位并提示 */}
+                    <span
+                      className="mpv-danmu-toggle is-off is-disabled"
+                      title="MPV 内核暂不支持弹幕叠加，切换 WebView2 内核可看弹幕"
                     >
                       <span className="danmu-toggle-label">弹幕</span>
                       <span className="danmu-toggle-switch">
                         <span className="switch-track" />
                         <span className="switch-thumb" />
                       </span>
-                    </button>
+                    </span>
                     <select
                       value={currentQuality}
                       title="清晰度"
