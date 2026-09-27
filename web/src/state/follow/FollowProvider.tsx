@@ -3,7 +3,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
 
-export type Platform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI";
+export type Platform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI" | "TWITCH";
 
 export type FollowedStreamer = {
   id: string;
@@ -86,7 +86,7 @@ function normalizeStreamerKey(streamerKey: string) {
 }
 
 function isKnownPlatform(platform: string): platform is Platform {
-  return platform === "DOUYU" || platform === "DOUYIN" || platform === "HUYA" || platform === "BILIBILI";
+  return platform === "DOUYU" || platform === "DOUYIN" || platform === "HUYA" || platform === "BILIBILI" || platform === "TWITCH";
 }
 
 function normalizeListOrder(order: FollowListItem[]): FollowListItem[] {

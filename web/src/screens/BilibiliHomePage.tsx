@@ -1,17 +1,18 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
 import { BilibiliCookieControls } from "@/components/bilibili/BilibiliCookieControls";
 import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
 import { biliCategoriesData } from "@/platforms/bilibili/biliCategoriesData";
-import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
+import { useRememberedCategory } from "@/hooks/useRememberedCategory";
 
 export function BilibiliHomePage() {
-  const [selected, setSelected] = useState<CategorySelectedEvent | null>(null);
+  const remembered = useRememberedCategory("bilibili");
+  const selected = remembered.selected;
   const custom = useCustomCategories();
 
   const canSubscribe = !!selected?.cate2Href;
@@ -25,7 +26,8 @@ export function BilibiliHomePage() {
       <div style={{ flexShrink: 0, background: "transparent", zIndex: 10 }}>
         <CommonCategory
           categoriesData={biliCategoriesData as any}
-          onCategorySelected={(e) => setSelected(e)}
+          onCategorySelected={(e) => remembered.select(e)}
+          initialCate2Href={remembered.initialCate2Href}
           actions={
             <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
               <BilibiliCookieControls variant="category" />

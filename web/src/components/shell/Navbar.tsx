@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, m } from "framer-motion";
-import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, X } from "lucide-react";
+import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Settings, Sun, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -16,8 +16,10 @@ import { Platform } from "@/platforms/common/types";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
+import { useAppSettings } from "@/state/settings/SettingsProvider";
+import { SettingsModal } from "@/components/settings/SettingsModal";
 
-type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "custom";
+type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "twitch" | "custom";
 
 type VersionInfo = {
   version: string;
@@ -33,7 +35,8 @@ const basePlatforms: Array<{ id: Exclude<UiPlatform, "custom">; name: string }> 
   { id: "douyu", name: "斗鱼" },
   { id: "huya", name: "虎牙" },
   { id: "douyin", name: "抖音" },
-  { id: "bilibili", name: "B站" }
+  { id: "bilibili", name: "B站" },
+  { id: "twitch", name: "Twitch" }
 ];
 
 const customPlatform = { id: "custom" as const, name: "自定义" };
@@ -140,11 +143,26 @@ export function Navbar({
   const custom = useCustomCategories();
 
   const showCustomTab = custom.hydrated && custom.entries.length > 0;
+  const appSettings = useAppSettings();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // 平台设置：启用开关 + 排序（设置面板可改，全局生效 + 持久化）
+  const orderedBasePlatforms = useMemo(() => {
+    const enabled = basePlatforms.filter((p) => appSettings.settings.enabledPlatforms[p.id] !== false);
+    const order = appSettings.settings.platformOrder;
+    if (!order.length) return enabled;
+    return [...enabled].sort((a, b) => {
+      const ia = order.indexOf(a.id);
+      const ib = order.indexOf(b.id);
+      return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+    });
+  }, [appSettings.settings.enabledPlatforms, appSettings.settings.platformOrder]);
+
   const visiblePlatforms = useMemo(() => {
     // 对齐老项目：有自定义分区时，自定义入口放在最前面
-    if (showCustomTab) return [customPlatform, ...basePlatforms];
-    return basePlatforms;
-  }, [showCustomTab]);
+    if (showCustomTab) return [customPlatform, ...orderedBasePlatforms];
+    return orderedBasePlatforms;
+  }, [showCustomTab, orderedBasePlatforms]);
 
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -241,6 +259,7 @@ export function Navbar({
     if (activePlatform === "huya") return "搜索虎牙主播/房间...";
     if (activePlatform === "bilibili") return "搜索B站直播间...";
     if (activePlatform === "douyin") return "搜索直播间号";
+    if (activePlatform === "twitch") return "Twitch 暂不支持站内搜索";
     if (activePlatform === "custom") return "搜索：切到具体平台后可用";
     return "搜索斗鱼主播/房间...";
   }, [activePlatform]);
@@ -437,7 +456,9 @@ export function Navbar({
           ? "DOUYIN"
           : island.platform === Platform.HUYA
             ? "HUYA"
-            : "BILIBILI";
+            : island.platform === Platform.TWITCH
+              ? "TWITCH"
+              : "BILIBILI";
     return follow.isFollowed(fp, island.roomId);
   }, [follow, island.platform, island.roomId, island.visible]);
 
@@ -513,7 +534,9 @@ export function Navbar({
                       ? "DOUYIN"
                       : island.platform === Platform.HUYA
                         ? "HUYA"
-                        : "BILIBILI";
+                        : island.platform === Platform.TWITCH
+                          ? "TWITCH"
+                          : "BILIBILI";
                 if (follow.isFollowed(fp, island.roomId)) follow.unfollowStreamer(fp, island.roomId);
                 else {
                   follow.followStreamer({
@@ -713,6 +736,18 @@ export function Navbar({
           // eslint-disable-next-line react/no-unknown-property
           data-tauri-drag-region="false"
           className={styles.navIconBtn}
+          title="设置"
+          aria-label="设置"
+          onClick={() => setSettingsOpen(true)}
+        >
+          <Settings size={18} />
+        </button>
+
+        <button
+          type="button"
+          // eslint-disable-next-line react/no-unknown-property
+          data-tauri-drag-region="false"
+          className={styles.navIconBtn}
           title="Data Sync"
           aria-label="Data Sync"
           onClick={() => setLanSyncOpen(true)}
@@ -846,6 +881,7 @@ export function Navbar({
       </AnimatePresence>
 
       <LanSyncModal open={lanSyncOpen} onClose={() => setLanSyncOpen(false)} appVersion={localVersion} />
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </nav>
   );
 }

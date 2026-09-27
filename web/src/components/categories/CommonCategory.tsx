@@ -10,11 +10,14 @@ import type { Category1, Category2, CategorySelectedEvent } from "@/platforms/co
 export function CommonCategory({
   categoriesData,
   onCategorySelected,
-  actions
+  actions,
+  initialCate2Href
 }: {
   categoriesData: Category1[];
   onCategorySelected: (event: CategorySelectedEvent) => void;
   actions?: React.ReactNode;
+  /** 分类记忆：首次数据加载时优先选中的 cate2 href（不存在时回落第一个） */
+  initialCate2Href?: string | null;
 }) {
   const [cate1List, setCate1List] = useState<Category1[]>([]);
 
@@ -25,6 +28,11 @@ export function CommonCategory({
   const cate2ShellRef = useRef<HTMLDivElement | null>(null);
   const [overlayMaxHeight, setOverlayMaxHeight] = useState<number | null>(null);
   const emittedKeyRef = useRef<string | null>(null);
+  // 分类记忆恢复：只消费一次，避免后续数据变化再次跳转
+  const pendingInitialRef = useRef<string | null>(initialCate2Href ?? null);
+  useEffect(() => {
+    pendingInitialRef.current = initialCate2Href ?? null;
+  }, [initialCate2Href]);
 
   useEffect(() => {
     setCate1List(Array.isArray(categoriesData) ? categoriesData : []);
@@ -91,6 +99,22 @@ export function CommonCategory({
 
   useEffect(() => {
     if (cate1List.length === 0) return;
+
+    // 分类记忆恢复：数据就绪后优先定位记忆中的 cate2（跨 cate1 查找归属）
+    if (pendingInitialRef.current) {
+      const want = pendingInitialRef.current;
+      const owner = cate1List.find((c1) => (c1.subcategories ?? []).some((s) => s.href === want));
+      pendingInitialRef.current = null;
+      if (owner) {
+        setSelectedCate1Href(owner.href);
+        setSelectedCate2Href(want);
+        setExpanded(false);
+        return;
+      }
+      // 记忆目标已不存在（分类下架等）→ 清空回落默认
+      setSelectedCate2Href(null);
+    }
+
     if (!selectedCate1Href) {
       setSelectedCate1Href(cate1List[0].href);
       return;

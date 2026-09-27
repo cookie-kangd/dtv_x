@@ -13,6 +13,7 @@ import { useHuyaLiveRooms } from "@/hooks/liveRooms/useHuyaLiveRooms";
 import { useDouyinLiveRooms } from "@/hooks/liveRooms/useDouyinLiveRooms";
 import { useBilibiliLiveRooms } from "@/hooks/liveRooms/useBilibiliLiveRooms";
 import { useDouyuLiveRooms } from "@/hooks/liveRooms/useDouyuLiveRooms";
+import { useTwitchLiveRooms } from "@/hooks/liveRooms/useTwitchLiveRooms";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
 
 type DouyuCategorySelection = {
@@ -99,13 +100,15 @@ export function CommonStreamerList({
     platform === "bilibili" ? resolvedParentCategoryId : null
   );
   const douyu = useDouyuLiveRooms(platform === "douyu" ? douyuCategoryType : null, platform === "douyu" ? douyuCategoryId : null);
+  const twitch = useTwitchLiveRooms(platform === "twitch" ? categoryHref : null);
 
   const selected = useMemo(() => {
     if (platform === "douyin") return douyin;
     if (platform === "bilibili") return bilibili;
     if (platform === "douyu") return douyu;
+    if (platform === "twitch") return twitch;
     return huya;
-  }, [bilibili, douyin, douyu, huya, platform]);
+  }, [bilibili, douyin, douyu, twitch, huya, platform]);
 
   const rooms: CommonStreamer[] = selected.rooms;
   const isLoading = selected.isLoading;

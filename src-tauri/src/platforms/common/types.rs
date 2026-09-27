@@ -85,6 +85,11 @@ pub struct DouyuDanmakuState(pub std::sync::Mutex<Option<tokio::sync::mpsc::Send
 #[allow(dead_code)]
 pub struct HuyaDanmakuState(pub std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>);
 
+// State for the Twitch IRC Danmaku listener
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct TwitchDanmakuState(pub std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>);
+
 #[derive(Serialize, Clone, Debug, specta::Type)]
 pub struct DanmakuFrontendPayload {
     pub room_id: String,

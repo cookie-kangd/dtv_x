@@ -32,9 +32,11 @@ import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
+import { getTwitchStreamConfig } from "@/platforms/twitch/playerHelper";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useFollow, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
+import { useAppSettings } from "@/state/settings/SettingsProvider";
 
 declare global {
   // Used to guard against React StrictMode(dev) mount/unmount cycles accidentally stopping a newer player session.
@@ -81,7 +83,7 @@ const DEFAULT_DANMU_SETTINGS: DanmuUserSettings = {
 function resolveStoredQuality(platform: Platform) {
   try {
     const saved = window.localStorage.getItem(`${platform}_preferred_quality`);
-    if (saved && (qualityOptions as readonly string[]).includes(saved)) return saved;
+    if (saved && ((qualityOptions as readonly string[]).includes(saved) || platform === Platform.TWITCH)) return saved;
   } catch {
     // ignore
   }
@@ -200,6 +202,27 @@ export function MainPlayer({
   const router = useRouter();
   const follow = useFollow();
   const { setIsland, clearIsland, setFullscreen } = usePlayerUi();
+  const appSettings = useAppSettings();
+
+  // 全局默认画质（设置 → 基本设置）：仅在用户未手动选过画质时生效
+  useEffect(() => {
+    if (!appSettings.hydrated) return;
+    try {
+      if (!window.localStorage.getItem(`${platform}_preferred_quality`)) {
+        setCurrentQuality(appSettings.settings.defaultQuality);
+      }
+    } catch {
+      // ignore
+    }
+  }, [appSettings.hydrated, appSettings.settings.defaultQuality, platform]);
+
+  // 全局默认弹幕开关：仅当用户从未手动设置过弹幕偏好时生效
+  useEffect(() => {
+    if (!appSettings.hydrated) return;
+    if (appSettings.settings.danmuDefaultOn) return;
+    if (loadDanmuPreferences()) return; // 用户已有持久化偏好，不覆盖
+    setIsDanmuEnabled(false);
+  }, [appSettings.hydrated, appSettings.settings.danmuDefaultOn]);
   const { ensureProxyStarted, getAvatarSrc } = useImageProxy();
   const pageRef = useRef<HTMLDivElement | null>(null);
   const dragStartArmedRef = useRef(false);
@@ -240,6 +263,13 @@ export function MainPlayer({
   const lineOptions: LineOption[] = useMemo(() => lineOptionsByPlatform[platform] ?? [], [platform]);
   const [currentQuality, setCurrentQuality] = useState<string>(() =>
     typeof window === "undefined" ? "原画" : resolveStoredQuality(platform)
+  );
+  // Twitch 画质列表是动态的（原画/720P60/480P/仅音频...），由取流结果填充；
+  // 其他平台仍用静态 qualityOptions
+  const [qualityOptionsOverride, setQualityOptionsOverride] = useState<string[] | null>(null);
+  const effectiveQualityOptions = useMemo(
+    () => (qualityOptionsOverride && qualityOptionsOverride.length > 0 ? qualityOptionsOverride : [...qualityOptions]),
+    [qualityOptionsOverride]
   );
   const [currentLine, setCurrentLine] = useState<string | null>(() =>
     typeof window === "undefined" ? null : resolveStoredLine(platform, lineOptionsByPlatform[platform] ?? [])
@@ -575,7 +605,9 @@ export function MainPlayer({
           ? "DOUYIN"
           : platform === Platform.HUYA
             ? "HUYA"
-            : "BILIBILI";
+            : platform === Platform.TWITCH
+              ? "TWITCH"
+              : "BILIBILI";
     return follow.isFollowed(fp, roomId);
   }, [follow, platform, roomId]);
 
@@ -652,6 +684,11 @@ export function MainPlayer({
     } catch {
       // ignore
     }
+    try {
+      await invoke("stop_twitch_danmaku_listener", { roomId: "" });
+    } catch {
+      // ignore
+    }
   }, []);
 
   const stopAllProxies = useCallback(async () => {
@@ -703,13 +740,15 @@ export function MainPlayer({
            await invoke("start_douyin_danmu_listener", { payload });
          } else if (platformToStart === Platform.HUYA) {
            await invoke("start_huya_danmaku_listener", { payload: { args: { room_id_str: roomIdToStart } } });
-         } else if (platformToStart === Platform.BILIBILI) {
-           const cookie = typeof localStorage !== "undefined" ? localStorage.getItem("bilibili_cookie") : null;
-           await invoke("start_bilibili_danmaku_listener", {
-             payload: { args: { room_id_str: roomIdToStart } },
-             cookie: cookie || null
-           });
-         }
+        } else if (platformToStart === Platform.BILIBILI) {
+          const cookie = typeof localStorage !== "undefined" ? localStorage.getItem("bilibili_cookie") : null;
+          await invoke("start_bilibili_danmaku_listener", {
+            payload: { args: { room_id_str: roomIdToStart } },
+            cookie: cookie || null
+          });
+        } else if (platformToStart === Platform.TWITCH) {
+          await invoke("start_twitch_danmaku_listener", { payload: { args: { room_id_str: roomIdToStart } } });
+        }
        } catch (e) {
          console.warn("[Player] start danmaku backend failed:", e);
          return;
@@ -729,7 +768,8 @@ export function MainPlayer({
            level: String(p.user_level || 0),
            badgeLevel: p.fans_club_level > 0 ? String(p.fans_club_level) : undefined,
            room_id: p.room_id || effectiveFilterRoomId,
-           color: douyuColor(p.color)
+           // Twitch 弹幕颜色是 hex（#1E90FF），斗鱼是数字色号 → 分别处理
+           color: p.color && p.color.startsWith("#") ? p.color : douyuColor(p.color)
          };
 
         const contentLower = (msg.content || "").toLowerCase();
@@ -983,7 +1023,7 @@ export function MainPlayer({
       qualityPluginRef.current = player.registerPlugin?.(QualityControl, {
         position: POSITIONS.CONTROLS_RIGHT,
         index: 5,
-        options: [...qualityOptions],
+        options: [...effectiveQualityOptions],
         getCurrent: () => currentQualityRef.current,
         onSelect: (value: string) => {
           if (value === currentQualityRef.current) return;
@@ -1052,6 +1092,9 @@ export function MainPlayer({
 
       const effectiveQuality = overrides?.quality ?? currentQuality;
       const effectiveLine = typeof overrides?.line !== "undefined" ? overrides.line : currentLine;
+
+      // 每次重载先清掉动态画质列表（Twitch 分支会按取流结果重新填充）
+      setQualityOptionsOverride(null);
 
       await stopAllDanmakuBackends();
       await stopAllProxies();
@@ -1214,6 +1257,41 @@ export function MainPlayer({
             destroyPlayer();
             await mountPlayer(sessionId, streamUrl, streamType);
           }
+        } else if (platform === Platform.TWITCH) {
+          // Twitch：roomId 即频道 login；GQL 元数据 + usher m3u8 一次拿全
+          const cfg = await getTwitchStreamConfig(roomId, effectiveQuality);
+          if (!isSessionActive(sessionId)) return;
+          setPlayerTitle(cfg.title || null);
+          setPlayerAnchorName(cfg.anchorName || null);
+          setPlayerAvatar(cfg.avatar || null);
+          setPlayerIsLive(true);
+          if (cfg.qualities.length > 0) {
+            setQualityOptionsOverride(cfg.qualities);
+          }
+          const nextKind: "hls" | "flv" = "hls";
+          const player = playerRef.current;
+          const canSoftSwitch =
+            !!player &&
+            !!danmuOverlayRef.current &&
+            typeof player.switchURL === "function" &&
+            !!playbackKindRef.current &&
+            playbackKindRef.current === nextKind;
+          if (canSoftSwitch) {
+            try {
+              const ret = player.switchURL(cfg.streamUrl, { seamless: false });
+              if (ret && typeof (ret as any).then === "function") await ret;
+              if (isSessionActive(sessionId)) {
+                playbackKindRef.current = nextKind;
+                await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
+              }
+            } catch {
+              destroyPlayer();
+              await mountPlayer(sessionId, cfg.streamUrl, cfg.streamType);
+            }
+          } else {
+            destroyPlayer();
+            await mountPlayer(sessionId, cfg.streamUrl, cfg.streamType);
+          }
         }
       } catch (e: any) {
         if (!isSessionActive(sessionId)) return;
@@ -1311,14 +1389,14 @@ export function MainPlayer({
 
   useEffect(() => {
     try {
-      qualityPluginRef.current?.setOptions?.([...qualityOptions]);
+      qualityPluginRef.current?.setOptions?.([...effectiveQualityOptions]);
       qualityPluginRef.current?.updateLabel?.(currentQuality);
       linePluginRef.current?.setOptions?.([...lineOptions]);
       linePluginRef.current?.updateLabel?.(lineOptions.find((o) => o.key === resolveCurrentLineFor(lineOptions, currentLine))?.label ?? "线路");
     } catch {
       // ignore
     }
-  }, [currentLine, currentQuality, lineOptions]);
+  }, [currentLine, currentQuality, effectiveQualityOptions, lineOptions]);
 
   useEffect(() => {
     // quality / line change triggers reload (debounced a bit)
@@ -1339,7 +1417,9 @@ export function MainPlayer({
           ? "DOUYIN"
           : platform === Platform.HUYA
             ? "HUYA"
-            : "BILIBILI";
+            : platform === Platform.TWITCH
+              ? "TWITCH"
+              : "BILIBILI";
 
     return {
       id: roomId,

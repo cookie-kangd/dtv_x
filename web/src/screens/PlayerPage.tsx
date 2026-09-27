@@ -10,6 +10,7 @@ function toPlatformEnum(p: string): Platform {
   if (key === "douyin") return Platform.DOUYIN;
   if (key === "huya") return Platform.HUYA;
   if (key === "bilibili") return Platform.BILIBILI;
+  if (key === "twitch") return Platform.TWITCH;
   return Platform.DOUYU;
 }
 

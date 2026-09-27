@@ -7,9 +7,9 @@ import { m } from "framer-motion";
 import { CommonCategory } from "@/components/categories/CommonCategory";
 import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
 import type { Category1 } from "@/platforms/common/categoryTypes";
-import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import type { CommonPlatformCategory } from "@/platforms/common/types";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
+import { useRememberedCategory } from "@/hooks/useRememberedCategory";
 
 import styles from "./DouyuHomePage.module.css";
 
@@ -55,10 +55,11 @@ async function fetchDouyuCategories(): Promise<{
 
 export function DouyuHomePage() {
   const custom = useCustomCategories();
+  const remembered = useRememberedCategory("douyu");
+  const selected = remembered.selected;
   const [categories, setCategories] = useState<Category1[]>([]);
   const [cate2IdMap, setCate2IdMap] = useState<Record<string, string>>({});
   const [cate3Map, setCate3Map] = useState<Record<string, FrontendCate3Item[]>>({});
-  const [selected, setSelected] = useState<CategorySelectedEvent | null>(null);
   const [selectedCate3Id, setSelectedCate3Id] = useState<string | null>(null);
   const [selectedCate3Name, setSelectedCate3Name] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -172,7 +173,8 @@ export function DouyuHomePage() {
       <div style={{ flexShrink: 0, background: "transparent", zIndex: 10 }}>
         <CommonCategory
           categoriesData={categories}
-          onCategorySelected={(e) => setSelected(e)}
+          onCategorySelected={(e) => remembered.select(e)}
+          initialCate2Href={remembered.initialCate2Href}
           actions={
             <m.button
               type="button"

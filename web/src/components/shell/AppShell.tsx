@@ -13,7 +13,7 @@ import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
 import { PlayerOverlayHost, PlayerOverlayProvider, usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
 
-type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "custom";
+type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "twitch" | "custom";
 
 function normalizePathname(pathname: string) {
   const raw = String(pathname || "/");
@@ -27,6 +27,7 @@ function getActivePlatform(pathname: string): UiPlatform {
   if (p.startsWith("/douyin")) return "douyin";
   if (p.startsWith("/huya")) return "huya";
   if (p.startsWith("/bilibili")) return "bilibili";
+  if (p.startsWith("/twitch")) return "twitch";
   return "douyu";
 }
 
@@ -99,6 +100,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         douyin: "/douyin/",
         huya: "/huya/",
         bilibili: "/bilibili/",
+        twitch: "/twitch/",
         custom: "/custom/"
       };
 
@@ -123,6 +125,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       void router.prefetch("/douyin/");
       void router.prefetch("/huya/");
       void router.prefetch("/bilibili/");
+      void router.prefetch("/twitch/");
       if (custom.hydrated && custom.entries.length > 0) void router.prefetch("/custom/");
     } catch {
       // ignore

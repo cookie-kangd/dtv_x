@@ -229,6 +229,7 @@ fn main() {
             .manage(DouyuDanmakuHandles::default()) // Manage new DouyuDanmakuHandles
             .manage(DouyinDanmakuState::default()) // Manage DouyinDanmakuState
             .manage(HuyaDanmakuState::default()) // Manage HuyaDanmakuState
+            .manage(platforms::common::TwitchDanmakuState::default()) // Manage TwitchDanmakuState
             .manage(platforms::common::BilibiliDanmakuState::default()) // Manage BilibiliDanmakuState
             .manage(StreamUrlStore::default())
             .manage(proxy::ProxyServerHandle::default())
@@ -286,6 +287,11 @@ fn main() {
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,
                 version_check::check_version_cmd,
+                platforms::twitch::fetch_twitch_categories,
+                platforms::twitch::fetch_twitch_live_list,
+                platforms::twitch::get_twitch_stream_cmd,
+                platforms::twitch::start_twitch_danmaku_listener,
+                platforms::twitch::stop_twitch_danmaku_listener,
                 version_check::download_and_install_cmd,
             ])
             .run(tauri::generate_context!())
