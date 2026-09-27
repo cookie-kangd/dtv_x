@@ -148,7 +148,7 @@ export class DanmuSettingsControl extends Plugin {
 
     if (typeof document !== 'undefined') {
       this.handleDocumentClick = (event: MouseEvent) => {
-        if (!this.root.contains(event.target as Node)) {
+        if (!this.root?.contains(event.target as Node)) {
           this.closePanel();
         }
       };
@@ -249,7 +249,7 @@ export class DanmuSettingsControl extends Plugin {
         </div>
       </div>
     `;
-    this.root.appendChild(this.panel);
+    this.root?.appendChild(this.panel);
 
     this.panel.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -377,7 +377,7 @@ export class DanmuSettingsControl extends Plugin {
     }
     this.isOpen = true;
     this.panel.classList.add('show');
-    this.root.classList.add('menu-open');
+    this.root?.classList.add('menu-open');
     this.updateInputs();
   }
 
@@ -391,7 +391,7 @@ export class DanmuSettingsControl extends Plugin {
     }
     this.isOpen = false;
     this.panel.classList.remove('show');
-    this.root.classList.remove('menu-open');
+    this.root?.classList.remove('menu-open');
   }
 
   private updateInputs() {
@@ -587,7 +587,7 @@ export class DanmuKeywordBlockControl extends Plugin {
         <div class="block-hint">关键词对所有平台生效</div>
       </div>
     `;
-    this.root.appendChild(this.panel);
+    this.root?.appendChild(this.panel);
 
     this.panel.addEventListener('click', (event) => event.stopPropagation());
     this.panel.addEventListener('pointerdown', (event) => event.stopPropagation());
@@ -662,7 +662,7 @@ export class DanmuKeywordBlockControl extends Plugin {
     }
     this.isOpen = true;
     this.panel.classList.add('show');
-    this.root.classList.add('menu-open');
+    this.root?.classList.add('menu-open');
     this.updateUi();
     if (focusInput) {
       try {
@@ -679,7 +679,7 @@ export class DanmuKeywordBlockControl extends Plugin {
     }
     this.isOpen = false;
     this.panel.classList.remove('show');
-    this.root.classList.remove('menu-open');
+    this.root?.classList.remove('menu-open');
   }
 
   private updateUi() {
