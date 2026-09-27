@@ -3,7 +3,7 @@
 // 设置弹窗（参考 dtv_mx 的设置面板结构）：
 // 基本设置 / 平台设置 / 平台登录 / 关于（不放检查更新，只放应用简介）。
 // 所有设置写入 SettingsProvider（localStorage 持久化，关闭应用再打开依然生效）。
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { m, AnimatePresence } from "framer-motion";
 import { Info, LogIn, LogOut, MonitorSmartphone, Settings as SettingsIcon, SlidersHorizontal, Wrench, X } from "lucide-react";
 
@@ -199,7 +199,7 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
                   <>
                     <div className={styles.groupTitle}>平台启用</div>
                     <div className={styles.groupDesc}>关闭的平台将从顶部导航栏隐藏</div>
-                    {orderedPlatforms.map((id) => (
+                    {orderedPlatforms.map((id: string) => (
                       <div className={styles.row} key={id}>
                         <div className={styles.rowText}>
                           <div className={styles.rowName}>{PLATFORM_NAMES[id] || id}</div>
@@ -215,7 +215,7 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
                       平台排序
                     </div>
                     <div className={styles.groupDesc}>设置导航栏中平台的显示顺序</div>
-                    {orderedPlatforms.map((id, idx) => (
+                    {orderedPlatforms.map((id: string, idx: number) => (
                       <div className={styles.row} key={`order_${id}`}>
                         <div className={styles.rowText}>
                           <div className={styles.rowName}>
