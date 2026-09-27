@@ -1468,7 +1468,6 @@ export function MainPlayer({
 
               <div ref={playerContainerRef} className="video-player" />
 
-              ) : null}
 
               {isLoadingStream ? (
                 <div className="loading-player" style={{ position: "absolute", inset: 0, zIndex: 20 }}>
