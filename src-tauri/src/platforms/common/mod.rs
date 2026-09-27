@@ -11,4 +11,5 @@ pub use types::DouyinDanmakuState;
 pub use types::DouyuDanmakuState;
 pub use types::GetStreamUrlPayload;
 pub use types::HuyaDanmakuState;
+pub use types::TwitchDanmakuState;
 pub use types::LiveStreamInfo;
