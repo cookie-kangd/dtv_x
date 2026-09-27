@@ -98,26 +98,38 @@ pub async fn start_twitch_danmaku_listener(
                 let (ws_stream, _) = connect_async(DANMU_WS).await?;
                 let (mut ws_write, mut ws_read) = ws_stream.split();
 
+                // 单写者模式：ws_write 只归 writer_task 所有，其余任务通过
+                // 无界队列投递消息（keepalive 与 recv 侧的 PONG 都走这里），
+                // 避免 ws_write 的双重可变借用（E0499）。
+                let (out_tx, mut out_rx) = tokio_mpsc::unbounded_channel::<WsMessage>();
+
                 // 匿名登录三件套
-                ws_write
-                    .send(WsMessage::Text("CAP REQ :twitch.tv/tags twitch.tv/commands".into()))
-                    .await?;
-                let nick = format!(
-                    "justinfan{}",
-                    10_000 + (rand::random::<u64>() % 90_000)
-                );
-                ws_write.send(WsMessage::Text(format!("NICK {}", nick))).await?;
-                ws_write
-                    .send(WsMessage::Text(format!("JOIN #{}", channel_clone)))
-                    .await?;
+                let nick = format!("justinfan{}", 10_000 + (rand::random::<u64>() % 90_000));
+                let _ = out_tx.send(WsMessage::Text("CAP REQ :twitch.tv/tags twitch.tv/commands".into()));
+                let _ = out_tx.send(WsMessage::Text(format!("NICK {}", nick)));
+                let _ = out_tx.send(WsMessage::Text(format!("JOIN #{}", channel_clone)));
+
+                // 写者任务：独占 ws_write
+                let writer_task = async {
+                    while let Some(msg) = out_rx.recv().await {
+                        if ws_write.send(msg).await.is_err() {
+                            return Err::<(), anyhow::Error>(anyhow::anyhow!("Twitch ws write failed"));
+                        }
+                    }
+                    Err::<(), anyhow::Error>(anyhow::anyhow!("Twitch ws writer closed"))
+                };
 
                 // 周期性应用层心跳保活（服务端 PING 由 recv 侧回 PONG；
                 // 这里额外每 3 分钟主动 PONG 一次，避免部分网络环境下空闲断链）
+                let keepalive_tx = out_tx.clone();
                 let keepalive_task = async {
                     loop {
                         sleep(Duration::from_secs(180)).await;
-                        if ws_write.send(WsMessage::Text("PONG :tmi.twitch.tv".into())).await.is_err() {
-                            return Err::<(), anyhow::Error>(anyhow::anyhow!("Twitch keepalive send failed"));
+                        if keepalive_tx
+                            .send(WsMessage::Text("PONG :tmi.twitch.tv".into()))
+                            .is_err()
+                        {
+                            return Err::<(), anyhow::Error>(anyhow::anyhow!("Twitch keepalive channel closed"));
                         }
                     }
                 };
@@ -131,7 +143,7 @@ pub async fn start_twitch_danmaku_listener(
                         let text = match m {
                             WsMessage::Text(t) => t,
                             WsMessage::Ping(p) => {
-                                let _ = ws_write.send(WsMessage::Pong(p)).await;
+                                let _ = out_tx.send(WsMessage::Pong(p));
                                 continue;
                             }
                             WsMessage::Close(_) => {
@@ -148,7 +160,7 @@ pub async fn start_twitch_danmaku_listener(
                                 continue;
                             }
                             if line.starts_with("PING") {
-                                let _ = ws_write.send(WsMessage::Text("PONG :tmi.twitch.tv".into())).await;
+                                let _ = out_tx.send(WsMessage::Text("PONG :tmi.twitch.tv".into()));
                                 continue;
                             }
                             if !line.contains("PRIVMSG") {
@@ -174,6 +186,10 @@ pub async fn start_twitch_danmaku_listener(
 
                 tokio::select! {
                     _ = rx_shutdown.recv() => Ok(ConnectionOutcome::Stop),
+                    it = writer_task => {
+                        if let Err(e) = it { warn!("[Twitch Danmaku] {}", e); }
+                        Ok(ConnectionOutcome::Disconnected)
+                    }
                     it = keepalive_task => {
                         if let Err(e) = it { warn!("[Twitch Danmaku] {}", e); }
                         Ok(ConnectionOutcome::Disconnected)
