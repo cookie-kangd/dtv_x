@@ -231,7 +231,6 @@ export function MainPlayer({
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<any>(null);
   const playbackKindRef = useRef<null | "hls" | "flv">(null);
-  const wasPlayingBeforeHideRef = useRef(false);
   const danmuOverlayRef = useRef<DanmuOverlayInstance | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
 
@@ -309,29 +308,10 @@ export function MainPlayer({
     };
   }, [danmuKeywordBlock.keywords]);
 
-  // 页面隐藏（最小化/切到其他窗口不可见）时自动暂停播放，省 CPU/GPU；
-  // 恢复可见时仅在我们主动暂停的情况下续播（用户自己暂停的不动）。
-  useEffect(() => {
-    const onVisibility = () => {
-      const player = playerRef.current;
-      if (!player) return;
-      try {
-        if (document.hidden) {
-          if (!player.paused && !player.ended) {
-            wasPlayingBeforeHideRef.current = true;
-            player.pause();
-          }
-        } else if (wasPlayingBeforeHideRef.current) {
-          wasPlayingBeforeHideRef.current = false;
-          void player.play?.();
-        }
-      } catch {
-        // ignore
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, []);
+  // 说明：此前版本在页面隐藏时自动暂停播放，但被其它应用遮挡/切换窗口时会
+  // 误触发停播，影响"挂直播听声"的体验，已按用户要求移除。
+  // 窗口遮挡导致的渲染降级由 WebView2 启动参数
+  // --disable-backgrounding-occluded-windows 兜底（见 tauri.conf.json）。
 
   useEffect(() => {
     const keywordsEqual = (left: string[], right: string[]) => {
@@ -669,6 +649,20 @@ export function MainPlayer({
     }
     danmuOverlayRef.current = null;
 
+    // 释放解码器 / MSE 缓冲：先清空 video 源再销毁播放器，避免连续切换房间时
+    // 上一个流的数据残留在内存里（长时间浏览会持续涨内存）。
+    try {
+      const root = playerRef.current?.root as HTMLElement | null;
+      const video = root?.querySelector("video") as HTMLVideoElement | null;
+      if (video) {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      }
+    } catch {
+      // ignore
+    }
+
     try {
       playerRef.current?.destroy();
     } catch {
@@ -931,8 +925,16 @@ export function MainPlayer({
           enableWorker: true,
           withCredentials: false,
           lowLatencyMode: false,
-          // 限制回看缓冲，长时间直播挂机时控制内存增长
-          backBufferLength: 30,
+          // ===== 内存 / CPU / GPU 优化 =====
+          // 说明：不使用 capLevelToPlayerSize —— 它会把自动画质压到播放器像素尺寸
+          // 以下（例如 1100px 宽的播放区只给 480p），明显牺牲画质，得不偿失。
+          // 正向缓冲目标：默认 30s 偏大，直播无需那么多余量，降到 12s。
+          maxBufferLength: 12,
+          maxMaxBufferLength: 24,
+          // 缓冲区字节上限：默认 60MB，压到 20MB 控制内存峰值。
+          maxBufferSize: 20 * 1000 * 1000,
+          // 回看缓冲（已播放部分保留时长）：长时间挂机时控制内存增长。
+          backBufferLength: 20,
           fetchOptions: hlsFetchOptions,
           xhrSetup: (xhr: XMLHttpRequest, reqUrl?: string) => {
             try {

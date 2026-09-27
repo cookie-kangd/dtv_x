@@ -39,16 +39,28 @@ function Switch({
   onChange: (next: boolean) => void;
   disabled?: boolean;
 }) {
+  // 开启态除 CSS 类外，额外用 data-state 属性选择器 + 内联样式双重兜底，
+  // 避免被全局主题样式 / 构建期 CSS Modules 处理差异影响，保证"开=蓝色"稳定可见。
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
       disabled={disabled}
+      data-state={checked ? "checked" : "unchecked"}
       className={`${styles.switch} ${checked ? styles.switchOn : ""} ${disabled ? styles.switchDisabled : ""}`}
+      style={
+        checked
+          ? {
+              background: "#4d9fff",
+              borderColor: "#4d9fff",
+              boxShadow: "0 0 0 3px rgba(77, 159, 255, 0.18)"
+            }
+          : undefined
+      }
       onClick={() => onChange(!checked)}
     >
-      <span className={styles.switchThumb} />
+      <span className={styles.switchThumb} style={{ transform: checked ? "translateX(20px)" : "translateX(0)" }} />
     </button>
   );
 }

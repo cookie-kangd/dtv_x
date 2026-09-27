@@ -1,6 +1,7 @@
 use actix_web::{dev::ServerHandle, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use futures_util::TryStreamExt;
 use reqwest::Client;
+use url::Url;
 // awc removed for now due to API differences; using reqwest streaming
 use crate::StreamUrlStore;
 use serde::Deserialize;
@@ -208,6 +209,175 @@ async fn flv_proxy_handler(
     }
 }
 
+// ===================== HLS 代理（/hls?url=...） =====================
+//
+// 背景：Twitch 的 playlist 边缘节点（*.playlist.ttvnw.net）会校验 Origin 头，
+// 只放行 https://www.twitch.tv；而 WebView2 里跨域 XHR 一定会带上
+// Origin: http://tauri.localhost，且 Origin 属于 forbidden header（JS 无法改写），
+// 于是 hls.js 请求 m3u8 一律 403 → 播放黑屏转圈（弹幕走独立 IRC 通道所以正常）。
+//
+// 解决：让 hls.js 只请求本地代理，由 Rust 侧（reqwest）去回源。Rust 发出的请求
+// 不带 Origin，因此可正常取回 playlist / segment；m3u8 文本里的 URL 会被改写成
+// 指向本代理的绝对地址，保证后续请求同样绕开浏览器。
+
+/// 遵循系统代理的 HTTP 客户端（Twitch 等海外平台必须走系统代理，不能 no_proxy）
+#[derive(Clone)]
+pub struct SystemProxyHttpClient(pub Client);
+
+#[derive(Deserialize)]
+struct HlsQuery {
+    url: String,
+}
+
+fn is_playlist(url: &str, content_type: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_lowercase();
+    if path.ends_with(".m3u8") || path.ends_with(".m3u") {
+        return true;
+    }
+    let ct = content_type.to_lowercase();
+    ct.contains("mpegurl") || ct.contains("mpeg-url") || ct.contains("application/vnd.apple.mpeg")
+}
+
+fn absolutize(base: &Option<Url>, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    base.as_ref()?.join(raw).ok().map(|u| u.to_string())
+}
+
+/// 把 m3u8 中出现的 URL（含 #EXT-X-KEY / #EXT-X-MAP 的 URI="..." 属性）
+/// 全部改写成指向本代理的绝对 URL，避免 hls.js 用相对路径解析回原始域名。
+fn rewrite_playlist(text: &str, base_url: &str, proxy_base: &str) -> String {
+    let base = Url::parse(base_url).ok();
+    let to_proxy = |absolute: &str| -> String {
+        format!("{}/hls?url={}", proxy_base, urlencoding::encode(absolute))
+    };
+
+    let mut out = String::with_capacity(text.len() + 512);
+    for raw_line in text.split('\n') {
+        let line = raw_line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            out.push('\n');
+            continue;
+        }
+
+        if line.starts_with('#') {
+            // 标签行：只需处理内嵌的 URI="..."（如 #EXT-X-KEY / #EXT-X-MAP）
+            let mut result = line.to_string();
+            let mut cursor = 0usize;
+            while let Some(rel) = result[cursor..].find("URI=\"") {
+                let value_start = cursor + rel + 5;
+                let remain = &result[value_start..];
+                let value_end = match remain.find('"') {
+                    Some(idx) => value_start + idx,
+                    None => break,
+                };
+                let uri = result[value_start..value_end].to_string();
+                match absolutize(&base, &uri) {
+                    Some(absolute) => {
+                        let replaced = to_proxy(&absolute);
+                        result.replace_range(value_start..value_end, &replaced);
+                        cursor = value_start + replaced.len() + 1;
+                    }
+                    None => cursor = value_end + 1,
+                }
+                if cursor > result.len() {
+                    break;
+                }
+            }
+            out.push_str(&result);
+            out.push('\n');
+            continue;
+        }
+
+        // URL 行
+        match absolutize(&base, line) {
+            Some(absolute) => out.push_str(&to_proxy(&absolute)),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+async fn hls_proxy_handler(
+    req: HttpRequest,
+    query: web::Query<HlsQuery>,
+    client: web::Data<SystemProxyHttpClient>,
+) -> impl Responder {
+    let url = query.url.trim().to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return HttpResponse::BadRequest().body("invalid url");
+    }
+    let proxy_base = format!("http://{}", req.connection_info().host().to_string());
+
+    let upstream = client
+        .0
+        .get(&url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .header("Accept", "*/*")
+        .send()
+        .await;
+
+    let resp = match upstream {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[Rust/proxy.rs hls] upstream error {}: {}", url, e);
+            return HttpResponse::InternalServerError().body(format!("hls upstream error: {}", e));
+        }
+    };
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    if !status.is_success() {
+        let code = actix_web::http::StatusCode::from_u16(status.as_u16())
+            .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
+        eprintln!("[Rust/proxy.rs hls] upstream {} -> {}", url, status);
+        return HttpResponse::build(code).body(format!("upstream status {}", status));
+    }
+
+    match resp.bytes().await {
+        Ok(bytes) => {
+            if is_playlist(&url, &content_type) {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                let rewritten = rewrite_playlist(&text, &url, &proxy_base);
+                HttpResponse::Ok()
+                    .content_type(if content_type.is_empty() || content_type == "application/octet-stream" {
+                        "application/vnd.apple.mpegurl"
+                    } else {
+                        content_type.as_str()
+                    })
+                    .insert_header(("Content-Length", rewritten.len().to_string()))
+                    .insert_header(("Cache-Control", "no-store"))
+                    .body(rewritten)
+            } else {
+                HttpResponse::Ok()
+                    .content_type(content_type)
+                    .insert_header(("Content-Length", bytes.len().to_string()))
+                    .insert_header(("Cache-Control", "no-store"))
+                    .body(bytes)
+            }
+        }
+        Err(e) => {
+            eprintln!("[Rust/proxy.rs hls] read body error {}: {}", url, e);
+            HttpResponse::InternalServerError().body(format!("hls read error: {}", e))
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn start_proxy(
     _app_handle: AppHandle,
@@ -248,12 +418,24 @@ pub async fn start_proxy(
                 .build()
                 .expect("failed to build client"),
         );
+        // 走系统代理的客户端（Twitch 等海外平台回源用）
+        let app_data_system_client = web::Data::new(SystemProxyHttpClient(
+            Client::builder()
+                .http1_only()
+                .pool_max_idle_per_host(8)
+                .tcp_keepalive(Duration::from_secs(60))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("failed to build system proxy client"),
+        ));
         App::new()
             .app_data(app_data_stream_url)
             .app_data(app_data_reqwest_client)
+            .app_data(app_data_system_client)
             .wrap(actix_cors::Cors::permissive())
             .route("/live.flv", web::get().to(flv_proxy_handler))
             .route("/image", web::get().to(image_proxy_handler))
+            .route("/hls", web::get().to(hls_proxy_handler))
     })
     .keep_alive(Duration::from_secs(120))
     .bind(("127.0.0.1", port))
@@ -317,12 +499,24 @@ pub async fn start_static_proxy_server(
                 .build()
                 .expect("failed to build client"),
         );
+        // 走系统代理的客户端（Twitch 等海外平台回源用）
+        let app_data_system_client = web::Data::new(SystemProxyHttpClient(
+            Client::builder()
+                .http1_only()
+                .pool_max_idle_per_host(8)
+                .tcp_keepalive(Duration::from_secs(60))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("failed to build system proxy client"),
+        ));
         App::new()
             .app_data(app_data_stream_url)
             .app_data(app_data_reqwest_client)
+            .app_data(app_data_system_client)
             .wrap(actix_cors::Cors::permissive())
             .route("/live.flv", web::get().to(flv_proxy_handler))
             .route("/image", web::get().to(image_proxy_handler))
+            .route("/hls", web::get().to(hls_proxy_handler))
     })
     .keep_alive(Duration::from_secs(120))
     .bind(("127.0.0.1", port))
