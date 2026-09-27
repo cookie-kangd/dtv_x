@@ -5,8 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CommonStreamer } from "@/platforms/common/streamerTypes";
 
 // Twitch 分区键形态（与 dtv_mx 一致）：
-// - "twitch:top"       → 推荐（官方热门流）
-// - "twitch:g:<slug>"  → 指定游戏分类
+// - "twitch:top"       → 推荐（中文热门目录，服务端 ZH 过滤，单页无游标）
+// - "twitch:g:<slug>"  → 指定游戏分类（全局热门，游标分页）
 export function parseTwitchCategoryKey(key: string | null): { slug: string | null } {
   if (!key) return { slug: null };
   if (key.startsWith("twitch:g:")) {

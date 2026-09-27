@@ -1,7 +1,9 @@
 // Twitch 平台 API（参考 dtv_mx 的 TwitchApiAndroid 实现）。
 //
 // 链路：
-// - 列表/分类/搜索：GQL（https://gql.twitch.tv/gql），匿名 + Client-ID + X-Device-Id
+// - 分类/分类内列表：GQL ad-hoc 查询（https://gql.twitch.tv/gql），匿名 + Client-ID + X-Device-Id
+// - 「推荐」列表：DirectoryPage_Game persisted query + broadcasterLanguages=ZH（中文热门，
+//   对齐网页版中文用户的推荐内容；ad-hoc streams(languages:) 会被服务端静默忽略）
 // - 播放：PlaybackAccessToken（persisted query）→ usher master m3u8 → 解析画质变体
 // 注意：Twitch 在国内无法直连，reqwest 默认遵循系统代理环境变量（与 WebView2 行为一致），
 // 因此这里**不要**像国内平台那样 no_proxy()。
@@ -17,6 +19,15 @@ const REFERER: &str = "https://www.twitch.tv/";
 // PlaybackAccessToken 的官方 persisted query（与 dtv_mx 一致）
 const PLAYBACK_ACCESS_TOKEN_HASH: &str =
     "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712";
+
+// 目录页 persisted query（网页版「浏览」页同款，支持 broadcasterLanguages 语言过滤；
+// ad-hoc 的 streams(languages:) 会被服务端静默忽略，只有这个 persisted 查询真正生效）
+const DIRECTORY_GAME_HASH: &str =
+    "86bcceb4e8b1a51256ff8eed8bd8aae4acacf80d737efe904f84f3aeadf8cafd";
+// 「推荐」分区用中文热门目录（谈天说地 = Just Chatting，中文主播聚集地，
+// 与网页版中文用户看到的推荐内容一致）。注意：游标翻页会触发 Twitch 反爬
+// integrity check，因此中文推荐只取单页（40 条），不跟随游标。
+const ZH_DIRECTORY_SLUG: &str = "just-chatting";
 
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -70,6 +81,92 @@ async fn gql(query: &str, variables: serde_json::Value) -> Result<serde_json::Va
 
 fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
+}
+
+// 目录页 persisted query（POST 一次，容忍响应里的 per-field error——
+// 该 persisted 文档的 profileImageURL 字段在服务端会报错但数据仍完整返回）
+async fn gql_persisted_directory(
+    slug: &str,
+    limit: i64,
+) -> Result<serde_json::Value, String> {
+    let body = serde_json::json!({
+        "operationName": "DirectoryPage_Game",
+        "extensions": { "persistedQuery": { "version": 1, "sha256Hash": DIRECTORY_GAME_HASH } },
+        "variables": {
+            "limit": limit,
+            "slug": slug,
+            "imageWidth": 320,
+            "includeCostreaming": false,
+            "options": {
+                "broadcasterLanguages": ["ZH"],
+                "freeformTags": null,
+                "includeRestricted": ["SUB_ONLY_LIVE"],
+                "recommendationsContext": { "platform": "web" },
+                "sort": "VIEWER_COUNT",
+                "systemFilters": [],
+                "tags": [],
+                "requestID": "JIRA-VXP-2397",
+            },
+            "sortTypeIsRecency": false,
+        }
+    });
+    let resp = http_client()
+        .post(GQL_URL)
+        .header("Client-ID", CLIENT_ID)
+        .header("X-Device-Id", device_id().as_str())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Twitch 目录请求失败: {}", e))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Twitch 目录 HTTP {}", status));
+    }
+    let root: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Twitch 目录响应解析失败: {}", e))?;
+    if root["data"].is_null() {
+        return Err(format!(
+            "Twitch 目录返回错误: {}",
+            root["errors"].to_string().chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(root["data"].clone())
+}
+
+// 批量补头像：users(logins:) ad-hoc 查询（中文目录 persisted 响应里 avatar 字段会报错为空）
+async fn fetch_user_avatars(logins: &[String]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if logins.is_empty() {
+        return out;
+    }
+    let body = serde_json::json!({
+        "query": "query($logins:[String!]){users(logins:$logins){login profileImageURL(width:70)}}",
+        "variables": { "logins": logins }
+    });
+    let resp = http_client()
+        .post(GQL_URL)
+        .header("Client-ID", CLIENT_ID)
+        .header("X-Device-Id", device_id().as_str())
+        .json(&body)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    let root: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    if let Some(users) = root["data"]["users"].as_array() {
+        for u in users {
+            if let (Some(login), Some(url)) = (json_str(u, "login"), json_str(u, "profileImageURL")) {
+                out.insert(login.to_string(), url.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn node_to_item(node: &serde_json::Value) -> Option<TwitchStreamerFrontend> {
@@ -186,17 +283,6 @@ pub struct TwitchLiveListResponse {
     pub has_more: bool,
 }
 
-const STREAMS_QUERY: &str = r#"
-query($first:Int,$cursor:Cursor){
-  streams(first:$first,after:$cursor){
-    edges{ cursor node{ id title viewersCount previewImageURL(width:320,height:180)
-      game{ displayName slug }
-      broadcaster{ login displayName profileImageURL(width:70) } } }
-    pageInfo{ hasNextPage }
-  }
-}
-"#;
-
 const GAME_STREAMS_QUERY: &str = r#"
 query($slug:String!,$first:Int,$cursor:Cursor){
   game(slug:$slug){
@@ -241,7 +327,15 @@ pub async fn fetch_twitch_live_list(
     cursor: Option<String>,
 ) -> Result<TwitchLiveListResponse, String> {
     let slug_clean = slug.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let query = if slug_clean.is_some() { GAME_STREAMS_QUERY } else { STREAMS_QUERY };
+
+    // 「推荐」分区：改用中文热门目录（谈天说地 + ZH 过滤），
+    // 对齐网页版中文用户看到的推荐内容（原全局热门几乎全是英文频道）。
+    // 游标翻页会触发 Twitch 反爬 integrity check，故只取单页、不再加载更多。
+    if slug_clean.is_none() {
+        return fetch_zh_recommend_list().await;
+    }
+
+    let query = GAME_STREAMS_QUERY;
     let mut variables = serde_json::json!({ "first": 30 });
     if let Some(s) = &slug_clean {
         variables["slug"] = serde_json::json!(s);
@@ -258,6 +352,39 @@ pub async fn fetch_twitch_live_list(
                 data: Some(items),
                 cursor: next_cursor,
                 has_more,
+            })
+        }
+        Err(e) => Ok(TwitchLiveListResponse {
+            error: 1,
+            msg: Some(e),
+            data: None,
+            cursor: None,
+            has_more: false,
+        }),
+    }
+}
+
+// 中文推荐单页：DirectoryPage_Game(just-chatting, ZH) + users 批量补头像
+async fn fetch_zh_recommend_list() -> Result<TwitchLiveListResponse, String> {
+    match gql_persisted_directory(ZH_DIRECTORY_SLUG, 40).await {
+        Ok(data) => {
+            let (items, _cursor, _has_more) = parse_streams(&data);
+            let mut items = items;
+            let logins: Vec<String> = items.iter().map(|i| i.room_id.clone()).collect();
+            let avatars = fetch_user_avatars(&logins).await;
+            for it in items.iter_mut() {
+                if let Some(a) = avatars.get(&it.room_id) {
+                    if !a.is_empty() {
+                        it.avatar = a.clone();
+                    }
+                }
+            }
+            Ok(TwitchLiveListResponse {
+                error: 0,
+                msg: None,
+                data: Some(items),
+                cursor: None,
+                has_more: false,
             })
         }
         Err(e) => Ok(TwitchLiveListResponse {
@@ -395,30 +522,62 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
 
 async fn build_usher_url(login: &str) -> Result<String, String> {
     let (token, sig) = fetch_playback_token(login).await?;
+    // supported_codecs=h264：强制只下发 H.264 变体（WebView2 对 HEVC/AV1 支持不稳定）；
+    // device_id / play_session_id 与网页版播放器行为对齐，减少边缘节点 502/风控概率
     Ok(format!(
-        "{}{}.m3u8?token={}&sig={}&allow_source=true&allow_audio_only=true&platform=web&player=site",
+        "{}{}.m3u8?token={}&sig={}&allow_source=true&allow_audio_only=true&platform=web&player=site&supported_codecs=h264&device_id={}&play_session_id={}",
         USHER_URL,
         login,
         urlencoding::encode(&token),
-        sig
+        sig,
+        device_id().as_str(),
+        play_session_id().as_str()
     ))
 }
 
-/// 拉取 usher master m3u8，返回 (master_url, 画质变体列表)
+// 进程内稳定的播放会话串（usher play_session_id，网页版每次播放随机生成）
+fn play_session_id() -> &'static String {
+    static PLAY_SESSION: OnceLock<String> = OnceLock::new();
+    PLAY_SESSION.get_or_init(|| {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        (0..32).map(|_| format!("{:x}", rng.gen_range(0..16))).collect()
+    })
+}
+
+/// 拉取 usher master m3u8，返回 (master_url, 画质变体列表)。
+/// usher 边缘节点偶发 502，重试一次。
 async fn fetch_usher_playlist(login: &str) -> Result<(String, Vec<TwitchStreamVariant>), String> {
-    let usher_url = build_usher_url(login).await?;
-    let resp = http_client()
-        .get(&usher_url)
-        .header("Referer", REFERER)
-        .send()
-        .await
-        .map_err(|e| format!("获取 Twitch 画质列表失败: {}", e))?;
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    let variants = parse_master_playlist(&text);
-    if variants.is_empty() {
-        return Err("该频道未返回可用画质".to_string());
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let usher_url = build_usher_url(login).await?;
+        match http_client()
+            .get(&usher_url)
+            .header("Referer", REFERER)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    let variants = parse_master_playlist(&text);
+                    if variants.is_empty() {
+                        return Err("该频道未返回可用画质".to_string());
+                    }
+                    return Ok((usher_url, variants));
+                }
+                last_err = format!("获取 Twitch 画质列表 HTTP {}", status);
+            }
+            Err(e) => {
+                last_err = format!("获取 Twitch 画质列表失败: {}", e);
+            }
+        }
     }
-    Ok((usher_url, variants))
+    Err(last_err)
 }
 
 #[tauri::command]

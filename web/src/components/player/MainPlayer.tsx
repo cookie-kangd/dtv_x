@@ -231,6 +231,7 @@ export function MainPlayer({
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<any>(null);
   const playbackKindRef = useRef<null | "hls" | "flv">(null);
+  const wasPlayingBeforeHideRef = useRef(false);
   const danmuOverlayRef = useRef<DanmuOverlayInstance | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
 
@@ -307,6 +308,30 @@ export function MainPlayer({
       keywordsLower: (danmuKeywordBlock.keywords ?? []).map((k) => String(k || "").trim().toLowerCase()).filter(Boolean)
     };
   }, [danmuKeywordBlock.keywords]);
+
+  // 页面隐藏（最小化/切到其他窗口不可见）时自动暂停播放，省 CPU/GPU；
+  // 恢复可见时仅在我们主动暂停的情况下续播（用户自己暂停的不动）。
+  useEffect(() => {
+    const onVisibility = () => {
+      const player = playerRef.current;
+      if (!player) return;
+      try {
+        if (document.hidden) {
+          if (!player.paused && !player.ended) {
+            wasPlayingBeforeHideRef.current = true;
+            player.pause();
+          }
+        } else if (wasPlayingBeforeHideRef.current) {
+          wasPlayingBeforeHideRef.current = false;
+          void player.play?.();
+        }
+      } catch {
+        // ignore
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
 
   useEffect(() => {
     const keywordsEqual = (left: string[], right: string[]) => {
@@ -881,12 +906,21 @@ export function MainPlayer({
       };
 
       if (isHlsPlayback) {
-        const hlsFetchOptions: RequestInit = {
-          referrer: "https://live.bilibili.com/",
-          referrerPolicy: "no-referrer-when-downgrade",
-          credentials: "omit",
-          mode: "cors"
-        };
+        // Referer/Origin 伪装头仅对 B 站 CDN 生效。
+        // Twitch 的 playlist 边缘节点会对带第三方 Origin 的请求返回 403，
+        // 导致 hls.js 无限重试（黑屏一直加载、弹幕正常），因此按 URL 判定。
+        const isBiliSource = /(^|\.)bilibili/i.test(url || "");
+        const hlsFetchOptions: RequestInit = isBiliSource
+          ? {
+              referrer: "https://live.bilibili.com/",
+              referrerPolicy: "no-referrer-when-downgrade",
+              credentials: "omit",
+              mode: "cors"
+            }
+          : {
+              credentials: "omit",
+              mode: "cors"
+            };
 
         playerOptions.plugins = [HlsPlugin];
         playerOptions.useHlsPlugin = true;
@@ -897,12 +931,17 @@ export function MainPlayer({
           enableWorker: true,
           withCredentials: false,
           lowLatencyMode: false,
+          // 限制回看缓冲，长时间直播挂机时控制内存增长
+          backBufferLength: 30,
           fetchOptions: hlsFetchOptions,
-          xhrSetup: (xhr: XMLHttpRequest) => {
+          xhrSetup: (xhr: XMLHttpRequest, reqUrl?: string) => {
             try {
               xhr.withCredentials = false;
-              xhr.setRequestHeader("Referer", "https://live.bilibili.com/");
-              xhr.setRequestHeader("Origin", "https://live.bilibili.com");
+              const target = reqUrl || url || "";
+              if (/(^|\.)bilibili/i.test(target)) {
+                xhr.setRequestHeader("Referer", "https://live.bilibili.com/");
+                xhr.setRequestHeader("Origin", "https://live.bilibili.com");
+              }
             } catch {
               // ignore
             }
