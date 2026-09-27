@@ -243,7 +243,7 @@ export class QualityControl extends Plugin {
 
     if (typeof document !== 'undefined') {
       this.handleDocumentClick = (event: MouseEvent) => {
-        if (!this.root.contains(event.target as Node)) {
+        if (!this.root?.contains(event.target as Node)) {
           this.hideDropdown();
         }
       };
@@ -333,7 +333,7 @@ export class QualityControl extends Plugin {
   private createDropdown() {
     this.dropdown = document.createElement('div');
     this.dropdown.className = 'xgplayer-quality-dropdown';
-    this.root.appendChild(this.dropdown);
+    this.root?.appendChild(this.dropdown);
     this.populateDropdown();
   }
 
@@ -398,7 +398,7 @@ export class QualityControl extends Plugin {
       this.hoverCloseTimer = null;
     }
     this.dropdown.classList.add('show');
-    this.root.classList.add('menu-open');
+    this.root?.classList.add('menu-open');
     this.updateActiveState(this.getCurrent());
   }
 
@@ -410,7 +410,7 @@ export class QualityControl extends Plugin {
     if (this.dropdown) {
       this.dropdown.classList.remove('show');
     }
-    this.root.classList.remove('menu-open');
+    this.root?.classList.remove('menu-open');
   }
 
   private updateActiveState(current: string) {
@@ -494,7 +494,7 @@ export class LineControl extends Plugin {
 
     if (typeof document !== 'undefined') {
       this.handleDocumentClick = (event: MouseEvent) => {
-        if (!this.root.contains(event.target as Node)) {
+        if (!this.root?.contains(event.target as Node)) {
           this.hideDropdown();
         }
       };
@@ -601,7 +601,7 @@ export class LineControl extends Plugin {
   private createDropdown() {
     this.dropdown = document.createElement('div');
     this.dropdown.className = 'xgplayer-line-dropdown';
-    this.root.appendChild(this.dropdown);
+    this.root?.appendChild(this.dropdown);
     this.populateDropdown();
   }
 
@@ -667,7 +667,7 @@ export class LineControl extends Plugin {
       this.hoverCloseTimer = null;
     }
     this.dropdown.classList.add('show');
-    this.root.classList.add('menu-open');
+    this.root?.classList.add('menu-open');
     this.updateActiveState(this.getCurrentKey());
   }
 
@@ -679,7 +679,7 @@ export class LineControl extends Plugin {
     if (this.dropdown) {
       this.dropdown.classList.remove('show');
     }
-    this.root.classList.remove('menu-open');
+    this.root?.classList.remove('menu-open');
   }
 
   private updateActiveState(currentKey: string) {
