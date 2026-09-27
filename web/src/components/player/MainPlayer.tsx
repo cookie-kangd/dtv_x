@@ -579,11 +579,10 @@ export function MainPlayer({
     return follow.isFollowed(fp, roomId);
   }, [follow, platform, roomId]);
 
-  // WebView2 内核模式：切回前台时若视频意外暂停则自动恢复（后台节流已由 Rust 侧禁用，这里是兜底）
+  // 切回前台时若视频意外暂停则自动恢复（后台节流已由 Rust 侧禁用，这里是兜底）
   useEffect(() => {
     const onVis = () => {
       if (document.visibilityState !== "visible") return;
-      if (engineRef.current !== "webview") return;
       try {
         const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
         if (video && video.paused && !video.ended && video.readyState > 0) {
