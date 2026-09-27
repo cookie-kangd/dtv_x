@@ -87,15 +87,6 @@ export function Navbar({
   const [isWindows, setIsWindows] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
 
-  const [playerEngine, setPlayerEngine] = useState<"mpv" | "webview">("mpv");
-  useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem("dtv_player_engine");
-      setPlayerEngine(saved === "webview" ? "webview" : "mpv");
-    } catch {
-      // ignore
-    }
-  }, []);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [lanSyncOpen, setLanSyncOpen] = useState(false);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
@@ -715,27 +706,6 @@ export function Navbar({
         >
           <span className={styles.versionText}>v{localVersion || "?"}</span>
           {hasUpdate ? <span className={styles.badgeNew}>NEW</span> : null}
-        </button>
-
-        <button
-          type="button"
-          // eslint-disable-next-line react/no-unknown-property
-          data-tauri-drag-region="false"
-          className={styles.navIconBtn}
-          title={`播放内核：${playerEngine === "mpv" ? "MPV（点击切换为 WebView2）" : "WebView2（点击切换为 MPV）"}`}
-          aria-label="切换播放内核"
-          onClick={() => {
-            const next = playerEngine === "mpv" ? "webview" : "mpv";
-            setPlayerEngine(next);
-            try {
-              window.localStorage.setItem("dtv_player_engine", next);
-            } catch {
-              // ignore
-            }
-            window.dispatchEvent(new CustomEvent("dtv-x:engine-changed", { detail: { engine: next } }));
-          }}
-        >
-          <span className={styles.versionText}>{playerEngine === "mpv" ? "MPV" : "WEB"}</span>
         </button>
 
         <button

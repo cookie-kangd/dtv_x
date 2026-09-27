@@ -44,9 +44,6 @@ declare global {
 
 const qualityOptions = ["原画", "高清", "标清"] as const;
 
-// MPV 模式下视频矩形底部预留的控制条高度（CSS px，需与 player.css 的 .mpv-controls 高度一致）
-const MPV_CONTROL_STRIP_PX = 48;
-
 const PLAYER_DRAG_EXCLUDED_SELECTOR = [
   // App chrome / topbar (主播信息栏 & 关闭/关注按钮等)
   ".player-topbar",
@@ -582,189 +579,6 @@ export function MainPlayer({
     return follow.isFollowed(fp, roomId);
   }, [follow, platform, roomId]);
 
-  // ===== MPV 内核模式（默认；启动失败自动回退 WebView2） =====
-  const engineRef = useRef<"mpv" | "webview">("mpv");
-  const [engine, setEngine] = useState<"mpv" | "webview">("mpv");
-  const [mpvActive, setMpvActive] = useState(false);
-  const [mpvPaused, setMpvPaused] = useState(false);
-  const [mpvMuted, setMpvMuted] = useState(false);
-  const [mpvVolume, setMpvVolume] = useState<number>(() => {
-    const v = loadStoredVolume();
-    return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : 100;
-  });
-  const mpvUnlistenRef = useRef<(() => void) | null>(null);
-  const mpvResizeObserverRef = useRef<ResizeObserver | null>(null);
-
-  const setEnginePersist = useCallback((next: "mpv" | "webview", persist = true) => {
-    engineRef.current = next;
-    setEngine(next);
-    if (persist) {
-      try {
-        window.localStorage.setItem("dtv_player_engine", next);
-      } catch {
-        // ignore
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem("dtv_player_engine");
-      setEnginePersist(saved === "webview" ? "webview" : "mpv", false);
-    } catch {
-      // ignore
-    }
-  }, [setEnginePersist]);
-
-  // 视频子窗口矩形。MPV 模式下视频位于原生层（WebView2 之上），
-  // DOM 控制条放在视频下方的预留条带内（不在 mpv 窗口矩形内，天然可见）
-  const computeMpvRect = useCallback(() => {
-    const container = playerContainerRef.current;
-    if (!container) return null;
-    const r = container.getBoundingClientRect();
-    const usable = r.height - MPV_CONTROL_STRIP_PX;
-    if (r.width < 2 || usable < 2) return null;
-    // getBoundingClientRect 返回 CSS 逻辑像素；Win32 子窗口定位用的是物理像素。
-    // 高 DPI（125%/150% 缩放）下必须乘 devicePixelRatio，否则视频窗口会错位/缩小甚至完全看不到。
-    const dpr = window.devicePixelRatio || 1;
-    return {
-      x: Math.round(r.left * dpr),
-      y: Math.round(r.top * dpr),
-      width: Math.round(r.width * dpr),
-      height: Math.round(usable * dpr)
-    };
-  }, []);
-
-  const stopMpvSession = useCallback(async () => {
-    try {
-      mpvResizeObserverRef.current?.disconnect();
-    } catch {
-      // ignore
-    }
-    mpvResizeObserverRef.current = null;
-    try {
-      mpvUnlistenRef.current?.();
-    } catch {
-      // ignore
-    }
-    mpvUnlistenRef.current = null;
-    try {
-      await invoke("mpv_stop_cmd");
-    } catch {
-      // ignore
-    }
-    setMpvActive(false);
-    setMpvPaused(false);
-  }, []);
-
-  const mpvHeadersForPlatform = useCallback((p: Platform): Record<string, string> => {
-    if (p === Platform.BILIBILI) {
-      return { Referer: "https://live.bilibili.com/", Origin: "https://live.bilibili.com" };
-    }
-    if (p === Platform.DOUYIN) {
-      return { Referer: "https://live.douyin.com/" };
-    }
-    return {};
-  }, []);
-
-  // 启动 mpv 会话 + watchdog：15s 内 time-pos 未走动视为失败（返回 false → 回退 WebView2）
-  const tryStartMpv = useCallback(
-    async (sessionId: number, url: string): Promise<boolean> => {
-      const container = playerContainerRef.current;
-      if (!container || !isSessionActive(sessionId)) return false;
-      try {
-        const available = await invoke<boolean>("mpv_is_available_cmd");
-        if (!available) {
-          console.warn("[MPV] libmpv-2.dll 不可用，回退 WebView2 内核");
-          return false;
-        }
-        const rect = computeMpvRect();
-        if (!rect) return false;
-        try {
-          await invoke("mpv_stop_cmd");
-        } catch {
-          // ignore
-        }
-        await invoke("mpv_play_cmd", {
-          url,
-          headers: mpvHeadersForPlatform(platform),
-          rect
-        });
-        if (!isSessionActive(sessionId)) return false;
-
-        // 尺寸跟随（窗口缩放/最大化/全屏）
-        mpvResizeObserverRef.current = new ResizeObserver(() => {
-          const next = computeMpvRect();
-          if (next) {
-            void invoke("mpv_set_rect_cmd", { rect: next }).catch(() => {});
-          }
-        });
-        mpvResizeObserverRef.current.observe(container);
-
-        // 直播流结束/空闲 → 自动重新拉流：统一由全局 mpv-event 监听处理（组件卸载前兜底），
-        // 此处不再重复注册，避免断流时触发双重 reload
-
-        // watchdog：确认真的在播
-        const deadline = Date.now() + 15000;
-        let playing = false;
-        while (Date.now() < deadline) {
-          if (!isSessionActive(sessionId)) return false;
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          const t = await invoke<number | null>("mpv_time_pos_cmd").catch(() => null);
-          if (t != null && t > 0.5) {
-            playing = true;
-            break;
-          }
-        }
-        if (!playing) {
-          console.warn("[MPV] 15s 内未开始播放，自动回退 WebView2 内核");
-          await stopMpvSession();
-          return false;
-        }
-        setMpvActive(true);
-        void invoke("mpv_set_volume_cmd", { volume: mpvVolume }).catch(() => {});
-        return true;
-      } catch (err) {
-        console.warn("[MPV] 启动失败，回退 WebView2 内核:", err);
-        try {
-          await stopMpvSession();
-        } catch {
-          // ignore
-        }
-        return false;
-      }
-    },
-    [computeMpvRect, isSessionActive, mpvHeadersForPlatform, mpvVolume, platform, stopMpvSession]
-  );
-
-  // mpv 直播流事件（end/idle）兜底自动刷新（tryStartMpv 内的 listener 销毁前的兜底）
-  useEffect(() => {
-    const un = listen("mpv-event", (e) => {
-      const payload = (e as unknown as TauriEvent<{ kind: string }>).payload;
-      if (!payload?.kind) return;
-      if (payload.kind === "end" || payload.kind === "idle") {
-        if (engineRef.current === "mpv" && !disposedRef.current) {
-          void reloadStreamRef.current?.("refresh");
-        }
-      }
-    });
-    return () => {
-      void un.then((f) => f()).catch(() => {});
-    };
-  }, []);
-
-  // 引擎切换（Navbar 触发）：若正在播放则用新内核重载
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ engine?: "mpv" | "webview" }>).detail;
-      if (detail?.engine !== "mpv" && detail?.engine !== "webview") return;
-      setEnginePersist(detail.engine, false);
-      void reloadStreamRef.current?.("refresh");
-    };
-    window.addEventListener("dtv-x:engine-changed", handler);
-    return () => window.removeEventListener("dtv-x:engine-changed", handler);
-  }, [setEnginePersist]);
-
   // WebView2 内核模式：切回前台时若视频意外暂停则自动恢复（后台节流已由 Rust 侧禁用，这里是兜底）
   useEffect(() => {
     const onVis = () => {
@@ -814,22 +628,6 @@ export function MainPlayer({
     qualityPluginRef.current = null;
     linePluginRef.current = null;
 
-    // MPV 内核清理
-    try {
-      mpvResizeObserverRef.current?.disconnect();
-    } catch {
-      // ignore
-    }
-    mpvResizeObserverRef.current = null;
-    try {
-      mpvUnlistenRef.current?.();
-    } catch {
-      // ignore
-    }
-    mpvUnlistenRef.current = null;
-    void invoke("mpv_stop_cmd").catch(() => {});
-    setMpvActive(false);
-    setMpvPaused(false);
     setIsFullScreen(false);
   }, []);
 
@@ -988,19 +786,6 @@ export function MainPlayer({
         throw new Error("播放器容器初始化失败，请刷新页面重试。");
       }
       if (!isSessionActive(sessionId)) return;
-
-      // ===== MPV 内核（默认）：原生 libmpv 渲染视频，WebView2 只画 UI =====
-      if (engineRef.current === "mpv") {
-        const mpvOk = await tryStartMpv(sessionId, url);
-        if (!isSessionActive(sessionId)) return;
-        if (mpvOk) {
-          // MPV 模式：视频位于原生层（WebView2 之上），DOM 弹幕无法覆盖在画面上，
-          // 且跳过弹幕解析可显著降低 CPU 占用。需要弹幕请在导航栏切换 WebView2 内核。
-          return;
-        }
-        // MPV 启动失败 → 本次会话回退 WebView2 内核（不覆盖用户持久化的内核选择）
-        setEnginePersist("webview", false);
-      }
 
       const isHlsPlayback = (streamType || "").toLowerCase() === "hls" || url.toLowerCase().includes(".m3u8");
 
@@ -1245,7 +1030,7 @@ export function MainPlayer({
       await startDanmaku(sessionId, overlay, platform, backendRoomId, filterRoomId);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentLine, currentQuality, danmuSettings, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku, tryStartMpv, setEnginePersist]
+    [currentLine, currentQuality, danmuSettings, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku]
   );
 
   const reloadStream = useCallback(
@@ -1683,120 +1468,6 @@ export function MainPlayer({
 
               <div ref={playerContainerRef} className="video-player" />
 
-              {engine === "mpv" && mpvActive ? (
-                <div className="mpv-controls" data-tauri-drag-region="false">
-                  <div className="mpv-controls-group">
-                    <span className="mpv-engine-badge">MPV</span>
-                    <button
-                      type="button"
-                      className="mpv-icon-btn"
-                      title={mpvPaused ? "播放" : "暂停"}
-                      onClick={() => {
-                        const next = !mpvPaused;
-                        setMpvPaused(next);
-                        void invoke("mpv_pause_cmd", { paused: next }).catch(() => {});
-                      }}
-                    >
-                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: mpvPaused ? ICONS.play : ICONS.pause }} />
-                    </button>
-                    <button
-                      type="button"
-                      className="mpv-icon-btn"
-                      title={mpvMuted ? "取消静音" : "静音"}
-                      onClick={() => {
-                        const next = !mpvMuted;
-                        setMpvMuted(next);
-                        void invoke("mpv_set_mute_cmd", { muted: next }).catch(() => {});
-                      }}
-                    >
-                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: mpvMuted ? ICONS.volumeX : ICONS.volume2 }} />
-                    </button>
-                    <input
-                      className="mpv-volume"
-                      type="range"
-                      min={0}
-                      max={100}
-                      value={mpvVolume}
-                      title="音量"
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setMpvVolume(v);
-                        void invoke("mpv_set_volume_cmd", { volume: v }).catch(() => {});
-                        if (mpvMuted) {
-                          setMpvMuted(false);
-                          void invoke("mpv_set_mute_cmd", { muted: false }).catch(() => {});
-                        }
-                      }}
-                    />
-                    <span className="mpv-volume-value">{mpvVolume}%</span>
-                    <button
-                      type="button"
-                      className="mpv-icon-btn"
-                      title="刷新直播流"
-                      onClick={() => void reloadStreamRef.current?.("refresh")}
-                    >
-                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: ICONS.rotateCcw }} />
-                    </button>
-                  </div>
-                  <div className="mpv-controls-group">
-                    {/* MPV 模式视频在原生层之上，DOM 弹幕无法覆盖画面——置灰占位并提示 */}
-                    <span
-                      className="mpv-danmu-toggle is-off is-disabled"
-                      title="MPV 内核暂不支持弹幕叠加，切换 WebView2 内核可看弹幕"
-                    >
-                      <span className="danmu-toggle-label">弹幕</span>
-                      <span className="danmu-toggle-switch">
-                        <span className="switch-track" />
-                        <span className="switch-thumb" />
-                      </span>
-                    </span>
-                    <select
-                      value={currentQuality}
-                      title="清晰度"
-                      onChange={(e) => {
-                        const q = e.target.value;
-                        if (q === currentQualityRef.current) return;
-                        setCurrentQuality(q);
-                        try {
-                          window.localStorage.setItem(`${platform}_preferred_quality`, q);
-                        } catch {
-                          // ignore
-                        }
-                      }}
-                    >
-                      {qualityOptions.map((q) => (
-                        <option key={q} value={q}>
-                          {q}
-                        </option>
-                      ))}
-                    </select>
-                    {lineOptions.length > 0 ? (
-                      <select
-                        value={resolveCurrentLineFor(lineOptions, currentLine) ?? ""}
-                        title="线路"
-                        onChange={(e) => {
-                          const key = e.target.value;
-                          if (!key || key === currentLineRef.current) return;
-                          setCurrentLine(key);
-                        }}
-                      >
-                        {lineOptions.map((o) => (
-                          <option key={o.key} value={o.key}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
-                    ) : null}
-                    <button
-                      type="button"
-                      className="mpv-icon-btn"
-                      title={isFullScreen ? "退出网页全屏" : "网页全屏"}
-                      onClick={() => setIsFullScreen(!isFullScreen)}
-                    >
-                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: isFullScreen ? ICONS.minimize2 : ICONS.fullscreen }} />
-                    </button>
-                  </div>
-                </div>
               ) : null}
 
               {isLoadingStream ? (

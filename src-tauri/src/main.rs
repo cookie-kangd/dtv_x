@@ -17,7 +17,6 @@ mod sync_transfer;
 mod platforms;
 mod proxy;
 mod version_check;
-mod mpv_player;
 use platforms::common::{DouyinDanmakuState, FollowHttpClient, HuyaDanmakuState};
 use platforms::douyin::danmu::signature::generate_douyin_ms_token;
 use platforms::douyin::fetch_douyin_partition_rooms;
@@ -234,7 +233,6 @@ fn main() {
             .manage(StreamUrlStore::default())
             .manage(proxy::ProxyServerHandle::default())
             .manage(platforms::bilibili::state::BilibiliState::default())
-            .manage(mpv_player::MpvManager::default())
             .manage(lan_sync::LanSyncServerState::default())
             .invoke_handler(tauri::generate_handler![
                 get_stream_url_cmd,
@@ -289,14 +287,6 @@ fn main() {
                 open_in_default_browser,
                 version_check::check_version_cmd,
                 version_check::download_and_install_cmd,
-                mpv_player::mpv_is_available_cmd,
-                mpv_player::mpv_play_cmd,
-                mpv_player::mpv_stop_cmd,
-                mpv_player::mpv_set_rect_cmd,
-                mpv_player::mpv_pause_cmd,
-                mpv_player::mpv_set_volume_cmd,
-                mpv_player::mpv_set_mute_cmd,
-                mpv_player::mpv_time_pos_cmd,
             ])
             .run(tauri::generate_context!())
             .expect("error while running tauri application");

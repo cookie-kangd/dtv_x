@@ -63,17 +63,6 @@ export const ensureDanmuOverlayHost = (player: Player): HTMLElement | null => {
   return host;
 };
 
-// MPV 模式：在任意 DOM 容器上创建弹幕宿主（不依赖 xgplayer 实例）
-const ensureOverlayHostInContainer = (container: HTMLElement): HTMLElement | null => {
-  let host = container.querySelector('.player-danmu-overlay') as HTMLElement | null;
-  if (!host) {
-    host = document.createElement('div');
-    host.className = 'player-danmu-overlay';
-    container.appendChild(host);
-  }
-  return host;
-};
-
 export const applyDanmuOverlayPreferences = (
   overlay: DanmuOverlayInstance | null,
   danmuSettings: DanmuUserSettings,
@@ -174,7 +163,7 @@ const createDanmuInstance = (
   } as any);
 };
 
-// 构建弹幕实例（xgplayer 模式与 MPV 模式共用）。
+// 构建弹幕实例。
 // apply/sync 的 playerRoot 传宿主的父容器（querySelector 不含自身）。
 const buildOverlayInstance = (
   danmu: any,
@@ -374,46 +363,6 @@ export const createDanmuOverlay = (
     return buildOverlayInstance(danmu, overlayHost, danmuSettings, isDanmuEnabled);
   } catch (error) {
     console.error('[Player] Failed to initialize danmu.js overlay:', error);
-    return null;
-  }
-};
-
-// MPV 内核模式：视频由原生 libmpv 渲染（WebView2 透明露出），
-// 弹幕层挂在播放容器 DOM 上，用一个"假 video"对象喂给 danmu.js（直播场景不需要时间轴同步）。
-export const createDanmuOverlayForHost = (
-  container: HTMLElement | null,
-  danmuSettings: DanmuUserSettings,
-  isDanmuEnabled: boolean,
-): DanmuOverlayInstance | null => {
-  if (!container) {
-    return null;
-  }
-
-  try {
-    const overlayHost = ensureOverlayHostInContainer(container);
-    if (!overlayHost) {
-      return null;
-    }
-
-    overlayHost.innerHTML = '';
-    overlayHost.style.setProperty('--danmu-stroke-color', danmuSettings.strokeColor);
-    overlayHost.style.setProperty('--danmu-opacity', String(isDanmuEnabled ? sanitizeDanmuOpacity(danmuSettings.opacity) : 0));
-
-    // 假 video：danmu.js 只用它做时间轴/播放状态同步，直播弹幕逐条推送，不依赖真实媒体元素
-    const fakeMedia: any = {
-      currentTime: 0,
-      playbackRate: 1,
-      paused: false,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      dispatchEvent: () => true,
-      getBoundingClientRect: () => container.getBoundingClientRect()
-    };
-
-    const danmu = createDanmuInstance(overlayHost, fakeMedia, danmuSettings);
-    return buildOverlayInstance(danmu, overlayHost, danmuSettings, isDanmuEnabled);
-  } catch (error) {
-    console.error('[Player] Failed to initialize danmu.js overlay for MPV mode:', error);
     return null;
   }
 };

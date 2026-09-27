@@ -30,21 +30,6 @@ jobs:
           choco install protoc --no-progress -y
           echo "C:\ProgramData\chocolatey\lib\protoc\tools" >> $env:GITHUB_PATH
 
-      - name: Download libmpv-2.dll (MPV 播放内核)
-        shell: pwsh
-        run: |
-          $headers = @{ "User-Agent" = "dtv-x-ci" }
-          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -Headers $headers
-          $asset = $rel.assets | Where-Object { $_.name -like "mpv-dev-x86_64-*.7z" } | Select-Object -First 1
-          if (-not $asset) { throw "mpv-dev asset not found" }
-          Write-Host "Downloading $($asset.name)"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile mpv-dev.7z -UserAgent "dtv-x-ci"
-          $sz = "C:\Program Files\7-Zip\7z.exe"
-          if (-not (Test-Path $sz)) { choco install 7zip --no-progress -y; $sz = "7z" }
-          & $sz e mpv-dev.7z -osrc-tauri libmpv-2.dll -y
-          if (-not (Test-Path "src-tauri/libmpv-2.dll")) { throw "libmpv-2.dll extraction failed" }
-          Get-Item "src-tauri/libmpv-2.dll" | Select-Object Name, Length
-
       - name: Set rusty_v8 archive (Windows)
         run: |
           echo "RUSTY_V8_ARCHIVE=https://github.com/denoland/rusty_v8/releases/download/v0.93.1/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz" >> $env:GITHUB_ENV

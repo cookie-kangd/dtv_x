@@ -1,6 +1,6 @@
 [package]
 name = "dtv_x"
-version = "0.1.0"
+version = "0.1.1"
 description = "DTV X - Live Stream Client"
 authors = ["cookie-kangd"]
 edition = "2021"
@@ -71,16 +71,6 @@ anyhow = "1.0"
 rfd = "0.15"
 local-ip-address = "0.6"
 mdns-sd = "0.13"
-# MPV 播放内核：运行时加载 libmpv-2.dll + 原生视频子窗口
-libloading = "0.8"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-] }
 
 [profile.release]
 panic = "unwind"
