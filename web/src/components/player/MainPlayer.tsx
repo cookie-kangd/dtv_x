@@ -722,16 +722,8 @@ export function MainPlayer({
         });
         mpvResizeObserverRef.current.observe(container);
 
-        // 直播流结束/空闲 → 自动重新拉流
-        mpvUnlistenRef.current = await listen("mpv-event", (e) => {
-          const payload = (e as unknown as TauriEvent<{ kind: string }>).payload;
-          if (!payload?.kind) return;
-          if (payload.kind === "end" || payload.kind === "idle") {
-            if (engineRef.current === "mpv" && !disposedRef.current) {
-              void reloadStreamRef.current?.("refresh");
-            }
-          }
-        });
+        // 直播流结束/空闲 → 自动重新拉流：统一由全局 mpv-event 监听处理（组件卸载前兜底），
+        // 此处不再重复注册，避免断流时触发双重 reload
 
         // watchdog：确认真的在播
         const deadline = Date.now() + 15000;

@@ -288,6 +288,7 @@ fn main() {
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,
                 version_check::check_version_cmd,
+                version_check::download_and_install_cmd,
                 mpv_player::mpv_is_available_cmd,
                 mpv_player::mpv_play_cmd,
                 mpv_player::mpv_stop_cmd,

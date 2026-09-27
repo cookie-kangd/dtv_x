@@ -1093,3 +1093,40 @@
   background: var(--status-live);
   box-shadow: 0 0 0 4px rgba(255, 62, 62, 0.12);
 }
+
+/* ===== 应用内更新进度（v0.1.3） ===== */
+.updateActions {
+  gap: 10px;
+}
+
+.updateProgressWrap {
+  margin-top: 12px;
+}
+
+.updateProgressTrack {
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  overflow: hidden;
+}
+
+.updateProgressBar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent-gradient);
+  transition: width 0.25s ease;
+}
+
+.updateProgressText {
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  opacity: 0.85;
+}
+
+.updateErrorText {
+  margin-top: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #e5484d;
+}

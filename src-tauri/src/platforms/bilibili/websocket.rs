@@ -2,7 +2,7 @@
 use native_tls::TlsStream;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tungstenite::{client, Message, WebSocket};
@@ -331,7 +331,14 @@ pub fn connect(v: Value) -> WebSocket<TlsStream<TcpStream>> {
     let (host, url, ws_url) = find_server(danmu_server);
     ws_debug!("[websocket] connecting tcp {} and ws {}", url, ws_url);
     let connector: native_tls::TlsConnector = native_tls::TlsConnector::new().unwrap();
-    let stream: TcpStream = TcpStream::connect(url).unwrap();
+    // connect_timeout：无超时的 TcpStream::connect 在网络异常时会阻塞 ~20s（OS SYN 超时），
+    // 停止信号在此期间完全无法被处理；5s 超时保证关闭播放器时弹幕线程能及时退出
+    let addr = url
+        .to_socket_addrs()
+        .and_then(|mut it| it.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr")))
+        .map_err(|e| format!("resolve {} failed: {}", url, e))
+        .unwrap();
+    let stream: TcpStream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
     let stream: native_tls::TlsStream<TcpStream> =
         connector.connect(host.as_str(), stream).unwrap();
     let (socket, _resp) =

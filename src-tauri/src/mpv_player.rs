@@ -89,10 +89,24 @@ impl MpvSession {
         }
         unsafe {
             (self.syms.terminate_destroy)(self.handle);
-            #[cfg(windows)]
-            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.child_hwnd as _);
         }
+        // 子窗口持久复用：不能跨线程 DestroyWindow（Win32 限定窗口只能由创建线程销毁，
+        // 而 mpv_play_cmd 跑在 spawn_blocking 线程、stop 跑在异步运行时线程）。
+        // 跨线程 ShowWindow 是合法的（异步投递），隐藏即可；窗口留给下一次会话复用。
+        #[cfg(windows)]
+        hide_video_child(self.child_hwnd);
     }
+}
+
+// 持久子窗口句柄：整个进程生命周期只创建一次，各会话复用，退出时随进程回收
+#[cfg(windows)]
+static PERSISTENT_CHILD_HWND: OnceLock<isize> = OnceLock::new();
+
+#[cfg(windows)]
+fn hide_video_child(hwnd: isize) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    unsafe { ShowWindow(hwnd as HWND, SW_HIDE) };
 }
 
 #[cfg(windows)]
@@ -247,6 +261,39 @@ fn apply_webview_transparent(_app: &AppHandle, _transparent: bool) {}
 
 static CREATE_LOCK: Mutex<()> = Mutex::new(());
 
+// 获取（或创建）持久视频子窗口：复用时重新定位并显示
+#[cfg(windows)]
+unsafe fn acquire_video_child(parent_hwnd: isize, rect: &MpvRect) -> Result<isize, String> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+    };
+
+    if let Some(&existing) = PERSISTENT_CHILD_HWND.get() {
+        unsafe {
+            SetWindowPos(
+                existing as HWND,
+                std::ptr::null_mut(),
+                rect.x.max(0),
+                rect.y.max(0),
+                rect.width.max(2),
+                rect.height.max(2),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            ShowWindow(existing as HWND, SW_SHOW);
+        }
+        return Ok(existing);
+    }
+    let hwnd = unsafe { create_video_child(parent_hwnd, rect)? };
+    let _ = PERSISTENT_CHILD_HWND.set(hwnd);
+    Ok(hwnd)
+}
+
+#[cfg(not(windows))]
+unsafe fn acquire_video_child(_parent_hwnd: isize, _rect: &MpvRect) -> Result<isize, String> {
+    Err("MPV engine is only supported on Windows".into())
+}
+
 #[cfg(windows)]
 unsafe fn start_session(
     app: &AppHandle,
@@ -267,15 +314,24 @@ unsafe fn start_session(
 
     let (lib, syms) = unsafe { load_symbols() }?;
     let parent = main_window_hwnd(app)?;
-    let child = unsafe { create_video_child(parent, rect) }?;
+    let child = unsafe { acquire_video_child(parent, rect) }?;
     apply_webview_transparent(app, true);
+
+    // 出错统一清理：销毁 mpv 句柄 + 恢复 WebView2 背景（子窗口保留隐藏，供下次复用）
+    macro_rules! fail {
+        ($handle:expr, $err:expr) => {{
+            unsafe { (syms.terminate_destroy)($handle) };
+            apply_webview_transparent(app, false);
+            #[cfg(windows)]
+            hide_video_child(child);
+            return Err($err);
+        }};
+    }
 
     let handle = unsafe { (syms.create)() };
     if handle.is_null() {
         apply_webview_transparent(app, false);
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(child as _);
-        }
+        hide_video_child(child);
         return Err("mpv_create returned null".into());
     }
 
@@ -293,22 +349,12 @@ unsafe fn start_session(
     ];
     for (k, v) in pre_init.iter() {
         if let Err(e) = unsafe { mpv_set_str(&syms, handle, k, v) } {
-            unsafe { (syms.terminate_destroy)(handle) };
-            apply_webview_transparent(app, false);
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(child as _);
-            }
-            return Err(e);
+            fail!(handle, e);
         }
     }
 
     if unsafe { (syms.initialize)(handle) } < 0 {
-        unsafe { (syms.terminate_destroy)(handle) };
-        apply_webview_transparent(app, false);
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(child as _);
-        }
-        return Err("mpv_initialize failed".into());
+        fail!(handle, "mpv_initialize failed".to_string());
     }
 
     // 每个流的自定义 header（如 B 站 Referer）通过 loadfile 的 per-file options 传入
@@ -319,12 +365,7 @@ unsafe fn start_session(
     }
     let arg_refs: Vec<&str> = load_args.iter().map(|s| s.as_str()).collect();
     if let Err(e) = unsafe { mpv_command(&syms, handle, &arg_refs) } {
-        unsafe { (syms.terminate_destroy)(handle) };
-        apply_webview_transparent(app, false);
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(child as _);
-        }
-        return Err(e);
+        fail!(handle, e);
     }
 
     // 事件线程：广播 START/END/IDLE/SHUTDOWN 给前端
@@ -432,7 +473,7 @@ pub async fn mpv_play_cmd(
 }
 
 #[tauri::command]
-pub async fn mpv_stop_cmd(manager: State<'_, MpvManager>) -> Result<(), String> {
+pub async fn mpv_stop_cmd(app: AppHandle, manager: State<'_, MpvManager>) -> Result<(), String> {
     let old = {
         let mut g = manager.0.lock().map_err(|e| e.to_string())?;
         g.take()
@@ -440,6 +481,8 @@ pub async fn mpv_stop_cmd(manager: State<'_, MpvManager>) -> Result<(), String> 
     if let Some(s) = old {
         s.shutdown();
     }
+    // 正常停止也要把 WebView2 背景从透明恢复成不透明白（否则首页/WebView2 内核播放透出原生子窗口）
+    apply_webview_transparent(&app, false);
     Ok(())
 }
 

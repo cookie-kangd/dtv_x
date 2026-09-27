@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateProgress {
+    pub phase: String, // "downloading" | "installing" | "error"
+    pub downloaded: u64,
+    pub total: u64,
+    pub percent: f64,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteVersionInfo {
@@ -116,4 +125,137 @@ pub async fn check_version_cmd(
         remote,
         has_update,
     })
+}
+
+const MIRROR_PREFIX: &str = "https://v4.gh-proxy.org/";
+
+// 应用内一键更新：下载安装包（镜像优先、直连兜底，带进度事件）→ 启动 NSIS 安装程序 → 退出应用
+// 注意：State 为借用参数，在 async command 中必须置于最后
+#[tauri::command]
+pub async fn download_and_install_cmd(
+    app: AppHandle,
+    url: String,
+    version: String,
+    client: State<'_, reqwest::Client>,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    // 候选地址：镜像优先，失败回退直连
+    let mut candidates: Vec<String> = Vec::new();
+    if !url.trim().is_empty() {
+        candidates.push(url.trim().to_string());
+        if let Some(direct) = url.trim().strip_prefix(MIRROR_PREFIX) {
+            candidates.push(direct.to_string());
+        }
+    }
+    if candidates.is_empty() {
+        return Err("no download url provided".into());
+    }
+
+    let emit_progress = |phase: &str, downloaded: u64, total: u64, msg: Option<String>| {
+        let percent = if total > 0 {
+            (downloaded as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let _ = app.emit(
+            "update-progress",
+            UpdateProgress {
+                phase: phase.to_string(),
+                downloaded,
+                total,
+                percent,
+                message: msg,
+            },
+        );
+    };
+
+    let mut last_err = String::from("download failed");
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let resp = match client
+            .get(candidate)
+            .header("User-Agent", "dtv_x-updater")
+            .timeout(std::time::Duration::from_secs(600))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                last_err = format!("HTTP {}", r.status());
+                continue;
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
+        };
+
+        let total = resp.content_length().unwrap_or(0);
+        let file_name = format!(
+            "DTV_X_{}_x64-setup.exe",
+            version.trim().trim_start_matches('v')
+        );
+        let path = std::env::temp_dir().join(&file_name);
+        let file = std::fs::File::create(&path).map_err(|e| format!("create temp file failed: {}", e))?;
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+        let mut stream = resp.bytes_stream();
+        let mut downloaded: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
+
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if let Err(e) = writer.write_all(&chunk) {
+                        last_err = format!("write failed: {}", e);
+                        break;
+                    }
+                    downloaded += chunk.len() as u64;
+                    // 进度事件节流：最多每 120ms 一次，避免刷屏
+                    if last_emit.elapsed() >= std::time::Duration::from_millis(120) {
+                        last_emit = std::time::Instant::now();
+                        emit_progress("downloading", downloaded, total, None);
+                    }
+                }
+                Some(Err(e)) => {
+                    last_err = e.to_string();
+                    downloaded = 0;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        if downloaded == 0 {
+            continue; // 该候选地址失败，尝试下一个
+        }
+        if let Err(e) = writer.flush() {
+            last_err = format!("flush failed: {}", e);
+            continue;
+        }
+        if total > 0 && downloaded < total {
+            last_err = format!("incomplete download: {}/{}", downloaded, total);
+            continue;
+        }
+
+        // 下载完成 → 启动安装程序（用户可见向导，避免静默覆盖被文件锁干扰），随后退出本应用
+        let _ = idx;
+        emit_progress("installing", downloaded, total, Some("安装包已就绪，正在启动安装程序".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let spawn = std::process::Command::new(&path).spawn();
+        match spawn {
+            Ok(_) => {
+                app.exit(0);
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = format!("launch installer failed: {}", e);
+                emit_progress("error", 0, 0, Some(last_err.clone()));
+                return Err(last_err);
+            }
+        }
+    }
+
+    emit_progress("error", 0, 0, Some(last_err.clone()));
+    Err(last_err)
 }

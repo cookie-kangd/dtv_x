@@ -71,12 +71,12 @@ impl DanmakuClient {
         // 创建消息通道
         let (tx, mut rx) = mpsc::channel(32);
 
-        // 启动心跳任务
+        // 启动心跳任务（保存句柄：连接结束时 abort，避免残留最长 45s 的僵尸任务）
         let heartbeat_msg = "type@=mrkl/";
         let heartbeat_data = self.encode_msg(heartbeat_msg);
         let tx_clone = tx.clone();
 
-        tokio::spawn(async move {
+        let heartbeat_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(45)).await;
                 if let Err(_) = tx_clone.send(Message::Binary(heartbeat_data.clone())).await {
@@ -103,6 +103,7 @@ impl DanmakuClient {
                 _ = &mut *stop_rx => {
                     eprintln!("[Douyu Danmaku {}] Stop signal received, terminating listener.", room_id_clone);
                     send_task.abort();
+                    heartbeat_task.abort();
                     return Ok(ConnectionOutcome::Stop);
                 }
                 msg_option = read.next() => {
@@ -186,6 +187,7 @@ impl DanmakuClient {
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                             eprintln!("[Douyu Danmaku {}] Websocket closed or error, terminating listener.", room_id_clone);
                             send_task.abort();
+                            heartbeat_task.abort();
                             return Ok(ConnectionOutcome::Disconnected);
                         }
                         _ => {}

@@ -5,6 +5,7 @@ import { AnimatePresence, m } from "framer-motion";
 import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import styles from "./Navbar.module.css";
 import { LanSyncModal } from "./LanSyncModal";
@@ -100,6 +101,46 @@ export function Navbar({
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
+  const [updatePhase, setUpdatePhase] = useState<"idle" | "downloading" | "installing" | "error">("idle");
+  const [updatePercent, setUpdatePercent] = useState<number>(0);
+  const [updateMsg, setUpdateMsg] = useState<string>("");
+
+  // 应用内更新：下载进度事件（Rust 侧 download_and_install_cmd 发出）
+  useEffect(() => {
+    const un = listen<{
+      phase: "downloading" | "installing" | "error";
+      percent: number;
+      message?: string;
+    }>("update-progress", (e) => {
+      const p = e.payload;
+      if (!p?.phase) return;
+      setUpdatePhase(p.phase);
+      if (typeof p.percent === "number") setUpdatePercent(p.percent);
+      setUpdateMsg(p.message || "");
+    });
+    return () => {
+      void un.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
+  const startUpdate = useCallback(async () => {
+    if (!versionInfo?.url || updatePhase === "downloading" || updatePhase === "installing") return;
+    setUpdatePhase("downloading");
+    setUpdatePercent(0);
+    setUpdateMsg("正在连接下载源…");
+    try {
+      await invoke("download_and_install_cmd", {
+        url: versionInfo.url,
+        version: versionInfo.version
+      });
+      // 成功路径：Rust 侧会启动安装程序并退出应用
+      setUpdatePhase("installing");
+      setUpdateMsg("安装程序已启动，本应用即将退出");
+    } catch (err) {
+      setUpdatePhase("error");
+      setUpdateMsg(typeof err === "string" ? err : String(err));
+    }
+  }, [versionInfo, updatePhase]);
 
   const playerUi = usePlayerUi();
   const playerOverlay = usePlayerOverlay();
@@ -770,21 +811,63 @@ export function Navbar({
                 </div>
                 {hasUpdate && versionInfo?.notes?.length ? (
                   <ul className={styles.updateNotes}>
-                    {versionInfo.notes.map((n) => (
-                      <li key={n}>{n}</li>
+                    {versionInfo.notes.map((n, idx) => (
+                      <li key={`${idx}-${n}`}>{n}</li>
                     ))}
                   </ul>
                 ) : null}
 
+                {updatePhase === "downloading" || updatePhase === "installing" ? (
+                  <div className={styles.updateProgressWrap}>
+                    <div className={styles.updateProgressTrack}>
+                      <div
+                        className={styles.updateProgressBar}
+                        style={{ width: `${Math.min(100, Math.max(2, updatePercent))}%` }}
+                      />
+                    </div>
+                    <div className={styles.updateProgressText}>
+                      {updatePhase === "installing"
+                        ? updateMsg || "安装程序已启动，本应用即将退出"
+                        : `正在下载更新 ${updatePercent.toFixed(1)}%`}
+                    </div>
+                  </div>
+                ) : null}
+                {updatePhase === "error" ? <div className={styles.updateErrorText}>{updateMsg || "更新失败，请稍后重试或前往下载页"}</div> : null}
+
                 <div className={styles.updateActions}>
-                  <button
-                    type="button"
-                    className={styles.primaryBtn}
-                    onClick={() => void openExternal((versionInfo?.url || GITHUB_RELEASES_URL) as string)}
-                  >
-                    <ExternalLink size={16} />
-                    {hasUpdate ? "打开下载页" : "打开 GitHub"}
-                  </button>
+                  {hasUpdate && versionInfo ? (
+                    <>
+                      <button
+                        type="button"
+                        className={styles.primaryBtn}
+                        disabled={updatePhase === "downloading" || updatePhase === "installing"}
+                        onClick={() => void startUpdate()}
+                      >
+                        {updatePhase === "downloading"
+                          ? "正在下载…"
+                          : updatePhase === "installing"
+                            ? "正在启动安装程序…"
+                            : "立即更新"}
+                      </button>
+                      <button
+                        type="button"
+                        className={styles.secondaryBtn}
+                        onClick={() => void openExternal((versionInfo?.url || GITHUB_RELEASES_URL) as string)}
+                      >
+                        <ExternalLink size={14} />
+                        打开下载页
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className={styles.primaryBtn}
+                      onClick={() => void openExternal((versionInfo?.url || GITHUB_RELEASES_URL) as string)}
+                    >
+                      <ExternalLink size={16} />
+                      打开 GitHub
+                    </button>
+                  )}
                 </div>
               </div>
             </m.div>
