@@ -3,7 +3,8 @@
 // 设计要点：
 // - libmpv-2.dll 运行时加载（libloading）：DLL 缺失 / 初始化失败一律返回 Err，前端自动回退 WebView2 内核
 // - 视频窗口：主窗口下的原生子窗口，z-order 压到最底（WebView2 之下）；
-//   播放时 WebView2 背景切为透明、视频区域 DOM 背景清空，露出 mpv 画面（"透明洞"）
+//   WebView2 与窗口在创建时就开启透明（tauri.conf.json transparent:true），
+//   播放时视频区域 DOM 背景清空（"透明洞"，由 player.css + JS 打标控制），露出 mpv 画面
 // - 弹幕 / 控制条仍是 WebView2 里的 DOM，覆盖在视频上方（弹幕层在洞内、控制条自带背景）
 // - 事件线程 200ms 超时轮询 mpv_wait_event，把 START/END/IDLE/SHUTDOWN 广播给前端；
 //   前端另有 watchdog 轮询 mpv_time_pos_cmd 判断"真的在播"
@@ -244,20 +245,11 @@ fn main_window_hwnd(app: &AppHandle) -> Result<isize, String> {
     Ok(as_isize)
 }
 
-#[cfg(windows)]
-fn apply_webview_transparent(app: &AppHandle, transparent: bool) {
-    if let Some(window) = app.get_webview_window("main") {
-        // 播放时透明（露出 mpv），停止时恢复白色不透明底
-        let color = if transparent { (0u8, 0u8, 0u8, 0u8) } else { (255u8, 255u8, 255u8, 255u8) };
-        match window.set_background_color(Some(color.into())) {
-            Ok(_) => {}
-            Err(e) => eprintln!("[MPV] set_background_color({}) failed: {}", transparent, e),
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn apply_webview_transparent(_app: &AppHandle, _transparent: bool) {}
+// WebView2 透明由 tauri.conf.json 的 `"transparent": true` 在创建时一次性开启（wry 会在
+// controller 创建阶段与 init_webview 两次写入 DefaultBackgroundColor(0,0,0,0)，这是唯一
+// 经过验证可靠的透明路径）。运行时 `set_background_color` 在 Windows 上还会同时把
+// "窗口层"背景改为不透明色（alpha 被忽略），行为不可控，故不再运行时切换——
+// DOM 侧由 player.css 的 `body.mpv-active` / `.mpv-hole` 负责"透明洞"的开关。
 
 static CREATE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -266,19 +258,22 @@ static CREATE_LOCK: Mutex<()> = Mutex::new(());
 unsafe fn acquire_video_child(parent_hwnd: isize, rect: &MpvRect) -> Result<isize, String> {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+        SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SW_SHOW,
     };
 
     if let Some(&existing) = PERSISTENT_CHILD_HWND.get() {
         unsafe {
+            // 复用时一次性完成"重新定位 + 显示 + 压回 z-order 最底"。
+            // 必须再次压底：WebView2 在会话切换中可能被系统/前端操作提到更高 z-order，
+            // 一旦盖住 mpv 子窗口就会出现"只有声音没有画面"。
             SetWindowPos(
                 existing as HWND,
-                std::ptr::null_mut(),
+                HWND_BOTTOM,
                 rect.x.max(0),
                 rect.y.max(0),
                 rect.width.max(2),
                 rect.height.max(2),
-                SWP_NOZORDER | SWP_NOACTIVATE,
+                SWP_NOACTIVATE,
             );
             ShowWindow(existing as HWND, SW_SHOW);
         }
@@ -315,13 +310,11 @@ unsafe fn start_session(
     let (lib, syms) = unsafe { load_symbols() }?;
     let parent = main_window_hwnd(app)?;
     let child = unsafe { acquire_video_child(parent, rect) }?;
-    apply_webview_transparent(app, true);
 
-    // 出错统一清理：销毁 mpv 句柄 + 恢复 WebView2 背景（子窗口保留隐藏，供下次复用）
+    // 出错统一清理：销毁 mpv 句柄（子窗口保留隐藏，供下次复用）
     macro_rules! fail {
         ($handle:expr, $err:expr) => {{
             unsafe { (syms.terminate_destroy)($handle) };
-            apply_webview_transparent(app, false);
             #[cfg(windows)]
             hide_video_child(child);
             return Err($err);
@@ -330,16 +323,20 @@ unsafe fn start_session(
 
     let handle = unsafe { (syms.create)() };
     if handle.is_null() {
-        apply_webview_transparent(app, false);
         hide_video_child(child);
         return Err("mpv_create returned null".into());
     }
 
     // initialize 之前的选项（wid 必须在初始化前设置）
-    let pre_init: [(&str, String); 9] = [
+    // 内存优化：直播流不需要大缓冲，显式收紧 demuxer 缓存
+    // （mpv 默认 demuxer-max-bytes 可达 150MiB，直播场景 32MiB 前向 + 8MiB 后向足够流畅）
+    let pre_init: [(&str, String); 12] = [
         ("wid", child.to_string()),
         ("hwdec", "auto".into()),
         ("cache", "yes".into()),
+        ("demuxer-max-bytes", "33554432".into()),
+        ("demuxer-max-back-bytes", "8388608".into()),
+        ("demuxer-readahead-secs", "10".into()),
         ("terminal", "no".into()),
         ("audio-display", "no".into()),
         ("input-default-bindings", "no".into()),
@@ -474,6 +471,8 @@ pub async fn mpv_play_cmd(
 
 #[tauri::command]
 pub async fn mpv_stop_cmd(app: AppHandle, manager: State<'_, MpvManager>) -> Result<(), String> {
+    // app 保留在签名中以兼容既有前端调用；透明/背景恢复已全部由 DOM 侧 CSS 处理
+    let _ = &app;
     let old = {
         let mut g = manager.0.lock().map_err(|e| e.to_string())?;
         g.take()
@@ -481,8 +480,6 @@ pub async fn mpv_stop_cmd(app: AppHandle, manager: State<'_, MpvManager>) -> Res
     if let Some(s) = old {
         s.shutdown();
     }
-    // 正常停止也要把 WebView2 背景从透明恢复成不透明白（否则首页/WebView2 内核播放透出原生子窗口）
-    apply_webview_transparent(&app, false);
     Ok(())
 }
 

@@ -592,6 +592,23 @@ export function MainPlayer({
   const mpvHoleMarkedRef = useRef<HTMLElement[]>([]);
   const mpvUnlistenRef = useRef<(() => void) | null>(null);
   const mpvResizeObserverRef = useRef<ResizeObserver | null>(null);
+  // 控制条自动隐藏（对齐 xgplayer 行为：鼠标停止移动 2.6s 后滑出隐藏）
+  const [mpvControlsVisible, setMpvControlsVisible] = useState(true);
+  const mpvHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const bumpMpvControls = useCallback(() => {
+    setMpvControlsVisible(true);
+    if (mpvHideTimerRef.current) clearTimeout(mpvHideTimerRef.current);
+    mpvHideTimerRef.current = setTimeout(() => setMpvControlsVisible(false), 2600);
+  }, []);
+
+  const hideMpvControls = useCallback(() => {
+    if (mpvHideTimerRef.current) {
+      clearTimeout(mpvHideTimerRef.current);
+      mpvHideTimerRef.current = null;
+    }
+    setMpvControlsVisible(false);
+  }, []);
 
   const setEnginePersist = useCallback((next: "mpv" | "webview", persist = true) => {
     engineRef.current = next;
@@ -646,11 +663,14 @@ export function MainPlayer({
     if (!container) return null;
     const r = container.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return null;
+    // getBoundingClientRect 返回 CSS 逻辑像素；Win32 子窗口定位用的是物理像素。
+    // 高 DPI（125%/150% 缩放）下必须乘 devicePixelRatio，否则视频窗口会错位/缩小甚至完全看不到。
+    const dpr = window.devicePixelRatio || 1;
     return {
-      x: Math.round(r.left),
-      y: Math.round(r.top),
-      width: Math.round(r.width),
-      height: Math.round(r.height)
+      x: Math.round(r.left * dpr),
+      y: Math.round(r.top * dpr),
+      width: Math.round(r.width * dpr),
+      height: Math.round(r.height * dpr)
     };
   }, []);
 
@@ -743,6 +763,7 @@ export function MainPlayer({
           return false;
         }
         setMpvActive(true);
+        setMpvControlsVisible(true);
         void invoke("mpv_set_volume_cmd", { volume: mpvVolume }).catch(() => {});
         return true;
       } catch (err) {
@@ -848,10 +869,15 @@ export function MainPlayer({
       // ignore
     }
     mpvUnlistenRef.current = null;
+    if (mpvHideTimerRef.current) {
+      clearTimeout(mpvHideTimerRef.current);
+      mpvHideTimerRef.current = null;
+    }
     void invoke("mpv_stop_cmd").catch(() => {});
     clearMpvHole();
     setMpvActive(false);
     setMpvPaused(false);
+    setMpvControlsVisible(true);
 
     setIsFullScreen(false);
   }, []);
@@ -1717,79 +1743,132 @@ export function MainPlayer({
                 </div>
               </div>
 
-              <div ref={playerContainerRef} className="video-player" />
+              <div
+                ref={playerContainerRef}
+                className="video-player"
+                onMouseMove={engine === "mpv" && mpvActive ? bumpMpvControls : undefined}
+                onMouseLeave={engine === "mpv" && mpvActive ? hideMpvControls : undefined}
+              />
 
               {engine === "mpv" && mpvActive ? (
-                <div className="mpv-controls" data-tauri-drag-region="false">
-                  <span className="mpv-engine-badge">MPV</span>
-                  <button
-                    type="button"
-                    title={mpvPaused ? "播放" : "暂停"}
-                    onClick={() => {
-                      const next = !mpvPaused;
-                      setMpvPaused(next);
-                      void invoke("mpv_pause_cmd", { paused: next }).catch(() => {});
-                    }}
-                  >
-                    {mpvPaused ? "▶" : "❚❚"}
-                  </button>
-                  <button
-                    type="button"
-                    title={mpvMuted ? "取消静音" : "静音"}
-                    onClick={() => {
-                      const next = !mpvMuted;
-                      setMpvMuted(next);
-                      void invoke("mpv_set_mute_cmd", { muted: next }).catch(() => {});
-                    }}
-                  >
-                    {mpvMuted ? "🔇" : "🔊"}
-                  </button>
-                  <input
-                    className="mpv-volume"
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={mpvVolume}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      setMpvVolume(v);
-                      void invoke("mpv_set_volume_cmd", { volume: v }).catch(() => {});
-                      if (mpvMuted) {
-                        setMpvMuted(false);
-                        void invoke("mpv_set_mute_cmd", { muted: false }).catch(() => {});
-                      }
-                    }}
-                  />
-                  <select
-                    value={currentQuality}
-                    title="清晰度"
-                    onChange={(e) => {
-                      const q = e.target.value;
-                      if (q === currentQualityRef.current) return;
-                      setCurrentQuality(q);
-                      try {
-                        window.localStorage.setItem(`${platform}_preferred_quality`, q);
-                      } catch {
-                        // ignore
-                      }
-                    }}
-                  >
-                    {qualityOptions.map((q) => (
-                      <option key={q} value={q}>
-                        {q}
-                      </option>
-                    ))}
-                  </select>
-                  <button type="button" title="刷新直播流" onClick={() => void reloadStreamRef.current?.("refresh")}>
-                    ⟳
-                  </button>
-                  <button
-                    type="button"
-                    title={isFullScreen ? "退出全屏" : "全屏"}
-                    onClick={() => setIsFullScreen(!isFullScreen)}
-                  >
-                    {isFullScreen ? "⤡" : "⛶"}
-                  </button>
+                <div
+                  className={`mpv-controls ${mpvControlsVisible ? "" : "mpv-controls-hidden"}`}
+                  data-tauri-drag-region="false"
+                  onMouseMove={bumpMpvControls}
+                  onMouseLeave={hideMpvControls}
+                >
+                  <div className="mpv-controls-group">
+                    <span className="mpv-engine-badge">MPV</span>
+                    <button
+                      type="button"
+                      className="mpv-icon-btn"
+                      title={mpvPaused ? "播放" : "暂停"}
+                      onClick={() => {
+                        const next = !mpvPaused;
+                        setMpvPaused(next);
+                        void invoke("mpv_pause_cmd", { paused: next }).catch(() => {});
+                      }}
+                    >
+                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: mpvPaused ? ICONS.play : ICONS.pause }} />
+                    </button>
+                    <button
+                      type="button"
+                      className="mpv-icon-btn"
+                      title={mpvMuted ? "取消静音" : "静音"}
+                      onClick={() => {
+                        const next = !mpvMuted;
+                        setMpvMuted(next);
+                        void invoke("mpv_set_mute_cmd", { muted: next }).catch(() => {});
+                      }}
+                    >
+                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: mpvMuted ? ICONS.volumeX : ICONS.volume2 }} />
+                    </button>
+                    <input
+                      className="mpv-volume"
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={mpvVolume}
+                      title="音量"
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setMpvVolume(v);
+                        void invoke("mpv_set_volume_cmd", { volume: v }).catch(() => {});
+                        if (mpvMuted) {
+                          setMpvMuted(false);
+                          void invoke("mpv_set_mute_cmd", { muted: false }).catch(() => {});
+                        }
+                      }}
+                    />
+                    <span className="mpv-volume-value">{mpvVolume}%</span>
+                    <button
+                      type="button"
+                      className="mpv-icon-btn"
+                      title="刷新直播流"
+                      onClick={() => void reloadStreamRef.current?.("refresh")}
+                    >
+                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: ICONS.rotateCcw }} />
+                    </button>
+                  </div>
+                  <div className="mpv-controls-group">
+                    <button
+                      type="button"
+                      className={`mpv-danmu-toggle ${isDanmuEnabled ? "" : "is-off"}`}
+                      title={isDanmuEnabled ? "关闭弹幕" : "开启弹幕"}
+                      onClick={() => setIsDanmuEnabled(!isDanmuEnabled)}
+                    >
+                      <span className="danmu-toggle-label">弹幕</span>
+                      <span className="danmu-toggle-switch">
+                        <span className="switch-track" />
+                        <span className="switch-thumb" />
+                      </span>
+                    </button>
+                    <select
+                      value={currentQuality}
+                      title="清晰度"
+                      onChange={(e) => {
+                        const q = e.target.value;
+                        if (q === currentQualityRef.current) return;
+                        setCurrentQuality(q);
+                        try {
+                          window.localStorage.setItem(`${platform}_preferred_quality`, q);
+                        } catch {
+                          // ignore
+                        }
+                      }}
+                    >
+                      {qualityOptions.map((q) => (
+                        <option key={q} value={q}>
+                          {q}
+                        </option>
+                      ))}
+                    </select>
+                    {lineOptions.length > 0 ? (
+                      <select
+                        value={resolveCurrentLineFor(lineOptions, currentLine) ?? ""}
+                        title="线路"
+                        onChange={(e) => {
+                          const key = e.target.value;
+                          if (!key || key === currentLineRef.current) return;
+                          setCurrentLine(key);
+                        }}
+                      >
+                        {lineOptions.map((o) => (
+                          <option key={o.key} value={o.key}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="mpv-icon-btn"
+                      title={isFullScreen ? "退出网页全屏" : "网页全屏"}
+                      onClick={() => setIsFullScreen(!isFullScreen)}
+                    >
+                      <span className="mpv-icon" dangerouslySetInnerHTML={{ __html: isFullScreen ? ICONS.minimize2 : ICONS.fullscreen }} />
+                    </button>
+                  </div>
                 </div>
               ) : null}
 

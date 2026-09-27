@@ -2455,22 +2455,35 @@ html.mpv-active .mpv-hole {
   pointer-events: none;
 }
 
-/* mpv 控制条（替代 xgplayer 控制栏） */
+/* mpv 控制条（替代 xgplayer 控制栏，视觉与交互对齐 xgplayer：全宽渐变底栏 + 自动隐藏） */
 .mpv-controls {
   position: absolute;
-  left: 50%;
-  bottom: 14px;
-  transform: translateX(-50%);
+  left: 0;
+  right: 0;
+  bottom: 0;
   z-index: 30;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  border-radius: 10px;
-  background: rgba(20, 20, 24, 0.82);
+  justify-content: space-between;
+  gap: 12px;
+  height: 48px;
+  padding: 0 14px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0.38) 60%, transparent);
   color: #fff;
-  backdrop-filter: blur(8px);
   user-select: none;
+  transition: transform 0.24s ease, opacity 0.24s ease;
+}
+
+.mpv-controls.mpv-controls-hidden {
+  transform: translateY(100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mpv-controls-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .mpv-controls button,
@@ -2486,21 +2499,38 @@ html.mpv-active .mpv-hole {
   justify-content: center;
 }
 
-.mpv-controls button {
-  min-width: 28px;
-  height: 28px;
-  border-radius: 6px;
+.mpv-controls .mpv-icon-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  padding: 0;
 }
 
-.mpv-controls button:hover {
-  background: rgba(255, 255, 255, 0.14);
+.mpv-controls .mpv-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.mpv-controls .mpv-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mpv-controls .mpv-icon svg {
+  width: 18px;
+  height: 18px;
 }
 
 .mpv-controls select {
-  height: 28px;
+  height: 30px;
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.08);
-  padding: 0 6px;
+  padding: 0 8px;
+  transition: background 0.2s ease;
+}
+
+.mpv-controls select:hover {
+  background: rgba(255, 255, 255, 0.16);
 }
 
 .mpv-controls select option {
@@ -2509,9 +2539,17 @@ html.mpv-active .mpv-hole {
 }
 
 .mpv-controls .mpv-volume {
-  width: 80px;
-  accent-color: #4d9fff;
+  width: 84px;
+  accent-color: var(--player-accent, #4d9fff);
   cursor: pointer;
+}
+
+.mpv-controls .mpv-volume-value {
+  min-width: 38px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.92);
+  text-align: left;
 }
 
 .mpv-controls .mpv-engine-badge {
@@ -2522,4 +2560,60 @@ html.mpv-active .mpv-hole {
   border: 1px solid rgba(77, 159, 255, 0.5);
   border-radius: 999px;
   white-space: nowrap;
+}
+
+/* mpv 弹幕开关（对齐 xgplayer 的 .xgplayer-danmu-toggle） */
+.mpv-controls .mpv-danmu-toggle {
+  gap: 8px;
+  height: 32px;
+  padding: 0;
+  border-radius: 999px;
+  background: transparent;
+  border: none;
+  transition: color 0.2s ease;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mpv-controls .mpv-danmu-toggle .danmu-toggle-label {
+  font-weight: 500;
+  letter-spacing: 0.03em;
+}
+
+.mpv-controls .mpv-danmu-toggle .danmu-toggle-switch {
+  position: relative;
+  width: 30px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.mpv-controls .mpv-danmu-toggle .switch-track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+  transition: background 0.2s ease;
+}
+
+.mpv-controls .mpv-danmu-toggle .switch-thumb {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.3);
+  transform: translateX(1px);
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1), background 0.2s ease;
+}
+
+.mpv-controls .mpv-danmu-toggle:not(.is-off) .switch-track {
+  background: var(--player-accent-gradient);
+}
+
+.mpv-controls .mpv-danmu-toggle:not(.is-off) .switch-thumb {
+  transform: translateX(15px);
+  background: #1a1a1a;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
 }
