@@ -49,6 +49,10 @@ type FollowContextValue = {
   removeStreamerFromFolder: (folderId: string, platform: Platform, id: string) => void;
   removeStreamerFromFolderByKey: (streamerKey: string, folderId: string) => void;
   updateStreamer: (platform: Platform, id: string, patch: Partial<FollowedStreamer>) => void;
+  /** 批量更新多个主播（轮询刷新用）：只触发一次 state 更新，避免 N 次重渲染。 */
+  updateStreamers: (
+    updates: Array<{ platform: Platform; id: string; patch: Partial<FollowedStreamer> }>
+  ) => void;
 };
 
 const FollowContext = createContext<FollowContextValue | null>(null);
@@ -229,6 +233,46 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
       return changed ? next : prev;
     });
   }, []);
+
+  /**
+   * 批量更新：轮询刷新时把 N 个主播的结果一次性写回。
+   * 逐条调用 updateStreamer 会产生 N 次 setState（N 次重渲染 + N 次持久化），
+   * 主播较多时轮询会造成明显卡顿，这里合并成一次。
+   */
+  const updateStreamers = useCallback(
+    (updates: Array<{ platform: Platform; id: string; patch: Partial<FollowedStreamer> }>) => {
+      if (!updates.length) return;
+      const patchByKey = new Map<string, Partial<FollowedStreamer>>();
+      for (const u of updates) {
+        if (!u || !u.patch) continue;
+        patchByKey.set(`${u.platform}:${u.id}`, u.patch);
+      }
+      if (!patchByKey.size) return;
+
+      setFollowedStreamers((prev) => {
+        let changed = false;
+        const next = prev.map((s) => {
+          const patch = patchByKey.get(`${s.platform}:${s.id}`);
+          if (!patch) return s;
+          changed = true;
+          return { ...s, ...patch };
+        });
+        return changed ? next : prev;
+      });
+      setListOrder((prev) => {
+        let changed = false;
+        const next = prev.map((item) => {
+          if (item.type !== "streamer") return item; // folder 项原样返回
+          const patch = patchByKey.get(`${item.data.platform}:${item.data.id}`);
+          if (!patch) return item;
+          changed = true;
+          return { ...item, data: { ...item.data, ...patch } };
+        });
+        return changed ? next : prev;
+      });
+    },
+    []
+  );
 
   const value = useMemo<FollowContextValue>(() => {
     return {
@@ -419,9 +463,10 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
           return normalizeListOrder(next);
         });
       },
-      updateStreamer
+      updateStreamer,
+      updateStreamers
     };
-  }, [followedStreamers, folders, hydrated, listOrder]);
+  }, [followedStreamers, folders, hydrated, listOrder, updateStreamer, updateStreamers]);
 
   return <FollowContext.Provider value={value}>{children}</FollowContext.Provider>;
 }

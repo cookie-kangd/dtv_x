@@ -268,13 +268,16 @@ export function FollowsList() {
     try {
       const concurrency = FOLLOW_REFRESH_CONCURRENCY;
       let idx = 0;
+      // 先全部收集到 pendingPatches，再统一批量写回：避免每个主播刷新完成都触发一次
+      // state 更新（N 个主播 = N 次重渲染），批量提交后只更新一次。
+      const pendingPatches: Array<{ platform: FollowedStreamer["platform"]; id: string; patch: Partial<FollowedStreamer> }> = [];
       const workers = Array.from({ length: Math.min(concurrency, streamers.length) }, async () => {
         while (idx < streamers.length) {
           const current = streamers[idx];
           idx += 1;
           try {
             const patch = await refreshOne(current);
-            follow.updateStreamer(current.platform, current.id, patch);
+            pendingPatches.push({ platform: current.platform, id: current.id, patch });
             updatedByKey.set(`${current.platform}:${current.id}`, { ...current, ...patch });
           } catch {
             // 刷新失败时保持原状态不动：之前把 LIVE 降级为 UNKNOWN 会导致网络抖动时
@@ -286,6 +289,10 @@ export function FollowsList() {
         }
       });
       await Promise.all(workers);
+
+      if (pendingPatches.length) {
+        follow.updateStreamers(pendingPatches);
+      }
 
       // 对齐老项目：刷新完成后，把“直播中”的主播优先展示（保留同一状态桶内的原相对顺序）
       const baseOrder = listItemsRef.current;

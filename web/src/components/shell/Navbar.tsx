@@ -282,7 +282,7 @@ export function Navbar({
 
   /** 用关注列表同源接口校正搜索结果的开播状态（并发 3，最多 12 条） */
   const correctSearchLiveStatus = useCallback(
-    async (list: SearchAnchorResult[], apply: (next: SearchAnchorResult[]) => void) => {
+    async (list: SearchAnchorResult[], apply: (next: SearchAnchorResult[]) => void, isCancelled?: () => boolean) => {
       const targets = list.slice(0, 12);
       if (!targets.length) return;
 
@@ -325,6 +325,8 @@ export function Navbar({
       await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker));
 
       if (!results.size) return;
+      // 关键词已变化/组件卸载时放弃写回，避免旧结果覆盖新查询
+      if (isCancelled && isCancelled()) return;
       apply(
         list.map((item) => {
           const fixed = results.get(`${item.platform}:${item.roomId}`);
@@ -344,24 +346,35 @@ export function Navbar({
       return;
     }
 
+    // 竞态防护：请求真正发出后（220ms 防抖已过）用户若又改了关键词，
+    // 旧请求的响应不能再写回 state，否则会覆盖新查询的结果（表现为结果串台/闪烁）。
+    let cancelled = false;
+
     setIsLoadingSearch(true);
     const id = window.setTimeout(() => {
       searchAnchors(searchPlatform, trimmed)
         .then((res) => {
+          if (cancelled) return;
           const list = res ?? [];
           setSearchResults(list);
           // 搜索接口返回的开播状态不可靠（斗鱼 videoLoop/虎牙 live_status 常误判），
           // 用与关注列表同源的房间详情接口异步校正，保证两处状态一致。
-          void correctSearchLiveStatus(list, setSearchResults);
+          void correctSearchLiveStatus(list, setSearchResults, () => cancelled);
         })
         .catch((e: any) => {
+          if (cancelled) return;
           setSearchResults([]);
           setSearchError(typeof e === "string" ? e : e?.message || "搜索失败");
         })
-        .finally(() => setIsLoadingSearch(false));
+        .finally(() => {
+          if (!cancelled) setIsLoadingSearch(false);
+        });
     }, 220);
 
-    return () => window.clearTimeout(id);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(id);
+    };
   }, [correctSearchLiveStatus, searchPlatform, searchQuery]);
 
   useEffect(() => {
