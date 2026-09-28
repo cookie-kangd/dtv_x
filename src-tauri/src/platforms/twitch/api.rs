@@ -547,6 +547,44 @@ async fn fetch_usher_playlist(login: &str) -> Result<(String, Vec<TwitchStreamVa
     Err(last_err)
 }
 
+/// 关注列表用：轻量查询主播状态（仅一次 GQL，不打 usher，未开播也不报错）
+#[derive(Serialize)]
+pub struct TwitchStreamerStatus {
+    pub login: String,
+    pub nickname: String,
+    pub avatar: String,
+    pub title: String,
+    pub is_live: bool,
+}
+
+#[tauri::command]
+pub async fn get_twitch_streamer_status(login: String) -> Result<TwitchStreamerStatus, String> {
+    let login_clean = login.trim().to_lowercase();
+    if login_clean.is_empty() {
+        return Err("频道名为空".to_string());
+    }
+    let user = fetch_user_snapshot(&login_clean).await?;
+    let nickname = json_str(&user, "displayName")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| login_clean.clone());
+    let avatar = json_str(&user, "profileImageURL").unwrap_or("").to_string();
+    let title = user
+        .pointer("/stream/title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let is_live = !user.get("stream").map(|s| s.is_null()).unwrap_or(true);
+    Ok(TwitchStreamerStatus {
+        login: login_clean,
+        nickname,
+        avatar,
+        title,
+        is_live,
+    })
+}
+
 #[tauri::command]
 pub async fn get_twitch_stream_cmd(
     login: String,

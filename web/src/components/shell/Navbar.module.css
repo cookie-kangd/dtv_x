@@ -341,8 +341,8 @@
 
 .searchShell {
   height: 38px;
-  width: 160px;
-  max-width: 36vw;
+  width: 240px;
+  max-width: 40vw;
   display: inline-flex;
   align-items: center;
   gap: 6px;

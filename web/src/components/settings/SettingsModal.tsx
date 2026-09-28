@@ -221,6 +221,22 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
                     </div>
                     <div className={styles.row}>
                       <div className={styles.rowText}>
+                        <div className={styles.rowName}>关注列表轮询</div>
+                        <div className={styles.rowDesc}>每隔一段时间自动刷新关注主播的开播状态；仅在窗口可见时执行，几乎不增加资源占用</div>
+                      </div>
+                      <select
+                        className={styles.select}
+                        value={String(settings.followPollIntervalMin)}
+                        onChange={(e) => update({ followPollIntervalMin: Number(e.target.value) })}
+                      >
+                        <option value="0">关闭</option>
+                        <option value="1">1 分钟</option>
+                        <option value="2">2 分钟</option>
+                        <option value="5">5 分钟</option>
+                      </select>
+                    </div>
+                    <div className={styles.row}>
+                      <div className={styles.rowText}>
                         <div className={styles.rowName}>主题模式</div>
                         <div className={styles.rowDesc}>亮色 / 暗色 / 跟随系统</div>
                       </div>

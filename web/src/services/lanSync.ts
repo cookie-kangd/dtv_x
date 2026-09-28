@@ -175,7 +175,7 @@ export function parseLanSyncPayload(raw: unknown): LanSyncPayload {
   };
 }
 
-type FollowPlatform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI";
+type FollowPlatform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI" | "TWITCH";
 
 type FollowedStreamer = {
   id: string;
@@ -204,7 +204,7 @@ function normalizeStreamerKey(streamerKey: string) {
 }
 
 function isKnownPlatform(platform: string): platform is FollowPlatform {
-  return platform === "DOUYU" || platform === "DOUYIN" || platform === "HUYA" || platform === "BILIBILI";
+  return platform === "DOUYU" || platform === "DOUYIN" || platform === "HUYA" || platform === "BILIBILI" || platform === "TWITCH";
 }
 
 function ensureUuid(existing: Set<string>, seed?: string): string {

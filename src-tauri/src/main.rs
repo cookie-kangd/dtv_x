@@ -295,6 +295,7 @@ fn main() {
                 platforms::twitch::api::fetch_twitch_categories,
                 platforms::twitch::api::fetch_twitch_live_list,
                 platforms::twitch::api::get_twitch_stream_cmd,
+                platforms::twitch::api::get_twitch_streamer_status,
                 platforms::twitch::danmaku::start_twitch_danmaku_listener,
                 platforms::twitch::danmaku::stop_twitch_danmaku_listener,
                 version_check::download_and_install_cmd,

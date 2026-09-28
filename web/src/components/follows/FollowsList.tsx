@@ -10,6 +10,7 @@ import { createPortal } from "react-dom";
 import styles from "./FollowsList.module.css";
 import { Platform as PlatformEnum } from "@/platforms/common/types";
 import { useFollow, type FollowListItem, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
+import { useAppSettings } from "@/state/settings/SettingsProvider";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
 
@@ -97,12 +98,24 @@ async function refreshOne(streamer: FollowedStreamer) {
     } satisfies Partial<FollowedStreamer>;
   }
 
+  if (streamer.platform === "TWITCH") {
+    // Twitch 关注的 id 即频道 login；轻量 GQL 快照，未开播也不报错
+    const info = await invoke<any>("get_twitch_streamer_status", { login: streamer.id });
+    return {
+      nickname: info?.nickname ?? streamer.nickname,
+      avatarUrl: info?.avatar ?? streamer.avatarUrl,
+      roomTitle: info?.title ?? streamer.roomTitle,
+      liveStatus: normalizeLiveStatus(!!info?.is_live)
+    } satisfies Partial<FollowedStreamer>;
+  }
+
   return {} satisfies Partial<FollowedStreamer>;
 }
 
 export function FollowsList() {
   const pathname = usePathname();
   const follow = useFollow();
+  const { settings } = useAppSettings();
   const { ensureProxyStarted, getAvatarSrc } = useImageProxy();
   const playerOverlay = usePlayerOverlay();
 
@@ -295,6 +308,35 @@ export function FollowsList() {
       window.setTimeout(() => setShowCheckIcon(false), 1000);
     }
   }, [follow, isRefreshing]);
+
+  // 轮询始终调用最新版 refreshList，避免闭包里 isRefreshing 陈旧导致并发刷新
+  const refreshListRef = useRef(refreshList);
+  useEffect(() => {
+    refreshListRef.current = refreshList;
+  }, [refreshList]);
+
+  // 定时轮询：setTimeout 链（同一时刻最多一个挂起定时器，不堆积）；
+  // 复用 refreshList（并发 2、逐个更新）；窗口不可见时跳过该轮，几乎零额外开销；
+  // 间隔在设置里可调（分钟），0=关闭自动轮询
+  const pollIntervalMs = Math.max(0, settings.followPollIntervalMin) * 60_000;
+  useEffect(() => {
+    if (pollIntervalMs <= 0) return;
+    if (allStreamers.length === 0) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const tick = () => {
+      if (cancelled) return;
+      if (typeof document === "undefined" || document.visibilityState === "visible") {
+        void refreshListRef.current?.();
+      }
+      timer = window.setTimeout(tick, pollIntervalMs);
+    };
+    timer = window.setTimeout(tick, pollIntervalMs);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [allStreamers.length, pollIntervalMs]);
 
   const openOverlay = useCallback(() => {
     const btnRect = expandBtnRef.current?.getBoundingClientRect();
@@ -492,7 +534,7 @@ export function FollowsList() {
   const overlayPlatforms = useMemo(() => {
     const present = new Set<FollowPlatform>();
     for (const s of allStreamers) present.add(s.platform);
-    const order: FollowPlatform[] = ["DOUYU", "HUYA", "DOUYIN", "BILIBILI"];
+    const order: FollowPlatform[] = ["DOUYU", "HUYA", "DOUYIN", "BILIBILI", "TWITCH"];
     return order.filter((p) => present.has(p));
   }, [allStreamers]);
 
@@ -519,6 +561,7 @@ export function FollowsList() {
     if (p === "HUYA") return "虎牙";
     if (p === "DOUYIN") return "抖音";
     if (p === "BILIBILI") return "B站";
+    if (p === "TWITCH") return "Twitch";
     return p;
   }, []);
 

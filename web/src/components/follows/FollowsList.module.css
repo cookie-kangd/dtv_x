@@ -360,11 +360,16 @@
 }
 
 .liveDotUnknown {
-  background: var(--status-warning);
+  /* 未知状态与未开播一致显示灰色，关注列表只保留 绿=开播 / 灰=未开播 两种颜色 */
+  background: rgba(71, 85, 105, 1);
 }
 
 .liveDotOffline {
   background: rgba(71, 85, 105, 1);
+}
+
+:global(:root[data-theme="light"]) .liveDotUnknown {
+  background: rgba(148, 163, 184, 1);
 }
 
 :global(:root[data-theme="light"]) .liveDotOffline {

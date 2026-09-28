@@ -6,7 +6,7 @@
   align-items: center;
   justify-content: center;
   background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(4px);
+  /* 不用 backdrop-filter：WebView2 上首帧合成会闪一下，且下层直播画面变化会逐帧重算模糊，掉帧明显 */
 }
 
 .card {

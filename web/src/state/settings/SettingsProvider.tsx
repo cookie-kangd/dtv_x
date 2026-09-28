@@ -18,6 +18,7 @@ export interface AppSettings {
   highRefreshRate: boolean; // 屏幕高刷：开=跟随系统最高刷新率；关=界面动画/弹幕锁定 60fps 省 GPU（默认开）
   clearCacheOnExit: boolean; // 退出时清理缓存：清理 WebView2 磁盘缓存等垃圾数据，登录态与设置保留（默认开）
   twitchZhOnly: boolean; // Twitch 推荐只看中文：关=全语言人气总榜（默认开）
+  followPollIntervalMin: number; // 关注列表在线状态自动轮询间隔（分钟），0=关闭；默认 2 分钟
   // ===== 平台设置 =====
   enabledPlatforms: Record<string, boolean>; // 平台启用开关（缺省视为启用）
   platformOrder: string[]; // 平台在导航栏的显示顺序
@@ -30,6 +31,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   highRefreshRate: true,
   clearCacheOnExit: true,
   twitchZhOnly: true,
+  followPollIntervalMin: 2,
   enabledPlatforms: {},
   platformOrder: [...ALL_PLATFORM_IDS]
 };
