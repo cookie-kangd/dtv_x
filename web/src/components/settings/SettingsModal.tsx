@@ -242,6 +242,7 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
                         <option value="1">1 分钟</option>
                         <option value="2">2 分钟</option>
                         <option value="5">5 分钟</option>
+                        <option value="10">10 分钟</option>
                       </select>
                     </div>
                     <div className={styles.row}>

@@ -208,16 +208,26 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
 
   const updateStreamer = useCallback((platform: Platform, id: string, patch: Partial<FollowedStreamer>) => {
     const key = `${platform}:${id}`;
-    setFollowedStreamers((prev) => prev.map((s) => (`${s.platform}:${s.id}` === key ? { ...s, ...patch } : s)));
-    setListOrder((prev) =>
-      prev.map((item) => {
-        if (item.type === "streamer") {
-          return `${item.data.platform}:${item.data.id}` === key ? { ...item, data: { ...item.data, ...patch } } : item;
-        }
-        const nextStreamerIds = item.data.streamerIds.map((x) => x); // keep stable ref
-        return { ...item, data: { ...item.data, streamerIds: nextStreamerIds } };
-      })
-    );
+    setFollowedStreamers((prev) => {
+      let changed = false;
+      const next = prev.map((s) => {
+        if (`${s.platform}:${s.id}` !== key) return s;
+        changed = true;
+        return { ...s, ...patch };
+      });
+      return changed ? next : prev;
+    });
+    setListOrder((prev) => {
+      let changed = false;
+      const next = prev.map((item) => {
+        if (item.type !== "streamer") return item; // folder 项原样返回，避免无谓重渲染
+        if (`${item.data.platform}:${item.data.id}` !== key) return item;
+        changed = true;
+        return { ...item, data: { ...item.data, ...patch } };
+      });
+      // 没有任何变化时返回原数组引用，避免整棵关注列表重渲染
+      return changed ? next : prev;
+    });
   }, []);
 
   const value = useMemo<FollowContextValue>(() => {

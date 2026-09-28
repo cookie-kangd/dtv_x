@@ -38,12 +38,12 @@ async function refreshOne(streamer: FollowedStreamer) {
     const videoLoop =
       typeof rawVideoLoop === "number" ? rawVideoLoop : rawVideoLoop === null || typeof rawVideoLoop === "undefined" ? null : Number(rawVideoLoop);
 
-    // Douyu: show_status === 1 需要结合 video_loop 判断；未知值一律不展示“在线”以避免误判
+    // Douyu: show_status === 1 即开播；仅在明确 video_loop === 1（轮播/回放）时视为未开播。
+    // 注意：该接口常常不返回 video_loop，若把"取不到"也算未开播/未知，会导致
+    // 正在直播的主播被误判成灰色/未知（这正是状态不同步的主要原因）。
     let liveStatus: FollowedStreamer["liveStatus"] = "OFFLINE";
     if (showStatus === 1) {
-      if (videoLoop === 0) liveStatus = "LIVE";
-      else if (videoLoop === 1) liveStatus = "OFFLINE";
-      else liveStatus = "UNKNOWN";
+      liveStatus = videoLoop === 1 ? "OFFLINE" : "LIVE";
     }
     return {
       nickname: info?.nickname ?? streamer.nickname,
@@ -250,10 +250,16 @@ export function FollowsList() {
     hoverOpacity.set(1);
   }, [hoverHRaw, hoverOpacity, hoverYRaw]);
 
+  // 刷新互斥锁用 ref 而非 state：state 在 useCallback 闭包里会陈旧，
+  // 导致定时轮询调用到旧的 isRefreshing 值而误判/死锁。
+  const isRefreshingRef = useRef(false);
+
   const refreshList = useCallback(async () => {
-    if (isRefreshing) return;
+    if (isRefreshingRef.current) return;
     const streamers = follow.followedStreamers;
+    if (streamers.length === 0) return;
     const updatedByKey = new Map<string, FollowedStreamer>(streamers.map((s) => [`${s.platform}:${s.id}`, s]));
+    isRefreshingRef.current = true;
     setIsRefreshing(true);
     setShowCheckIcon(false);
     setProgressTotal(streamers.length);
@@ -271,11 +277,9 @@ export function FollowsList() {
             follow.updateStreamer(current.platform, current.id, patch);
             updatedByKey.set(`${current.platform}:${current.id}`, { ...current, ...patch });
           } catch {
-            // 刷新失败时，至少不要继续显示“LIVE”（避免误判在线）
-            if (current.liveStatus === "LIVE") {
-              follow.updateStreamer(current.platform, current.id, { liveStatus: "UNKNOWN" });
-              updatedByKey.set(`${current.platform}:${current.id}`, { ...current, liveStatus: "UNKNOWN" });
-            }
+            // 刷新失败时保持原状态不动：之前把 LIVE 降级为 UNKNOWN 会导致网络抖动时
+            // 状态在绿/灰之间乱跳（用户感知为"状态没同步/不同步"）。
+            void 0;
           } finally {
             setProgressCurrent((v) => v + 1);
           }
@@ -303,11 +307,12 @@ export function FollowsList() {
 
       follow.updateListOrder([...folderItems, ...liveItems, ...restItems]);
     } finally {
+      isRefreshingRef.current = false;
       setIsRefreshing(false);
       setShowCheckIcon(true);
       window.setTimeout(() => setShowCheckIcon(false), 1000);
     }
-  }, [follow, isRefreshing]);
+  }, [follow]);
 
   // 轮询始终调用最新版 refreshList，避免闭包里 isRefreshing 陈旧导致并发刷新
   const refreshListRef = useRef(refreshList);
@@ -316,19 +321,18 @@ export function FollowsList() {
   }, [refreshList]);
 
   // 定时轮询：setTimeout 链（同一时刻最多一个挂起定时器，不堆积）；
-  // 复用 refreshList（并发 2、逐个更新）；窗口不可见时跳过该轮，几乎零额外开销；
-  // 间隔在设置里可调（分钟），0=关闭自动轮询
+  // 复用 refreshList（并发 2、逐个更新）。
+  // 注意：不能依赖 document.visibilityState 判断——Tauri 窗口未聚焦/被遮挡时
+  // WebView2 会把它报成 "hidden"，会导致轮询整轮被跳过（表现为"轮询没生效"）。
+  // 这里只检查窗口是否真的被隐藏（minimize），窗口存在就照常刷新。
   const pollIntervalMs = Math.max(0, settings.followPollIntervalMin) * 60_000;
   useEffect(() => {
     if (pollIntervalMs <= 0) return;
-    if (allStreamers.length === 0) return;
     let cancelled = false;
     let timer: number | null = null;
     const tick = () => {
       if (cancelled) return;
-      if (typeof document === "undefined" || document.visibilityState === "visible") {
-        void refreshListRef.current?.();
-      }
+      void refreshListRef.current?.();
       timer = window.setTimeout(tick, pollIntervalMs);
     };
     timer = window.setTimeout(tick, pollIntervalMs);
@@ -336,7 +340,7 @@ export function FollowsList() {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [allStreamers.length, pollIntervalMs]);
+  }, [pollIntervalMs, allStreamers.length]);
 
   const openOverlay = useCallback(() => {
     const btnRect = expandBtnRef.current?.getBoundingClientRect();

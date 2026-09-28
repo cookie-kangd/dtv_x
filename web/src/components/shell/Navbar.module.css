@@ -1110,36 +1110,43 @@
   border-color: #fff;
 }
 
-/* 搜索结果右侧的关注/取关按钮 */
+/* 搜索结果右侧的关注/取关按钮：实心胶囊，绿=关注 / 红=取关（对齐参考样式） */
 .searchFollowBtn {
   flex-shrink: 0;
-  height: 27px;
-  min-width: 58px;
-  padding: 0 12px;
+  height: 28px;
+  min-width: 62px;
+  padding: 0 14px;
   border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.5);
-  background: rgba(148, 163, 184, 0.14);
-  color: var(--primary-text, #111);
+  border: none;
+  background: #22c55e;
+  color: #ffffff;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 800;
+  line-height: 1;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  box-shadow: 0 1px 4px rgba(34, 197, 94, 0.35);
+  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
 }
 
 .searchFollowBtn:hover {
-  background: rgba(148, 163, 184, 0.26);
+  background: #16a34a;
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.45);
 }
 
-/* 已关注态：实心蓝底 + 白字，对比明确 */
+.searchFollowBtn:active {
+  transform: scale(0.97);
+}
+
+/* 已关注态（点击即取关）：红色实心 */
 .searchFollowBtnActive {
-  background: #2f6fed;
-  border-color: #2f6fed;
+  background: #ef4444;
   color: #ffffff;
+  box-shadow: 0 1px 4px rgba(239, 68, 68, 0.35);
 }
 
 .searchFollowBtnActive:hover {
-  background: #2560d4;
-  border-color: #2560d4;
+  background: #dc2626;
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.45);
 }
 
 /* ===== 应用内更新进度（v0.1.3） ===== */
