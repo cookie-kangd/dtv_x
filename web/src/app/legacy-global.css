@@ -101,7 +101,7 @@
   --dim-text: rgba(134, 134, 139, 0.8);
   --border-color: var(--border);
   --border-color-light: var(--border);
-  --glass-blur: blur(32px);
+  --glass-blur: blur(16px);
   --glass-shadow: var(--shadow-md);
   --content-panel-bg: var(--bg-secondary);
   --color-card: rgba(255, 255, 255, 0.6);
@@ -156,7 +156,7 @@
   --dim-text: rgba(161, 161, 166, 0.8);
   --border-color: var(--border);
   --border-color-light: var(--border);
-  --glass-blur: blur(32px);
+  --glass-blur: blur(16px);
   --glass-shadow: var(--shadow-lg);
   --content-panel-bg: var(--bg-secondary);
   --color-card: rgba(255, 255, 255, 0.15);

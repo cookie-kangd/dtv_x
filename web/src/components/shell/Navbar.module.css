@@ -39,8 +39,7 @@
   position: relative;
   overflow: hidden;
   box-shadow: none;
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  /* 父级 navbar 已有 backdrop-filter，子层再 blur 是双倍 GPU 开销，视觉几乎无差，删除 */
 }
 
 .platformHighlight {
@@ -341,7 +340,7 @@
 
 .searchShell {
   height: 38px;
-  width: 240px;
+  width: 200px;
   max-width: 40vw;
   display: inline-flex;
   align-items: center;
@@ -351,8 +350,7 @@
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: none;
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  /* 父级 navbar 已有 backdrop-filter，子层再 blur 是双倍 GPU 开销，删除 */
 }
 
 :global(:root[data-theme="light"]) .searchShell {
@@ -1031,10 +1029,10 @@
 }
 
 .resultAvatar {
+  position: relative;
   width: 30px;
   height: 30px;
   border-radius: 999px;
-  overflow: hidden;
   flex-shrink: 0;
   background: rgba(0, 0, 0, 0.06);
 }
@@ -1043,6 +1041,7 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
+  border-radius: 999px;
 }
 
 .resultAvatarFallback {
@@ -1054,6 +1053,7 @@
   font-size: var(--text-sm);
   font-weight: var(--weight-bold);
   color: var(--secondary-text);
+  border-radius: 999px;
 }
 
 .resultMain {
@@ -1081,17 +1081,61 @@
   text-overflow: ellipsis;
 }
 
+/* 头像右下角开播状态点：绿=开播，灰=未开播（与关注列表配色一致） */
 .liveDot {
-  width: 8px;
-  height: 8px;
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 11px;
+  height: 11px;
   border-radius: 999px;
-  background: rgba(134, 134, 139, 0.7);
-  flex-shrink: 0;
+  border: 2px solid var(--primary-bg, #fff);
+  background: rgba(71, 85, 105, 1);
+  box-sizing: border-box;
 }
 
-.liveDotOn {
-  background: var(--status-live);
-  box-shadow: 0 0 0 4px rgba(255, 62, 62, 0.12);
+.liveDotLive {
+  background: #10b981;
+}
+
+.liveDotOff {
+  background: rgba(71, 85, 105, 1);
+}
+
+:global(:root[data-theme="light"]) .liveDotOff {
+  background: rgba(148, 163, 184, 1);
+}
+
+:global(:root[data-theme="light"]) .liveDot {
+  border-color: #fff;
+}
+
+/* 搜索结果右侧的关注/取关按钮 */
+.searchFollowBtn {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.searchFollowBtn:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.searchFollowBtnActive {
+  background: var(--accent);
+  color: #fff;
+}
+
+.searchFollowBtnActive:hover {
+  background: color-mix(in srgb, var(--accent) 85%, #000);
 }
 
 /* ===== 应用内更新进度（v0.1.3） ===== */

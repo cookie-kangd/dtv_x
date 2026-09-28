@@ -4,6 +4,7 @@
 // 基本设置 / 平台设置 / 平台登录 / 关于（不放检查更新，只放应用简介）。
 // 所有设置写入 SettingsProvider（localStorage 持久化，关闭应用再打开依然生效）。
 import React, { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { m, AnimatePresence } from "framer-motion";
 import { Info, LogIn, LogOut, MonitorSmartphone, Settings as SettingsIcon, SlidersHorizontal, Wrench, X } from "lucide-react";
 
@@ -106,7 +107,13 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
     update({ enabledPlatforms: { ...settings.enabledPlatforms, [id]: next } });
   };
 
-  return (
+  const portalTarget = typeof document !== "undefined" ? document.body : null;
+  if (!portalTarget) return null;
+
+  // 必须 Portal 到 body：Navbar 带 backdrop-filter（毛玻璃），会给内部 fixed 元素
+  // 创建 containing block —— 弹窗遮罩被困在 navbar 合成层内导致打开瞬间闪黑。
+  // 关注列表 overlay（Portal 模式）不闪，同因同果。
+  return createPortal(
     <AnimatePresence>
       {open ? (
         <m.div
@@ -369,6 +376,7 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
           </m.div>
         </m.div>
       ) : null}
-    </AnimatePresence>
+    </AnimatePresence>,
+    portalTarget
   );
 }

@@ -256,13 +256,8 @@ export function Navbar({
   }, [activePlatform]);
 
   const placeholderText = useMemo(() => {
-    if (activePlatform === "huya") return "搜索虎牙主播/房间...";
-    if (activePlatform === "bilibili") return "搜索B站直播间...";
-    if (activePlatform === "douyin") return "搜索直播间号";
-    if (activePlatform === "twitch") return "Twitch 暂不支持站内搜索";
-    if (activePlatform === "custom") return "搜索：切到具体平台后可用";
-    return "搜索斗鱼主播/房间...";
-  }, [activePlatform]);
+    return "搜索主播/房间";
+  }, []);
 
   useEffect(() => {
     const trimmed = searchQuery.trim();
@@ -663,7 +658,10 @@ export function Navbar({
               {!isLoadingSearch && searchError ? <div className={styles.searchMeta}>{searchError}</div> : null}
               {!isLoadingSearch && !searchError && searchResults.length ? (
                 <div className={styles.searchResultsList}>
-                  {searchResults.map((anchor) => (
+                  {searchResults.map((anchor) => {
+                    const followPlatform = String(anchor.platform).toUpperCase() as FollowPlatform;
+                    const isAnchorFollowed = follow.isFollowed(followPlatform, anchor.roomId);
+                    return (
                     <div
                       key={`${anchor.platform}-${anchor.roomId}`}
                       className={styles.searchResultItem}
@@ -683,6 +681,11 @@ export function Navbar({
                         ) : (
                           <div className={styles.resultAvatarFallback}>{(anchor.userName || "?").slice(0, 1)}</div>
                         )}
+                        <span
+                          className={`${styles.liveDot} ${anchor.liveStatus ? styles.liveDotLive : styles.liveDotOff}`}
+                          title={anchor.liveStatus ? "开播中" : "未开播"}
+                          aria-hidden="true"
+                        />
                       </div>
                       <div className={styles.resultMain}>
                         <div className={styles.resultName} title={anchor.userName}>
@@ -692,9 +695,35 @@ export function Navbar({
                           {anchor.roomTitle}
                         </div>
                       </div>
-                      <span className={`${styles.liveDot} ${anchor.liveStatus ? styles.liveDotOn : ""}`} aria-hidden="true" />
+                      <button
+                        type="button"
+                        className={`${styles.searchFollowBtn} ${isAnchorFollowed ? styles.searchFollowBtnActive : ""}`}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (isAnchorFollowed) {
+                            follow.unfollowStreamer(followPlatform, anchor.roomId);
+                          } else {
+                            follow.followStreamer({
+                              id: anchor.roomId,
+                              platform: followPlatform,
+                              nickname: anchor.userName || anchor.roomId,
+                              avatarUrl: anchor.avatar || "",
+                              roomTitle: anchor.roomTitle || "",
+                              currentRoomId: anchor.roomId,
+                              liveStatus: anchor.liveStatus ? "LIVE" : "OFFLINE"
+                            });
+                          }
+                        }}
+                      >
+                        {isAnchorFollowed ? "取关" : "关注"}
+                      </button>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ) : null}
 
