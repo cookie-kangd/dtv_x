@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CommonStreamer } from "@/platforms/common/streamerTypes";
 
 // Twitch 分区键形态（与 dtv_mx 一致）：
-// - "twitch:top"       → 推荐（中文热门目录，服务端 ZH 过滤，单页无游标）
+// - "twitch:top"       → 推荐（默认中文热门聚合；zhOnly 关闭时为全语言人气总榜）
 // - "twitch:g:<slug>"  → 指定游戏分类（全局热门，游标分页）
 export function parseTwitchCategoryKey(key: string | null): { slug: string | null } {
   if (!key) return { slug: null };
@@ -39,7 +39,7 @@ function mapTwitchItemToCommonStreamer(item: any): CommonStreamer {
   };
 }
 
-export function useTwitchLiveRooms(categoryKey: string | null) {
+export function useTwitchLiveRooms(categoryKey: string | null, zhOnly: boolean = true) {
   const [rooms, setRooms] = useState<CommonStreamer[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -63,7 +63,8 @@ export function useTwitchLiveRooms(categoryKey: string | null) {
         try {
           const resp = await invoke<TwitchLiveListResponse>("fetch_twitch_live_list", {
             slug: slug || null,
-            cursor: loadMore ? cursorRef.current : null
+            cursor: loadMore ? cursorRef.current : null,
+            zhOnly: slug ? null : zhOnly
           });
           if (resp.error !== 0) throw new Error(resp.msg || "Twitch 接口返回错误");
           const newRooms = (resp.data ?? []).map(mapTwitchItemToCommonStreamer);
@@ -92,7 +93,7 @@ export function useTwitchLiveRooms(categoryKey: string | null) {
       inflightRef.current = task;
       return task;
     },
-    [slug]
+    [slug, zhOnly]
   );
 
   const loadInitialRooms = useCallback(async () => {
@@ -108,13 +109,14 @@ export function useTwitchLiveRooms(categoryKey: string | null) {
   }, [fetchPage, hasMore, isLoading, isLoadingMore]);
 
   useEffect(() => {
-    const key = categoryKey ?? "";
+    // 组合键包含 zhOnly：切换「推荐只看中文」后当前列表立即按新设置重载
+    const key = `${categoryKey ?? ""}|${slug ? "any" : zhOnly ? "zh" : "all"}`;
     if (lastInitialKeyRef.current === key) return;
     lastInitialKeyRef.current = key;
     cursorRef.current = null;
     setHasMore(true);
     void loadInitialRooms();
-  }, [categoryKey, loadInitialRooms]);
+  }, [categoryKey, zhOnly, slug, loadInitialRooms]);
 
   return { rooms, isLoading, isLoadingMore, error, hasMore, loadInitialRooms, loadMoreRooms };
 }

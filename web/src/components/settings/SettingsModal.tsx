@@ -191,6 +191,36 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
                     </div>
                     <div className={styles.row}>
                       <div className={styles.rowText}>
+                        <div className={styles.rowName}>屏幕高刷</div>
+                        <div className={styles.rowDesc}>开启后跟随系统最高刷新率渲染（高刷屏更流畅）；关闭则界面动画与弹幕锁定 60fps，降低 GPU 占用，视频播放不受影响</div>
+                      </div>
+                      <Switch
+                        checked={settings.highRefreshRate}
+                        onChange={(v) => update({ highRefreshRate: v })}
+                      />
+                    </div>
+                    <div className={styles.row}>
+                      <div className={styles.rowText}>
+                        <div className={styles.rowName}>退出时清理缓存</div>
+                        <div className={styles.rowDesc}>开启后每次退出应用自动清理网页缓存、临时文件等垃圾数据；登录状态（如 B站）与设置、关注列表均保留</div>
+                      </div>
+                      <Switch
+                        checked={settings.clearCacheOnExit}
+                        onChange={(v) => update({ clearCacheOnExit: v })}
+                      />
+                    </div>
+                    <div className={styles.row}>
+                      <div className={styles.rowText}>
+                        <div className={styles.rowName}>Twitch 推荐只看中文</div>
+                        <div className={styles.rowDesc}>开启后 Twitch「推荐」只显示中文频道，并聚合中文观众常看的谈天说地/IRL；关闭则回到全语言人气总榜。点进具体分类不受影响</div>
+                      </div>
+                      <Switch
+                        checked={settings.twitchZhOnly}
+                        onChange={(v) => update({ twitchZhOnly: v })}
+                      />
+                    </div>
+                    <div className={styles.row}>
+                      <div className={styles.rowText}>
                         <div className={styles.rowName}>主题模式</div>
                         <div className={styles.rowDesc}>亮色 / 暗色 / 跟随系统</div>
                       </div>

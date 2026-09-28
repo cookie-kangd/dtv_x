@@ -264,14 +264,19 @@ fn parse_streams(data: &serde_json::Value, zh_only: bool) -> Vec<(TwitchStreamer
 pub async fn fetch_twitch_live_list(
     slug: Option<String>,
     cursor: Option<String>,
+    zh_only: Option<bool>,
 ) -> Result<TwitchLiveListResponse, String> {
     // cursor 参数仅为兼容前端签名而保留：匿名 Client-ID 带游标翻页会被
     // integrity check 拒绝（dtv_mx 踩坑记录），因此这里刻意不使用
     let _ = cursor;
     let slug_clean = slug.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
-    // 「推荐」分区：中文三路聚合（dtv_mx 同款），内容对齐网页版中文推荐
+    // 「推荐」分区：默认中文三路聚合（dtv_mx 同款）；
+    // 设置关闭「Twitch 推荐只看中文」后走全语言人气总榜
     if slug_clean.is_none() {
+        if zh_only == Some(false) {
+            return fetch_global_recommend_list().await;
+        }
         return fetch_zh_recommend_list().await;
     }
 
@@ -306,11 +311,37 @@ pub async fn fetch_twitch_live_list(
     }
 }
 
+// 全语言人气总榜（设置关闭「Twitch 推荐只看中文」时使用，单页 30 条）
+async fn fetch_global_recommend_list() -> Result<TwitchLiveListResponse, String> {
+    let vars = serde_json::json!({ "first": 30 });
+    match gql(STREAMS_QUERY, vars).await {
+        Ok(data) => {
+            let items = parse_streams(&data, false)
+                .into_iter()
+                .map(|(item, _)| item)
+                .collect();
+            Ok(TwitchLiveListResponse {
+                error: 0,
+                msg: None,
+                data: Some(items),
+                cursor: None,
+                has_more: false,
+            })
+        }
+        Err(e) => Ok(TwitchLiveListResponse {
+            error: 1,
+            msg: Some(e),
+            data: None,
+            cursor: None,
+            has_more: false,
+        }),
+    }
+}
+
 // 中文推荐单页聚合（对齐 dtv_mx 的 fetchRecommendedStreams）：
 // 中文人气总榜 + 中文谈天说地 + 中文IRL 三路并发，去重、按观众数重排。
 // 单路只有 30 条且内容单薄，三路合并后带上中文观众最常看的谈天说地/IRL。
-async fn fetch_zh_recommend_list() -> Result<TwitchLiveListResponse, String> {
-    let top = async {
+async fn fetch_zh_recommend_list() -> Result<TwitchLiveListResponse, String> {    let top = async {
         let vars = serde_json::json!({ "first": 30, "options": zh_only_options() });
         gql(STREAMS_QUERY, vars)
             .await

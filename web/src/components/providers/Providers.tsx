@@ -7,6 +7,7 @@ import { FollowProvider } from "@/state/follow/FollowProvider";
 import { CustomCategoriesProvider } from "@/state/customCategories/CustomCategoriesProvider";
 import { PlayerUiProvider } from "@/state/playerUi/PlayerUiProvider";
 import { SettingsProvider } from "@/state/settings/SettingsProvider";
+import { HighRefreshRateEffect } from "@/hooks/useHighRefreshRate";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
@@ -14,7 +15,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
       <ThemeProvider>
         <FollowProvider>
           <PlayerUiProvider>
-            <CustomCategoriesProvider>{children}</CustomCategoriesProvider>
+            <CustomCategoriesProvider>
+              <HighRefreshRateEffect />
+              {children}
+            </CustomCategoriesProvider>
           </PlayerUiProvider>
         </FollowProvider>
       </ThemeProvider>

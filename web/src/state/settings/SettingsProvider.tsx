@@ -3,6 +3,7 @@
 // 全局应用设置（参考 dtv_mx 的设置面板）。
 // localStorage 持久化：关闭应用再打开依然生效（key: dtv_app_settings_v1）。
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 export const SETTINGS_STORAGE_KEY = "dtv_app_settings_v1";
 
@@ -14,6 +15,9 @@ export interface AppSettings {
   rememberCategory: boolean; // 记住每个平台最后选中的分类（默认开）
   danmuDefaultOn: boolean; // 未手动设置过弹幕时的默认弹幕开关（默认开）
   defaultQuality: string; // 未手动选过画质时的默认画质（默认原画）
+  highRefreshRate: boolean; // 屏幕高刷：开=跟随系统最高刷新率；关=界面动画/弹幕锁定 60fps 省 GPU（默认开）
+  clearCacheOnExit: boolean; // 退出时清理缓存：清理 WebView2 磁盘缓存等垃圾数据，登录态与设置保留（默认开）
+  twitchZhOnly: boolean; // Twitch 推荐只看中文：关=全语言人气总榜（默认开）
   // ===== 平台设置 =====
   enabledPlatforms: Record<string, boolean>; // 平台启用开关（缺省视为启用）
   platformOrder: string[]; // 平台在导航栏的显示顺序
@@ -23,6 +27,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   rememberCategory: true,
   danmuDefaultOn: true,
   defaultQuality: "原画",
+  highRefreshRate: true,
+  clearCacheOnExit: true,
+  twitchZhOnly: true,
   enabledPlatforms: {},
   platformOrder: [...ALL_PLATFORM_IDS]
 };
@@ -74,9 +81,22 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
       saveJson(SETTINGS_STORAGE_KEY, next);
+      // 「退出时清理缓存」需要在应用退出时由 Rust 侧执行，
+      // 该开关只存在前端 localStorage，这里把最新值同步给 Rust（失败静默）。
+      if (patch.clearCacheOnExit !== undefined) {
+        invoke("set_exit_cleanup_enabled", { enabled: !!patch.clearCacheOnExit }).catch(() => {});
+      }
       return next;
     });
   }, []);
+
+  // 启动时把持久化的「退出时清理缓存」同步给 Rust（默认开）
+  useEffect(() => {
+    if (!hydrated) return;
+    invoke("set_exit_cleanup_enabled", { enabled: !!settings.clearCacheOnExit }).catch(() => {});
+    // 仅在完成水合后同步一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated]);
 
   const value = useMemo<SettingsContextValue>(() => ({ settings, hydrated, update }), [settings, hydrated, update]);
 

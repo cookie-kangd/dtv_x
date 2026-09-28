@@ -15,6 +15,7 @@ import { useBilibiliLiveRooms } from "@/hooks/liveRooms/useBilibiliLiveRooms";
 import { useDouyuLiveRooms } from "@/hooks/liveRooms/useDouyuLiveRooms";
 import { useTwitchLiveRooms } from "@/hooks/liveRooms/useTwitchLiveRooms";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
+import { useAppSettings } from "@/state/settings/SettingsProvider";
 
 type DouyuCategorySelection = {
   type: "cate2" | "cate3";
@@ -100,7 +101,8 @@ export function CommonStreamerList({
     platform === "bilibili" ? resolvedParentCategoryId : null
   );
   const douyu = useDouyuLiveRooms(platform === "douyu" ? douyuCategoryType : null, platform === "douyu" ? douyuCategoryId : null);
-  const twitch = useTwitchLiveRooms(platform === "twitch" ? categoryHref : null);
+  const twitchZhOnly = useAppSettings().settings.twitchZhOnly;
+  const twitch = useTwitchLiveRooms(platform === "twitch" ? categoryHref : null, twitchZhOnly);
 
   const selected = useMemo(() => {
     if (platform === "douyin") return douyin;

@@ -7,10 +7,10 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-#[cfg(target_os = "macos")]
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 mod logging;
+mod cache_cleaner;
 mod config_transfer;
 mod lan_sync;
 mod sync_transfer;
@@ -235,6 +235,7 @@ fn main() {
             .manage(proxy::ProxyServerHandle::default())
             .manage(platforms::bilibili::state::BilibiliState::default())
             .manage(lan_sync::LanSyncServerState::default())
+            .manage(cache_cleaner::ExitCleanupFlag(std::sync::atomic::AtomicBool::new(true)))
             .invoke_handler(tauri::generate_handler![
                 get_stream_url_cmd,
                 get_stream_url_with_quality_cmd,
@@ -286,6 +287,7 @@ fn main() {
                 platforms::bilibili::cookie::open_bilibili_login_window,
                 platforms::bilibili::cookie::bilibili_login_window_exists,
                 platforms::bilibili::cookie::close_bilibili_login_window,
+                cache_cleaner::set_exit_cleanup_enabled,
                 platforms::bilibili::search::search_bilibili_rooms,
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,
@@ -297,6 +299,13 @@ fn main() {
                 platforms::twitch::danmaku::stop_twitch_danmaku_listener,
                 version_check::download_and_install_cmd,
             ])
-            .run(tauri::generate_context!())
-            .expect("error while running tauri application");
+            .build(tauri::generate_context!())
+            .expect("error while building tauri application")
+            .run(|app_handle, event| {
+                // 应用退出时按设置清理 WebView2 缓存（登录态/设置/关注列表不受影响）
+                if let tauri::RunEvent::Exit = event {
+                    let flag = app_handle.state::<cache_cleaner::ExitCleanupFlag>();
+                    cache_cleaner::cleanup_on_exit(app_handle, flag.inner());
+                }
+            });
 }
