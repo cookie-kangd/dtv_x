@@ -1,6 +1,6 @@
 [package]
 name = "dtv_x"
-version = "0.1.4"
+version = "0.1.5"
 description = "DTV X - Live Stream Client"
 authors = ["cookie-kangd"]
 edition = "2021"
