@@ -259,6 +259,63 @@ export function Navbar({
     return "搜索主播/房间";
   }, []);
 
+  // 搜索结果开播状态校正缓存：key = platform:roomId，避免重复请求
+  const liveStatusCacheRef = useRef<Map<string, boolean>>(new Map());
+
+  /** 用关注列表同源接口校正搜索结果的开播状态（并发 3，最多 12 条） */
+  const correctSearchLiveStatus = useCallback(
+    async (list: SearchAnchorResult[], apply: (next: SearchAnchorResult[]) => void) => {
+      const targets = list.slice(0, 12);
+      if (!targets.length) return;
+
+      const results = new Map<string, boolean>();
+      let idx = 0;
+      const worker = async () => {
+        while (idx < targets.length) {
+          const item = targets[idx];
+          idx += 1;
+          const key = `${item.platform}:${item.roomId}`;
+          const cached = liveStatusCacheRef.current.get(key);
+          if (cached !== undefined) {
+            results.set(key, cached);
+            continue;
+          }
+          try {
+            let live = item.liveStatus;
+            if (item.platform === "douyu") {
+              const info = await invoke<any>("fetch_douyu_room_info", { roomId: item.roomId });
+              const showStatus = Number(info?.show_status ?? 0);
+              const loop = Number(info?.video_loop ?? info?.videoLoop ?? NaN);
+              live = showStatus === 1 && !(loop === 1);
+            } else if (item.platform === "huya") {
+              const info = await invoke<any>("get_huya_unified_cmd", { roomId: item.roomId, quality: null, line: null });
+              live = !!info?.is_live;
+            } else if (item.platform === "bilibili") {
+              const payload = { platform: "BILIBILI", args: { room_id_str: item.roomId } };
+              const cookie = typeof localStorage !== "undefined" ? localStorage.getItem("bilibili_cookie") || null : null;
+              const info = await invoke<any>("fetch_bilibili_streamer_info", { payload, cookie });
+              live = Number(info?.status ?? 0) === 1;
+            }
+            liveStatusCacheRef.current.set(key, live);
+            results.set(key, live);
+          } catch {
+            // 校正失败保持原值，不写缓存（下次可重试）
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker));
+
+      if (!results.size) return;
+      apply(
+        list.map((item) => {
+          const fixed = results.get(`${item.platform}:${item.roomId}`);
+          return fixed === undefined ? item : { ...item, liveStatus: fixed };
+        })
+      );
+    },
+    []
+  );
+
   useEffect(() => {
     const trimmed = searchQuery.trim();
     setSearchError(null);
@@ -271,7 +328,13 @@ export function Navbar({
     setIsLoadingSearch(true);
     const id = window.setTimeout(() => {
       searchAnchors(searchPlatform, trimmed)
-        .then((res) => setSearchResults(res ?? []))
+        .then((res) => {
+          const list = res ?? [];
+          setSearchResults(list);
+          // 搜索接口返回的开播状态不可靠（斗鱼 videoLoop/虎牙 live_status 常误判），
+          // 用与关注列表同源的房间详情接口异步校正，保证两处状态一致。
+          void correctSearchLiveStatus(list, setSearchResults);
+        })
         .catch((e: any) => {
           setSearchResults([]);
           setSearchError(typeof e === "string" ? e : e?.message || "搜索失败");
@@ -280,7 +343,7 @@ export function Navbar({
     }, 220);
 
     return () => window.clearTimeout(id);
-  }, [searchPlatform, searchQuery]);
+  }, [correctSearchLiveStatus, searchPlatform, searchQuery]);
 
   useEffect(() => {
     if (searchPlatform === "bilibili" || searchPlatform === "huya") {

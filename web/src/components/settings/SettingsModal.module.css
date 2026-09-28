@@ -6,7 +6,10 @@
   align-items: center;
   justify-content: center;
   background: rgba(0, 0, 0, 0.45);
-  /* 不用 backdrop-filter：WebView2 上首帧合成会闪一下，且下层直播画面变化会逐帧重算模糊，掉帧明显 */
+  /* 不使用 backdrop-filter / opacity 入场动画：
+     1) backdrop-filter 在 WebView2 首帧合成会闪、且下层画面变化逐帧重算模糊；
+     2) 遮罩自身做 opacity 过渡时，WebView2 会先合成一帧纯黑再叠加内容（用户看到的"闪黑色"）。
+     遮罩首帧即最终态，只给卡片做 GPU transform 动画。 */
 }
 
 .card {
@@ -16,10 +19,16 @@
   height: min(560px, calc(100vh - 96px));
   border-radius: 14px;
   overflow: hidden;
-  background: var(--primary-bg, #fff);
+  /* 不透明兜底：即使 CSS 变量尚未解析，也不会出现透明/黑底一帧 */
+  background: var(--primary-bg, #ffffff);
+  background-color: var(--primary-bg, #ffffff);
   color: var(--primary-text, #111);
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
   border: 1px solid var(--border-color, rgba(0, 0, 0, 0.08));
+  /* 提前提升为独立合成层，避免首帧重建层导致的闪烁 */
+  will-change: transform;
+  transform: translateZ(0);
+  contain: paint;
 }
 
 .header {

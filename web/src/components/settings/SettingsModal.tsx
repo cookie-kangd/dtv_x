@@ -66,11 +66,19 @@ function Switch({
   );
 }
 
+/** 外层门控：关闭时不渲染任何内容，内部的 B站 cookie 检测、版本查询等副作用一概不执行 */
 export function SettingsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  return (
+    <AnimatePresence>{open ? <SettingsModalContent onClose={onClose} /> : null}</AnimatePresence>
+  );
+}
+
+function SettingsModalContent({ onClose }: { onClose: () => void }) {
   const [section, setSection] = useState<SectionId>("basic");
   const { settings, update } = useAppSettings();
   const theme = useTheme();
-  const bilibili = useBilibiliCookie({ autoBootstrap: open });
+  // 弹窗打开才挂载，B站 cookie 检测只在真正需要时执行一次
+  const bilibili = useBilibiliCookie({ autoBootstrap: true });
   const [appVersion, setAppVersion] = useState("");
 
   useEffect(() => {
@@ -110,28 +118,22 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
   const portalTarget = typeof document !== "undefined" ? document.body : null;
   if (!portalTarget) return null;
 
-  // 必须 Portal 到 body：Navbar 带 backdrop-filter（毛玻璃），会给内部 fixed 元素
-  // 创建 containing block —— 弹窗遮罩被困在 navbar 合成层内导致打开瞬间闪黑。
-  // 关注列表 overlay（Portal 模式）不闪，同因同果。
+  // 遮罩不使用透明度动画：WebView2 上 opacity 过渡会先合成一帧纯黑再叠加内容，
+  // 表现为「打开设置闪一下黑」。遮罩改为首帧即最终态，只给卡片做纯 transform 动画。
   return createPortal(
-    <AnimatePresence>
-      {open ? (
-        <m.div
-          className={styles.backdrop}
-          data-tauri-drag-region="false"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onMouseDown={onClose}
-        >
-          <m.div
-            className={styles.card}
-            initial={{ opacity: 0, y: 12, scale: 0.985 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 8, scale: 0.99 }}
-            transition={{ type: "spring", stiffness: 520, damping: 44, mass: 0.7 }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
+    <m.div
+      className={styles.backdrop}
+      data-tauri-drag-region="false"
+      onMouseDown={onClose}
+    >
+      <m.div
+        className={styles.card}
+        initial={{ y: 14, scale: 0.98 }}
+        animate={{ y: 0, scale: 1 }}
+        exit={{ y: 8, scale: 0.99, transition: { duration: 0.1 } }}
+        transition={{ type: "spring", stiffness: 540, damping: 42, mass: 0.6 }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
             <div className={styles.header}>
               <div className={styles.headerTitle}>
                 <SettingsIcon size={18} />
@@ -373,10 +375,8 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
                 ) : null}
               </div>
             </div>
-          </m.div>
-        </m.div>
-      ) : null}
-    </AnimatePresence>,
+      </m.div>
+    </m.div>,
     portalTarget
   );
 }

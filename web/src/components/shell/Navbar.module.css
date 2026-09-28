@@ -1113,29 +1113,33 @@
 /* 搜索结果右侧的关注/取关按钮 */
 .searchFollowBtn {
   flex-shrink: 0;
-  height: 26px;
+  height: 27px;
+  min-width: 58px;
   padding: 0 12px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--accent) 65%, transparent);
-  background: transparent;
-  color: var(--accent);
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--primary-text, #111);
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
 .searchFollowBtn:hover {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  background: rgba(148, 163, 184, 0.26);
 }
 
+/* 已关注态：实心蓝底 + 白字，对比明确 */
 .searchFollowBtnActive {
-  background: var(--accent);
-  color: #fff;
+  background: #2f6fed;
+  border-color: #2f6fed;
+  color: #ffffff;
 }
 
 .searchFollowBtnActive:hover {
-  background: color-mix(in srgb, var(--accent) 85%, #000);
+  background: #2560d4;
+  border-color: #2560d4;
 }
 
 /* ===== 应用内更新进度（v0.1.3） ===== */
