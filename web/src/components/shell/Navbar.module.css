@@ -436,9 +436,13 @@
   width: min(520px, calc(100vw - 36px));
   border-radius: 18px;
   background: var(--bg-secondary);
+  background-color: var(--bg-secondary);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
+  /* 与设置弹窗一致：提升为独立合成层，避免首帧背景色缺失导致闪黑 */
+  will-change: transform;
+  transform: translateZ(0);
 }
 
 .overlayHeader {

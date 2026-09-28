@@ -361,16 +361,15 @@ export function LanSyncModal({
         className={styles.overlayBackdrop}
         // eslint-disable-next-line react/no-unknown-property
         data-tauri-drag-region="false"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
+        // 遮罩不做 opacity 入场动画（WebView2 上会先合成一帧纯黑，表现为闪黑）
+        initial={false}
         onMouseDown={() => close()}
       >
         <m.div
           className={styles.overlayCard}
-          initial={{ opacity: 0, y: 10, scale: 0.985 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          exit={{ opacity: 0, y: 8, scale: 0.99 }}
+          initial={{ y: 12, scale: 0.985 }}
+          animate={{ y: 0, scale: 1 }}
+          exit={{ y: 8, scale: 0.99, transition: { duration: 0.1 } }}
           transition={{ type: "spring", stiffness: 520, damping: 44, mass: 0.7 }}
           onMouseDown={(e) => e.stopPropagation()}
         >

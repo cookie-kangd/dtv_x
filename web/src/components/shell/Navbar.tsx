@@ -916,16 +916,17 @@ export function Navbar({
             className={styles.overlayBackdrop}
             // eslint-disable-next-line react/no-unknown-property
             data-tauri-drag-region="false"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
+            // 注意：遮罩不要做 opacity 入场动画——WebView2 上 opacity 0→1 会先合成一帧
+            // 纯黑底层再叠加内容，表现为"闪黑"（与设置弹窗同一个根因）。
+            // 遮罩首帧即最终态，只让卡片做 transform 动画。
+            initial={false}
             onMouseDown={() => setUpdateOpen(false)}
           >
             <m.div
               className={styles.overlayCard}
-              initial={{ opacity: 0, y: 10, scale: 0.985 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 8, scale: 0.99 }}
+              initial={{ y: 12, scale: 0.985 }}
+              animate={{ y: 0, scale: 1 }}
+              exit={{ y: 8, scale: 0.99, transition: { duration: 0.1 } }}
               transition={{ type: "spring", stiffness: 520, damping: 44, mass: 0.7 }}
               onMouseDown={(e) => e.stopPropagation()}
             >
