@@ -5,6 +5,14 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, WebviewUrl};
 use url::Url;
 
+// WebView2 浏览器进程全局共享：同进程内所有 webview 的 browser args 必须与
+// tauri.conf.json 主窗口的 additionalBrowserArgs 完全一致，否则创建第二个
+// webview 会失败（HRESULT 0x8007139F「组或资源的状态不是执行请求操作的正确状态」）。
+// 修改 tauri.conf.json 时必须同步修改这里！
+const WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding";
+
+const BILIBILI_LOGIN_WINDOW_LABEL: &str = "bilibili-login";
+
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BilibiliCookieResult {
@@ -156,6 +164,7 @@ pub async fn bootstrap_bilibili_cookie(
     .resizable(false)
     .focused(false)
     .decorations(false)
+    .additional_browser_args(WEBVIEW_BROWSER_ARGS)
     .build()
     .map_err(|e| format!("Failed to open silent window: {}", e))?;
 
@@ -169,4 +178,51 @@ pub async fn bootstrap_bilibili_cookie(
     }
 
     Ok(result)
+}
+
+/// 打开 B 站扫码登录窗口（Rust 侧创建，保证 additional_browser_args 与主窗口一致）。
+/// 已存在时仅显示并聚焦。
+#[tauri::command]
+pub async fn open_bilibili_login_window(app_handle: AppHandle) -> Result<(), String> {
+    let url = "https://passport.bilibili.com/login".to_string();
+    let parsed_url = Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
+
+    if let Some(existing) = app_handle.get_webview_window(BILIBILI_LOGIN_WINDOW_LABEL) {
+        let _ = existing.show();
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app_handle,
+        BILIBILI_LOGIN_WINDOW_LABEL.to_string(),
+        WebviewUrl::External(parsed_url),
+    )
+    .title("B站登录")
+    .inner_size(420.0, 640.0)
+    .resizable(true)
+    .focused(true)
+    .additional_browser_args(WEBVIEW_BROWSER_ARGS)
+    .build()
+    .map_err(|e| format!("创建登录窗口失败: {}", e))?;
+
+    Ok(())
+}
+
+/// 登录窗口是否仍然存在（前端轮询用于检测用户关闭窗口）。
+#[tauri::command]
+pub async fn bilibili_login_window_exists(app_handle: AppHandle) -> Result<bool, String> {
+    Ok(app_handle
+        .get_webview_window(BILIBILI_LOGIN_WINDOW_LABEL)
+        .is_some())
+}
+
+/// 关闭登录窗口（拿到 Cookie 后由前端调用）。
+#[tauri::command]
+pub async fn close_bilibili_login_window(app_handle: AppHandle) -> Result<(), String> {
+    if let Some(window) = app_handle.get_webview_window(BILIBILI_LOGIN_WINDOW_LABEL) {
+        let _ = window.close();
+    }
+    Ok(())
 }

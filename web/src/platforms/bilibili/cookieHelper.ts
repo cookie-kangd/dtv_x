@@ -1,5 +1,4 @@
 import { invoke } from '@tauri-apps/api/core';
-import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 export interface BilibiliCookieResult {
   cookie: string | null;
@@ -60,53 +59,32 @@ export const ensureBilibiliCookieBootstrap = async (): Promise<BilibiliCookieRes
   }
 };
 
-export const ensureBilibiliLoginWindow = async (): Promise<WebviewWindow> => {
-  const existing = await WebviewWindow.getByLabel(BILIBILI_LOGIN_WINDOW_LABEL);
-  if (existing) {
-    try {
-      await existing.show();
-      await existing.setFocus();
-    } catch (e) {
-      console.warn('[BilibiliCookie] Failed to focus existing login window:', e);
-    }
-    return existing;
-  }
+// 登录窗口由 Rust 侧创建（open_bilibili_login_window），保证 WebView2 browser args
+// 与主窗口完全一致 —— JS 端 WebviewWindow 选项不支持 additionalBrowserArgs，
+// 且参数不一致时第二个 webview 会创建失败（0x8007139F）。
+export interface BilibiliLoginWindowHandle {
+  label: string;
+}
 
-  // 注意：WebView2 的浏览器进程全局共享，同进程内所有 webview 的 additionalBrowserArgs
-  // 必须与主窗口（tauri.conf.json）完全一致，否则第二个 webview 创建会失败
-  // （HRESULT 0x8007139F「组或资源的状态不是执行请求操作的正确状态」）。
-  const loginWindow = new WebviewWindow(BILIBILI_LOGIN_WINDOW_LABEL, {
-    url: BILIBILI_LOGIN_URL,
-    title: 'B站登录',
-    width: 420,
-    height: 640,
-    resizable: true,
-    focus: true,
-    fullscreen: false,
-    alwaysOnTop: false,
-    additionalBrowserArgs:
-      '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding',
-  });
+export const ensureBilibiliLoginWindow = async (): Promise<BilibiliLoginWindowHandle> => {
+  await invoke('open_bilibili_login_window');
+  return { label: BILIBILI_LOGIN_WINDOW_LABEL };
+};
 
-  await Promise.race([
-    new Promise<void>((resolve) => {
-      loginWindow.once('tauri://created', () => resolve());
-    }),
-    new Promise<void>((_, reject) => {
-      loginWindow.once('tauri://error', (event) => {
-        reject(new Error(String(event.payload ?? '创建登录窗口失败')));
-      });
-    }),
-  ]);
-
+export const bilibiliLoginWindowExists = async (): Promise<boolean> => {
   try {
-    await loginWindow.show();
-    await loginWindow.setFocus();
-  } catch (e) {
-    console.warn('[BilibiliCookie] Unable to show or focus login window:', e);
+    return await invoke<boolean>('bilibili_login_window_exists');
+  } catch {
+    return false;
   }
+};
 
-  return loginWindow;
+export const closeBilibiliLoginWindow = async (): Promise<void> => {
+  try {
+    await invoke('close_bilibili_login_window');
+  } catch {
+    // ignore
+  }
 };
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

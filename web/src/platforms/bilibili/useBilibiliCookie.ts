@@ -1,9 +1,10 @@
 "use client";
 
-import { type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  bilibiliLoginWindowExists,
+  closeBilibiliLoginWindow,
   ensureBilibiliCookieBootstrap,
   ensureBilibiliLoginWindow,
   extractRequiredFlags,
@@ -112,49 +113,36 @@ export function useBilibiliCookie(options: Options = {}) {
     setError(null);
     setIsLoggingIn(true);
 
-    let unlisten: UnlistenFn | null = null;
     try {
-      const loginWindow = await ensureBilibiliLoginWindow();
-      let windowClosed = false;
-
-      unlisten = await loginWindow.listen("tauri://close-requested", () => {
-        windowClosed = true;
-      });
+      // 登录窗口由 Rust 侧创建（与主窗口 WebView2 参数一致，避免 0x8007139F）
+      const { label } = await ensureBilibiliLoginWindow();
 
       const timeoutMs = 120_000;
       const intervalMs = 1_500;
       const deadline = Date.now() + timeoutMs;
 
-      while (!windowClosed && Date.now() < deadline) {
-        const result = await getBilibiliCookies([loginWindow.label]);
+      while (Date.now() < deadline) {
+        const [result, windowExists] = await Promise.all([
+          getBilibiliCookies([label]),
+          bilibiliLoginWindowExists()
+        ]);
         if (hasRequiredCookies(result)) {
           persist(result.cookie);
-          try {
-            await loginWindow.close();
-          } catch (closeErr) {
-            console.warn("[BilibiliCookie] Failed to close login window:", closeErr);
-          }
+          await closeBilibiliLoginWindow();
           return;
+        }
+        if (!windowExists) {
+          throw new Error("登录窗口已关闭，未完成登录");
         }
         await sleep(intervalMs);
       }
 
-      if (windowClosed) {
-        throw new Error("登录窗口已关闭，未完成登录");
-      }
       throw new Error("登录超时，请重试");
     } catch (e: any) {
       const msg = e?.message || "登录失败，请重试";
       if (mountedRef.current) setError(msg);
       console.error("[BilibiliCookie] Login failed:", e);
     } finally {
-      if (unlisten) {
-        try {
-          unlisten();
-        } catch {
-          // ignore
-        }
-      }
       if (mountedRef.current) setIsLoggingIn(false);
     }
   }, [isLoggingIn, persist]);
