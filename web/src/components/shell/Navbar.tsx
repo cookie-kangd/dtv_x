@@ -435,7 +435,10 @@ export function Navbar({
 
   useLayoutEffect(() => {
     updateHighlight();
-  }, [updateHighlight, visiblePlatforms.length]);
+    // 依赖 visiblePlatforms（数组身份在平台启停/排序变化时都会更新）：
+    // 排序变化时 length 不变，若只依赖 length 会导致高亮块停留在旧位置，
+    // 压在错误的平台下方，出现「某些平台文字变白」的观感。
+  }, [updateHighlight, visiblePlatforms]);
 
   useEffect(() => {
     const onResize = () => updateHighlight();

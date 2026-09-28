@@ -72,6 +72,9 @@ export const ensureBilibiliLoginWindow = async (): Promise<WebviewWindow> => {
     return existing;
   }
 
+  // 注意：WebView2 的浏览器进程全局共享，同进程内所有 webview 的 additionalBrowserArgs
+  // 必须与主窗口（tauri.conf.json）完全一致，否则第二个 webview 创建会失败
+  // （HRESULT 0x8007139F「组或资源的状态不是执行请求操作的正确状态」）。
   const loginWindow = new WebviewWindow(BILIBILI_LOGIN_WINDOW_LABEL, {
     url: BILIBILI_LOGIN_URL,
     title: 'B站登录',
@@ -81,6 +84,8 @@ export const ensureBilibiliLoginWindow = async (): Promise<WebviewWindow> => {
     focus: true,
     fullscreen: false,
     alwaysOnTop: false,
+    additionalBrowserArgs:
+      '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding',
   });
 
   await Promise.race([
