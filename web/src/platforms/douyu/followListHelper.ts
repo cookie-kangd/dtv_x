@@ -31,22 +31,14 @@ export async function refreshDouyuFollowedStreamer(
       const sStatus = typeof roomInfo.show_status === 'number' ? roomInfo.show_status : null;
       const vLoop = typeof roomInfo.video_loop === 'number' ? roomInfo.video_loop : null;
 
+      // 与 FollowsList 保持一致：show_status === 1 即开播；
+      // 仅当明确 video_loop === 1（轮播/回放）时视为未开播。
+      // 注意 fetch_douyu_room_info 经常不返回 video_loop 字段，不能因此判为未开播。
       if (sStatus === 1) {
-        if (vLoop === 1) {
-          currentLiveStatus = 'REPLAY';
-        } else if (vLoop === 0 || vLoop === null) { 
-          currentLiveStatus = 'LIVE';
-        } else {
-          currentLiveStatus = 'OFFLINE'; 
-          console.warn(`[DouyuFollowHelper] Room ${roomInfo.room_id}: show_status is 1, but video_loop is unexpected (${vLoop}). Defaulting to OFFLINE.`);
-        }
-      } else { // Any show_status other than 1 (e.g., 2 or null/missing)
+        currentLiveStatus = vLoop === 1 ? 'OFFLINE' : 'LIVE';
+      } else {
         currentLiveStatus = 'OFFLINE';
       }
-      
-      console.log(
-        `[DouyuFollowHelper] Refresh for ID: ${streamer.id} - Nick: ${roomInfo.nickname ?? 'N/A'}, Title: ${roomInfo.room_name ?? 'N/A'}, show_status: ${sStatus ?? 'N/A'}, video_loop: ${vLoop ?? 'N/A'}, Calculated LiveStatus: ${currentLiveStatus}`
-      );
 
       return {
         liveStatus: currentLiveStatus,

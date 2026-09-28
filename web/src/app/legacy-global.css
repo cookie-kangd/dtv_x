@@ -223,7 +223,13 @@ body {
   outline-offset: 2px;
 }
 
-button:not(.button):not([data-slot="button"]) {
+/*
+ * 裸 button 的默认复位。
+ * 注意：必须用 :where() 把特异性压到 0，否则会盖掉 CSS Modules 里
+ * 单类选择器写的按钮背景/边框（例如 .searchFollowBtn 的绿/红实心胶囊）
+ * —— :not(.button) 这类写法本身会计入特异性 (0,2,1)，高于任何单类样式。
+ */
+:where(button:not(.button):not([data-slot="button"])) {
   border: none;
   background: none;
   cursor: pointer;

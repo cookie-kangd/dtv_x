@@ -41,6 +41,24 @@ const basePlatforms: Array<{ id: Exclude<UiPlatform, "custom">; name: string }> 
 
 const customPlatform = { id: "custom" as const, name: "自定义" };
 
+/**
+ * 搜索结果关注/取关按钮的定色兜底。
+ * 内联样式优先级最高：即使全局 button 复位规则（border/background: none）
+ * 因加载顺序或特异性问题胜出，按钮的实心底色与白字也一定生效。
+ * 其余尺寸/圆角/hover 反馈仍由 Navbar.module.css 的 .searchFollowBtn 提供。
+ */
+const followBtnColorStyle: React.CSSProperties = {
+  backgroundColor: "#22c55e",
+  backgroundImage: "none",
+  color: "#ffffff"
+};
+
+const unfollowBtnColorStyle: React.CSSProperties = {
+  backgroundColor: "#ef4444",
+  backgroundImage: "none",
+  color: "#ffffff"
+};
+
 function WinCaptionMinimizeIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -762,6 +780,8 @@ export function Navbar({
                       <button
                         type="button"
                         className={`${styles.searchFollowBtn} ${isAnchorFollowed ? styles.searchFollowBtnActive : ""}`}
+                        data-slot="button"
+                        style={isAnchorFollowed ? unfollowBtnColorStyle : followBtnColorStyle}
                         onMouseDown={(e) => {
                           e.preventDefault();
                           e.stopPropagation();

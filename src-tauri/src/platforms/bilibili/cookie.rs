@@ -9,7 +9,15 @@ use url::Url;
 // tauri.conf.json 主窗口的 additionalBrowserArgs 完全一致，否则创建第二个
 // webview 会失败（HRESULT 0x8007139F「组或资源的状态不是执行请求操作的正确状态」）。
 // 修改 tauri.conf.json 时必须同步修改这里！
-const WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding";
+//
+// 参数说明（v0.2.2 追加）：
+//   --disable-features=CalculateNativeWinOcclusion  Edge 会周期性用 EnumWindows 计算
+//       窗口遮挡状态，纯直播场景无收益却很吃 CPU，关掉可降占用。
+//   --enable-features=CanvasOopRasterization  画布光栅化放到独立进程，
+//       弹幕大量绘制时主 UI 线程更少卡顿。
+//   --renderer-process-limit=2  限制渲染进程数上限，降低内存占用。
+//   --js-flags=--max-old-space-size=512  限制 V8 老生代堆上限，避免长时间运行后内存膨胀。
+const WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --enable-features=CanvasOopRasterization --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding --renderer-process-limit=2 --js-flags=--max-old-space-size=512";
 
 const BILIBILI_LOGIN_WINDOW_LABEL: &str = "bilibili-login";
 

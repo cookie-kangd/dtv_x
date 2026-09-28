@@ -1110,26 +1110,34 @@
   border-color: #fff;
 }
 
-/* 搜索结果右侧的关注/取关按钮：实心胶囊，绿=关注 / 红=取关（对齐参考样式） */
+/* 搜索结果右侧的关注/取关按钮：实心胶囊，绿=关注 / 红=取关（对齐参考样式）
+ * 注意：背景与文字色在 TSX 里用内联样式兜底（优先级最高），
+ * 因此这里的 hover/active 需要 !important 才能覆盖内联值。
+ * 「已关注(红)」的组合选择器必须同时写上，否则 :hover 的高特异性会让
+ * 红色按钮在悬停时错误变绿。 */
 .searchFollowBtn {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   height: 28px;
   min-width: 62px;
   padding: 0 14px;
   border-radius: 999px;
-  border: none;
-  background: #22c55e;
-  color: #ffffff;
+  border: none !important;
+  background-color: #22c55e !important;
+  background-image: none !important;
+  color: #ffffff !important;
   font-size: 12px;
   font-weight: 800;
   line-height: 1;
   cursor: pointer;
   box-shadow: 0 1px 4px rgba(34, 197, 94, 0.35);
-  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
 }
 
 .searchFollowBtn:hover {
-  background: #16a34a;
+  background-color: #16a34a !important;
   box-shadow: 0 2px 8px rgba(34, 197, 94, 0.45);
 }
 
@@ -1138,14 +1146,15 @@
 }
 
 /* 已关注态（点击即取关）：红色实心 */
-.searchFollowBtnActive {
-  background: #ef4444;
-  color: #ffffff;
+.searchFollowBtnActive,
+.searchFollowBtnActive:hover {
+  background-color: #ef4444 !important;
+  color: #ffffff !important;
   box-shadow: 0 1px 4px rgba(239, 68, 68, 0.35);
 }
 
 .searchFollowBtnActive:hover {
-  background: #dc2626;
+  background-color: #dc2626 !important;
   box-shadow: 0 2px 8px rgba(239, 68, 68, 0.45);
 }
 
