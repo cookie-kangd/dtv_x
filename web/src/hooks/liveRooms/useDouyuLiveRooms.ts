@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommonStreamer } from "@/platforms/common/streamerTypes";
 
@@ -34,6 +34,8 @@ export function useDouyuLiveRooms(categoryType: "cate2" | "cate3" | null, catego
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [currentPage, setCurrentPage] = useState(0);
+  // 请求序号：用于丢弃「过期响应」（切换分类时旧分类的响应可能晚于新分类到达）
+  const requestSeqRef = useRef(0);
 
   const mapDouyuItemToCommon = useCallback((item: DouyuStreamer): CommonStreamer => {
     return {
@@ -58,6 +60,10 @@ export function useDouyuLiveRooms(categoryType: "cate2" | "cate3" | null, catego
         return;
       }
 
+      // 竞态防护：响应回来时若请求序号已变（切换分类 / 组件卸载），丢弃过期响应，
+      // 否则旧分类的结果会覆盖新分类的列表。
+      const seq = ++requestSeqRef.current;
+
       if (loadMore) setIsLoadingMore(true);
       else setIsLoading(true);
 
@@ -74,6 +80,7 @@ export function useDouyuLiveRooms(categoryType: "cate2" | "cate3" | null, catego
       try {
         const resp = await invoke<LiveListApiResponse>(command, params);
         if (resp.error !== 0 || !resp.data) throw new Error(resp.msg || "斗鱼接口返回错误");
+        if (seq !== requestSeqRef.current) return; // 过期响应，丢弃
 
         const newRooms = (resp.data.list || []).map(mapDouyuItemToCommon);
         setRooms((prev) => (pageToFetch === 0 ? newRooms : [...prev, ...newRooms]));
@@ -89,12 +96,16 @@ export function useDouyuLiveRooms(categoryType: "cate2" | "cate3" | null, catego
 
         setCurrentPage(pageToFetch);
       } catch (e) {
+        if (seq !== requestSeqRef.current) return; // 过期响应，丢弃
         console.error("[useDouyuLiveRooms] invoke error", e);
         if (pageToFetch === 0) setRooms([]);
         setHasMore(false);
       } finally {
-        if (loadMore) setIsLoadingMore(false);
-        else setIsLoading(false);
+        // 只有当前有效请求才允许关闭 loading，避免过期请求把新请求的 loading 状态关掉
+        if (seq === requestSeqRef.current) {
+          if (loadMore) setIsLoadingMore(false);
+          else setIsLoading(false);
+        }
       }
     },
     [categoryId, categoryType, mapDouyuItemToCommon]
@@ -120,6 +131,13 @@ export function useDouyuLiveRooms(categoryType: "cate2" | "cate3" | null, catego
     }
     void loadInitialRooms();
   }, [canFetch, loadInitialRooms]);
+
+  // 卸载后作废所有在途请求，避免组件已卸载仍写入状态
+  useEffect(() => {
+    return () => {
+      requestSeqRef.current += 1;
+    };
+  }, []);
 
   return { rooms, isLoading, isLoadingMore, hasMore, loadInitialRooms, loadMoreRooms };
 }

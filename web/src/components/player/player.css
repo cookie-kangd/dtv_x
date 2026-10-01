@@ -2432,3 +2432,43 @@ video.xgplayer-video {
   border-bottom: 1px solid var(--border-color-light, #e0e0e0);
 }
 
+/* ===== 直播自动重连提示（弱网/瞬断时显示，不遮挡画面交互）===== */
+.reconnect-toast {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 21;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(420px, 86vw);
+  padding: 10px 18px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: left;
+  pointer-events: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
+}
+
+.reconnect-toast .reconnect-spinner {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #ffffff;
+  animation: spinner-spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reconnect-toast .reconnect-spinner {
+    animation-duration: 2s;
+  }
+}
+
+

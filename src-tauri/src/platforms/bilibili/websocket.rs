@@ -42,34 +42,39 @@ pub struct BiliLiveClient {
 }
 
 impl BiliLiveClient {
-    pub fn new_with_cookie(cookies: &str, room_id: &str) -> Self {
-        let (v, auth) = init_server_with_cookie(cookies, room_id);
+    // 构造失败一律返回 Err（网络异常 / 风控 / 房间号非法），不再 panic。
+    pub fn new_with_cookie(cookies: &str, room_id: &str) -> Result<Self, String> {
+        let (v, auth) = init_server_with_cookie(cookies, room_id)?;
         ws_debug!("[websocket] server_info host_list: {:?}", v["host_list"]);
-        let ws = connect(v["host_list"].clone());
+        let ws = connect(v["host_list"].clone())?;
         ws_debug!("[websocket] connected via cookie for room {}", room_id);
-        BiliLiveClient {
+        let auth_msg =
+            serde_json::to_string(&auth).map_err(|e| format!("序列化鉴权信息失败：{e}"))?;
+        Ok(BiliLiveClient {
             ws,
-            auth_msg: serde_json::to_string(&auth).unwrap(),
+            auth_msg,
             host_list: v["host_list"].clone(),
             last_heartbeat: Instant::now(),
             heartbeat_interval: Duration::from_secs(30),
             pending: VecDeque::new(),
-        }
+        })
     }
 
-    pub fn new_without_cookie(room_id: &str) -> Self {
-        let (v, auth) = init_server_no_cookie(room_id);
+    pub fn new_without_cookie(room_id: &str) -> Result<Self, String> {
+        let (v, auth) = init_server_no_cookie(room_id)?;
         ws_debug!("[websocket] server_info host_list: {:?}", v["host_list"]);
-        let ws = connect(v["host_list"].clone());
+        let ws = connect(v["host_list"].clone())?;
         ws_debug!("[websocket] connected without cookie for room {}", room_id);
-        BiliLiveClient {
+        let auth_msg =
+            serde_json::to_string(&auth).map_err(|e| format!("序列化鉴权信息失败：{e}"))?;
+        Ok(BiliLiveClient {
             ws,
-            auth_msg: serde_json::to_string(&auth).unwrap(),
+            auth_msg,
             host_list: v["host_list"].clone(),
             last_heartbeat: Instant::now(),
             heartbeat_interval: Duration::from_secs(30),
             pending: VecDeque::new(),
-        }
+        })
     }
 
     pub fn send_auth(&mut self) {
@@ -94,14 +99,12 @@ impl BiliLiveClient {
         }
     }
 
-    // Try to reconnect using the cached host list, and re-authenticate
+    // Try to reconnect using the cached host list, and re-authenticate.
+    // connect() 已不再 panic（全部失败路径返回 Err），因此这里不需要 catch_unwind。
     fn reconnect(&mut self) {
         for attempt in 1..=2 {
             ws_debug!("[websocket] attempting reconnect (attempt {attempt}/2)...");
-            match std::panic::catch_unwind({
-                let host_list = self.host_list.clone();
-                move || connect(host_list)
-            }) {
+            match connect(self.host_list.clone()) {
                 Ok(new_ws) => {
                     self.ws = new_ws;
                     ws_debug!(
@@ -110,8 +113,8 @@ impl BiliLiveClient {
                     self.send_auth();
                     return;
                 }
-                Err(_) => {
-                    ws_debug!("[websocket] reconnect attempt {attempt} failed");
+                Err(e) => {
+                    ws_debug!("[websocket] reconnect attempt {attempt} failed: {e}");
                 }
             }
         }
@@ -121,6 +124,13 @@ impl BiliLiveClient {
     // Parse one frame and collect all messages into pending queue
     pub fn parse_ws_message(&mut self, resv: Vec<u8>) -> Option<BiliMessage> {
         ws_debug!("[websocket] parse_ws_message: total_len={}", resv.len());
+        // 防御性长度校验：帧头固定 16 字节。
+        // 服务端可能下发截断帧；ver==3（brotli 压缩）分支解压后还会**递归**调用本函数，
+        // 解压结果同样可能短于 16 字节。此前直接 `&resv[0..16]`，越界即 panic。
+        if resv.len() < 16 {
+            ws_debug!("[websocket] frame too short ({} < 16), ignoring", resv.len());
+            return None;
+        }
         let mut offset = 0;
         let header = &resv[0..16];
         let mut head_1 = get_msg_header(header);
@@ -165,11 +175,13 @@ impl BiliLiveClient {
                 head_1 = get_msg_header(temp_head);
             }
         } else if head_1.operation == 3 {
-            let mut body: [u8; 4] = [0, 0, 0, 0];
-            body[0] = resv[16];
-            body[1] = resv[17];
-            body[2] = resv[18];
-            body[3] = resv[19];
+            // 人气值帧 = 16 字节头 + 4 字节大端 i32 体。
+            // 长度不足时必须跳过，否则 resv[16..19] 越界 panic。
+            if resv.len() < 20 {
+                ws_debug!("[websocket] op=3 frame too short ({} < 20), ignoring", resv.len());
+                return None;
+            }
+            let body: [u8; 4] = [resv[16], resv[17], resv[18], resv[19]];
             let _popularity = i32::from_be_bytes(body);
             ws_debug!(
                 "[websocket] popularity message op=3; popularity={}",
@@ -313,7 +325,10 @@ pub fn gen_damu_list(list: &serde_json::Value) -> Vec<DanmuServer> {
 }
 
 fn find_server(vd: Vec<DanmuServer>) -> (String, String, String) {
-    let (host, wss_port) = (vd.get(0).unwrap().host.clone(), vd.get(0).unwrap().wss_port);
+    // gen_damu_list 保证至少返回一个默认服务器；这里再兜底一次，避免空列表 panic。
+    let fallback = DanmuServer::default();
+    let server = vd.first().unwrap_or(&fallback);
+    let (host, wss_port) = (server.host.clone(), server.wss_port);
     ws_debug!(
         "[websocket] choose server host={} wss_port={}",
         host,
@@ -326,25 +341,30 @@ fn find_server(vd: Vec<DanmuServer>) -> (String, String, String) {
     )
 }
 
-pub fn connect(v: Value) -> WebSocket<TlsStream<TcpStream>> {
+pub fn connect(v: Value) -> Result<WebSocket<TlsStream<TcpStream>>, String> {
     let danmu_server = gen_damu_list(&v);
     let (host, url, ws_url) = find_server(danmu_server);
     ws_debug!("[websocket] connecting tcp {} and ws {}", url, ws_url);
-    let connector: native_tls::TlsConnector = native_tls::TlsConnector::new().unwrap();
+    let connector: native_tls::TlsConnector =
+        native_tls::TlsConnector::new().map_err(|e| format!("创建 TLS 连接器失败：{e}"))?;
     // connect_timeout：无超时的 TcpStream::connect 在网络异常时会阻塞 ~20s（OS SYN 超时），
     // 停止信号在此期间完全无法被处理；5s 超时保证关闭播放器时弹幕线程能及时退出
     let addr = url
         .to_socket_addrs()
-        .and_then(|mut it| it.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr")))
-        .map_err(|e| format!("resolve {} failed: {}", url, e))
-        .unwrap();
-    let stream: TcpStream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
-    let stream: native_tls::TlsStream<TcpStream> =
-        connector.connect(host.as_str(), stream).unwrap();
-    let (socket, _resp) =
-        client(Url::parse(ws_url.as_str()).unwrap(), stream).expect("Can't connect");
+        .and_then(|mut it| {
+            it.next()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr"))
+        })
+        .map_err(|e| format!("解析弹幕服务器地址 {url} 失败：{e}"))?;
+    let stream: TcpStream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("连接弹幕服务器 {url} 失败：{e}"))?;
+    let stream: native_tls::TlsStream<TcpStream> = connector
+        .connect(host.as_str(), stream)
+        .map_err(|e| format!("TLS 握手失败（{host}）：{e}"))?;
+    let parsed = Url::parse(ws_url.as_str()).map_err(|e| format!("弹幕地址非法：{e}"))?;
+    let (socket, _resp) = client(parsed, stream).map_err(|e| format!("WebSocket 握手失败：{e}"))?;
     ws_debug!("[websocket] websocket handshake complete");
-    socket
+    Ok(socket)
 }
 
 pub enum Operation {
@@ -353,10 +373,13 @@ pub enum Operation {
 }
 
 pub fn make_packet(body: &str, ops: Operation) -> Vec<u8> {
-    let json: Value = serde_json::from_str(body).unwrap();
+    // body 由内部构造（紧凑 JSON），解析失败时退化为 null 而不是 panic。
+    let json: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let temp = json.to_string();
     let body_content: &[u8] = temp.as_bytes();
-    let pack_len: [u8; 4] = ((16 + body.len()) as u32).to_be_bytes();
+    // 包长必须与实际发送的 body 字节数一致：原实现用入参 body.len()，
+    // 一旦入参含多余空白就会导致声明长度与实际不符。
+    let pack_len: [u8; 4] = ((16 + temp.len()) as u32).to_be_bytes();
     let raw_header_size: [u8; 2] = (16 as u16).to_be_bytes();
     let ver: [u8; 2] = (1 as u16).to_be_bytes();
     let operation: [u8; 4] = match ops {

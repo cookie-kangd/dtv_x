@@ -80,25 +80,24 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const update = useCallback((patch: Partial<AppSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      saveJson(SETTINGS_STORAGE_KEY, next);
-      // 「退出时清理缓存」需要在应用退出时由 Rust 侧执行，
-      // 该开关只存在前端 localStorage，这里把最新值同步给 Rust（失败静默）。
-      if (patch.clearCacheOnExit !== undefined) {
-        invoke("set_exit_cleanup_enabled", { enabled: !!patch.clearCacheOnExit }).catch(() => {});
-      }
-      return next;
-    });
+    // 更新函数必须是纯函数：React StrictMode 会双次调用它（生产环境亦应纯），
+    // 原先在其中直接 saveJson / invoke 会造成重复写盘与重复 IPC。
+    setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
-  // 启动时把持久化的「退出时清理缓存」同步给 Rust（默认开）
+  // 持久化：settings 任一字段变化即写盘。放在 effect 里、依赖真实状态，
+  // 既保证纯函数语义，也天然做到「值没变就不写」。
+  useEffect(() => {
+    if (!hydrated) return;
+    saveJson(SETTINGS_STORAGE_KEY, settings);
+  }, [hydrated, settings]);
+
+  // 把「退出时清理缓存」同步给 Rust（清理动作在应用退出时由 Rust 执行，
+  // 该开关本身只存在前端 localStorage）。完成水合时同步一次，之后仅当该开关变化才发 IPC。
   useEffect(() => {
     if (!hydrated) return;
     invoke("set_exit_cleanup_enabled", { enabled: !!settings.clearCacheOnExit }).catch(() => {});
-    // 仅在完成水合后同步一次
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated]);
+  }, [hydrated, settings.clearCacheOnExit]);
 
   const value = useMemo<SettingsContextValue>(() => ({ settings, hydrated, update }), [settings, hydrated, update]);
 

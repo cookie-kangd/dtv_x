@@ -19,6 +19,8 @@ export function useHuyaLiveRooms(gid: string | null, options: UseHuyaLiveRoomsOp
   const pageSize = options.defaultPageSize ?? 120;
   const lastInitialKeyRef = useRef<string | null>(null);
   const inflightRef = useRef<Map<string, Promise<void>>>(new Map());
+  // 请求序号：用于丢弃「过期响应」（切换分类时旧分类的响应可能晚于新分类到达）
+  const requestSeqRef = useRef(0);
 
   const { proxify, ensureProxyStarted } = useImageProxy();
 
@@ -63,6 +65,10 @@ export function useHuyaLiveRooms(gid: string | null, options: UseHuyaLiveRoomsOp
       if (existing) return existing;
 
       const task = (async () => {
+        // 竞态防护：响应回来时若请求序号已变（切换分类 / 组件卸载），丢弃过期响应，
+        // 否则旧分类的结果会覆盖或混入新分类的列表。
+        const seq = ++requestSeqRef.current;
+
         if (loadMore) setIsLoadingMore(true);
         else setIsLoading(true);
         setError(null);
@@ -77,11 +83,13 @@ export function useHuyaLiveRooms(gid: string | null, options: UseHuyaLiveRoomsOp
           });
 
           if (resp.error !== 0 || !Array.isArray(resp.data)) throw new Error(resp.msg || "虎牙接口返回错误");
+          if (seq !== requestSeqRef.current) return; // 过期响应，丢弃
           const newRooms = resp.data.map(mapHuyaItemToCommonStreamer);
           setRooms((prev) => (loadMore ? [...prev, ...newRooms] : newRooms));
           setHasMore(newRooms.length === pageSize);
           setCurrentPage(pageNo + 1);
         } catch (e: any) {
+          if (seq !== requestSeqRef.current) return; // 过期响应，丢弃
           console.error("[useHuyaLiveRooms] invoke error", e);
           setError(e?.message || "加载失败");
           if (!loadMore) {
@@ -89,8 +97,11 @@ export function useHuyaLiveRooms(gid: string | null, options: UseHuyaLiveRoomsOp
             setHasMore(false);
           }
         } finally {
-          if (loadMore) setIsLoadingMore(false);
-          else setIsLoading(false);
+          // 只有当前有效请求才允许关闭 loading，避免过期请求把新请求的 loading 状态关掉
+          if (seq === requestSeqRef.current) {
+            if (loadMore) setIsLoadingMore(false);
+            else setIsLoading(false);
+          }
         }
       })();
 
@@ -130,6 +141,13 @@ export function useHuyaLiveRooms(gid: string | null, options: UseHuyaLiveRoomsOp
     lastInitialKeyRef.current = key;
     void loadInitialRooms();
   }, [canFetch, gid, loadInitialRooms, pageSize]);
+
+  // 卸载后作废所有在途请求，避免组件已卸载仍写入状态
+  useEffect(() => {
+    return () => {
+      requestSeqRef.current += 1;
+    };
+  }, []);
 
   return { rooms, isLoading, isLoadingMore, error, hasMore, loadInitialRooms, loadMoreRooms };
 }

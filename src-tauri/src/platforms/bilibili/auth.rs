@@ -1,6 +1,6 @@
 // src/auth.rs
 use md5::{Digest, Md5};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 #[allow(unused_imports)]
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -56,10 +56,12 @@ fn get_url_encoded(s: &str) -> String {
 }
 
 fn encode_wbi(params: Vec<(&str, String)>, (img_key, sub_key): (String, String)) -> String {
-    let cur_time = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(t) => t.as_secs(),
-        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
-    };
+    // 系统时间早于 UNIX EPOCH 属于极端异常（时钟被改写），用 0 兜底即可，
+    // 不能 panic：这里位于弹幕线程的取流路径上，panic 会导致线程反复重启。
+    let cur_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|t| t.as_secs())
+        .unwrap_or(0);
     _encode_wbi(params, (img_key, sub_key), cur_time)
 }
 
@@ -83,23 +85,30 @@ fn _encode_wbi(
     query + &format!("&w_rid={}", web_sign)
 }
 
-fn get_wbi_keys(headers: HeaderMap) -> Result<(String, String), reqwest::Error> {
+fn get_wbi_keys(headers: HeaderMap) -> Result<(String, String), String> {
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .no_proxy()
         .build()
-        .unwrap();
+        .map_err(|e| format!("创建 WBI 请求客户端失败：{e}"))?;
 
     let mut request_headers = headers;
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
+    request_headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
 
-    let response = client.get(UID_INIT_URL).headers(request_headers).send()?;
+    let response = client
+        .get(UID_INIT_URL)
+        .headers(request_headers)
+        .send()
+        .map_err(|e| format!("请求 WBI 密钥失败：{e}"))?;
 
-    let res_wbi: ResWbi = response.json()?;
-    Ok((
-        take_filename(res_wbi.data.wbi_img.img_url).unwrap(),
-        take_filename(res_wbi.data.wbi_img.sub_url).unwrap(),
-    ))
+    let res_wbi: ResWbi = response
+        .json()
+        .map_err(|e| format!("解析 WBI 密钥响应失败：{e}"))?;
+    let img = take_filename(res_wbi.data.wbi_img.img_url)
+        .ok_or_else(|| "WBI img_url 格式异常".to_string())?;
+    let sub = take_filename(res_wbi.data.wbi_img.sub_url)
+        .ok_or_else(|| "WBI sub_url 格式异常".to_string())?;
+    Ok((img, sub))
 }
 
 fn take_filename(url: String) -> Option<String> {
@@ -116,14 +125,22 @@ pub const USER_AGENT: &str =
 
 /// Get UID using cookie (optional). If request fails or no cookie, returns (status, body).
 pub fn init_uid(headers: HeaderMap) -> (reqwest::StatusCode, String) {
-    let client = reqwest::blocking::Client::builder()
+    let client = match reqwest::blocking::Client::builder()
         .https_only(true)
         .no_proxy()
         .build()
-        .unwrap();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{{\"error\":\"{}\"}}", e),
+            )
+        }
+    };
 
     let mut request_headers = headers;
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
+    request_headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
 
     let response = client.get(UID_INIT_URL).headers(request_headers).send();
     let stat: reqwest::StatusCode;
@@ -145,22 +162,24 @@ pub fn init_uid(headers: HeaderMap) -> (reqwest::StatusCode, String) {
     (stat, body)
 }
 
-/// Query danmaku server host list and token via signed URL, with given headers
-pub fn init_host_server(headers: HeaderMap, room_id: u64) -> (reqwest::StatusCode, String) {
+/// Query danmaku server host list and token via signed URL, with given headers.
+/// 返回 Err 表示无法拿到弹幕服务器配置（网络异常 / 风控 / WBI 签名失败）。
+pub fn init_host_server(headers: HeaderMap, room_id: u64) -> Result<(reqwest::StatusCode, String), String> {
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .no_proxy()
         .build()
-        .unwrap();
+        .map_err(|e| format!("创建弹幕服务器请求客户端失败：{e}"))?;
 
     let mut request_headers = headers.clone();
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
+    request_headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
 
+    // 原实现在此 panic：网络抖动时会让整条弹幕线程崩溃并被反复重启。改为向上传播错误。
     let wbi_keys = match get_wbi_keys(request_headers.clone()) {
         Ok(keys) => keys,
         Err(e) => {
-            log::error!("Failed to get WBI keys: {:?}", e);
-            panic!("Failed to get WBI keys");
+            log::error!("Failed to get WBI keys: {}", e);
+            return Err(format!("获取 WBI 密钥失败：{e}"));
         }
     };
 
@@ -187,24 +206,26 @@ pub fn init_host_server(headers: HeaderMap, room_id: u64) -> (reqwest::StatusCod
             body = String::new();
         }
     }
-    (stat, body)
+    Ok((stat, body))
 }
 
 use super::models::AuthMessage;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Initialize server info and auth message using cookie
-pub fn init_server_with_cookie(cookies: &str, room_id: &str) -> (Value, AuthMessage) {
+/// Initialize server info and auth message using cookie.
+///
+/// 所有失败路径都返回 Err 而不是 panic：调用方位于弹幕后台线程，
+/// panic 会被 catch_unwind 捕获并无限退避重试，造成长期空转与日志刷屏。
+pub fn init_server_with_cookie(cookies: &str, room_id: &str) -> Result<(Value, AuthMessage), String> {
     let mut auth_map = HashMap::new();
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::COOKIE,
-        reqwest::header::HeaderValue::from_str(cookies).unwrap(),
-    );
+    let cookie_value =
+        HeaderValue::from_str(cookies).map_err(|e| format!("Cookie 含非法字符：{e}"))?;
+    headers.insert(reqwest::header::COOKIE, cookie_value);
     headers.insert(
         reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(USER_AGENT),
+        HeaderValue::from_static(USER_AGENT),
     );
 
     // Try get uid via cookie (optional)
@@ -218,36 +239,46 @@ pub fn init_server_with_cookie(cookies: &str, room_id: &str) -> (Value, AuthMess
 
     auth_map.insert("room_id".to_string(), room_id.to_string());
 
-    let room_id_num = room_id.parse::<u64>().expect("room_id must be a valid u64");
-    let (_, body4) = init_host_server(headers.clone(), room_id_num);
-    let body4_res: Value = serde_json::from_str(body4.as_str()).unwrap();
+    let room_id_num = room_id
+        .parse::<u64>()
+        .map_err(|_| format!("B站房间号非法（需要纯数字）：{room_id}"))?;
+    let (_, body4) = init_host_server(headers.clone(), room_id_num)?;
+    let body4_res: Value =
+        serde_json::from_str(body4.as_str()).map_err(|e| format!("解析弹幕服务器响应失败：{e}"))?;
     let server_info = &body4_res["data"];
-    let token = &body4_res["data"]["token"].as_str().unwrap();
+    let token = body4_res["data"]["token"]
+        .as_str()
+        .ok_or_else(|| format!("弹幕服务器未返回 token（可能被风控）：{body4_res}"))?;
     auth_map.insert("token".to_string(), token.to_string());
 
     let auth_msg = AuthMessage::from(&auth_map);
-    (server_info.clone(), auth_msg)
+    Ok((server_info.clone(), auth_msg))
 }
 
 /// Initialize server info and auth message without cookie (uid=0)
-pub fn init_server_no_cookie(room_id: &str) -> (Value, AuthMessage) {
+pub fn init_server_no_cookie(room_id: &str) -> Result<(Value, AuthMessage), String> {
     let mut auth_map = HashMap::new();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(USER_AGENT),
+        HeaderValue::from_static(USER_AGENT),
     );
 
     auth_map.insert("uid".to_string(), "0".to_string());
     auth_map.insert("room_id".to_string(), room_id.to_string());
 
-    let room_id_num = room_id.parse::<u64>().expect("room_id must be a valid u64");
-    let (_, body4) = init_host_server(headers.clone(), room_id_num);
-    let body4_res: Value = serde_json::from_str(body4.as_str()).unwrap();
+    let room_id_num = room_id
+        .parse::<u64>()
+        .map_err(|_| format!("B站房间号非法（需要纯数字）：{room_id}"))?;
+    let (_, body4) = init_host_server(headers.clone(), room_id_num)?;
+    let body4_res: Value =
+        serde_json::from_str(body4.as_str()).map_err(|e| format!("解析弹幕服务器响应失败：{e}"))?;
     let server_info = &body4_res["data"];
-    let token = &body4_res["data"]["token"].as_str().unwrap();
+    let token = body4_res["data"]["token"]
+        .as_str()
+        .ok_or_else(|| format!("弹幕服务器未返回 token（可能被风控）：{body4_res}"))?;
     auth_map.insert("token".to_string(), token.to_string());
 
     let auth_msg = AuthMessage::from(&auth_map);
-    (server_info.clone(), auth_msg)
+    Ok((server_info.clone(), auth_msg))
 }

@@ -446,6 +446,35 @@ export function FollowsList() {
   const [dragUi, setDragUi] = useState<{ isDragging: boolean; dragOverFolderId: string | null; draggedItemType: "folder" | "streamer" | null }>({ isDragging: false, dragOverFolderId: null, draggedItemType: null });
   const didDragRef = useRef(false);
 
+  // 拖拽期间挂在 document 上的全局监听器引用。
+  // 必须显式记录：handleDragMove / handleDragUp / handlePrepMove / handlePrepUp 都是**函数声明**，
+  // 每次渲染都是新引用；而 resetDragUi / cancelPendingDrag 是 useCallback([])，闭包锁在首次渲染的实例上。
+  // 于是「注册用本次渲染的新引用、注销用首次渲染的旧引用」，引用不相等 → 监听器永远删不掉，
+  // 每次拖拽都往 document 上叠一对 mousemove/mouseup（内存泄漏 + 重复触发）。
+  // 统一从 ref 取同一个引用做 add/remove 即可根治。
+  const dragListenersRef = useRef<{
+    dragMove?: ((e: MouseEvent) => void) | null;
+    dragUp?: ((e: MouseEvent) => void) | null;
+    prepMove?: ((e: MouseEvent) => void) | null;
+    prepUp?: (() => void) | null;
+  }>({});
+
+  // 卸载兜底：若拖拽/预备拖拽尚未结束就卸载组件，必须把监听器与待触发定时器摘干净，
+  // 否则会残留在 document 上（切到播放页后仍在监听，属真实泄漏）。
+  useEffect(() => {
+    return () => {
+      const { dragMove, dragUp, prepMove, prepUp } = dragListenersRef.current;
+      if (dragMove) document.removeEventListener("mousemove", dragMove as any);
+      if (dragUp) document.removeEventListener("mouseup", dragUp as any);
+      if (prepMove) document.removeEventListener("mousemove", prepMove as any);
+      if (prepUp) document.removeEventListener("mouseup", prepUp as any);
+      dragListenersRef.current = {};
+      const p = pendingDragRef.current;
+      if (p.timer !== null) window.clearTimeout(p.timer);
+      document.body.style.userSelect = "";
+    };
+  }, []);
+
   const resetDragUi = useCallback(() => {
     dragRef.current = {
       isDragging: false,
@@ -460,17 +489,26 @@ export function FollowsList() {
     };
     setDragUi({ isDragging: false, dragOverFolderId: null, draggedItemType: null });
     document.body.style.userSelect = "";
-    document.removeEventListener("mousemove", handleDragMove as any);
-    document.removeEventListener("mouseup", handleDragUp as any);
+    const { dragMove, dragUp } = dragListenersRef.current;
+    if (dragMove) document.removeEventListener("mousemove", dragMove as any);
+    if (dragUp) document.removeEventListener("mouseup", dragUp as any);
+    dragListenersRef.current.dragMove = null;
+    dragListenersRef.current.dragUp = null;
   }, []);
 
   const cancelPendingDrag = useCallback(() => {
+    // 先无条件注销监听器（引用一致才删得掉），再处理 pending 状态。
+    // 不能放在 `if (!p.active) return` 之后：否则 active 为 false 时残留的监听器永远得不到清理。
+    const { prepMove, prepUp } = dragListenersRef.current;
+    if (prepMove) document.removeEventListener("mousemove", prepMove as any);
+    if (prepUp) document.removeEventListener("mouseup", prepUp as any);
+    dragListenersRef.current.prepMove = null;
+    dragListenersRef.current.prepUp = null;
+
     const p = pendingDragRef.current;
     if (!p.active) return;
     if (p.timer !== null) window.clearTimeout(p.timer);
     pendingDragRef.current = { active: false, timer: null, startX: 0, startY: 0, payload: null };
-    document.removeEventListener("mousemove", handlePrepMove as any);
-    document.removeEventListener("mouseup", handlePrepUp as any);
   }, []);
 
   // handlers need hoisting for reset/cancel above
@@ -494,8 +532,13 @@ export function FollowsList() {
 
     document.body.style.userSelect = "none";
     setDragUi({ isDragging: true, dragOverFolderId: null, draggedItemType: payload.type });
-    document.addEventListener("mousemove", handleDragMove as any);
-    document.addEventListener("mouseup", handleDragUp as any);
+    // 记录实例并注册，保证 resetDragUi 能用同一引用注销
+    const move = handleDragMove as any;
+    const up = handleDragUp as any;
+    dragListenersRef.current.dragMove = move;
+    dragListenersRef.current.dragUp = up;
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
   }
 
   function handlePrepMove(e: MouseEvent) {
@@ -528,8 +571,12 @@ export function FollowsList() {
         didDragRef.current = true;
       }, DRAG_PREP_DELAY_MS);
 
-      document.addEventListener("mousemove", handlePrepMove as any);
-      document.addEventListener("mouseup", handlePrepUp as any);
+      const prepMove = handlePrepMove as any;
+      const prepUp = handlePrepUp as any;
+      dragListenersRef.current.prepMove = prepMove;
+      dragListenersRef.current.prepUp = prepUp;
+      document.addEventListener("mousemove", prepMove);
+      document.addEventListener("mouseup", prepUp);
     },
     [cancelPendingDrag, folderMenu.open, folderNameModal.open, resetDragUi, follow]
   );

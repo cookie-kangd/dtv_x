@@ -48,7 +48,9 @@ pub async fn search_huya_anchors(
             ("typ", "-5"),
             ("livestate", "0"),
             ("rows", "20"),
-            ("start", &((page_num - 1) * 20).to_string()),
+            // 防御 page=0 的无符号下溢：usize 下溢在 debug 构建会 panic，
+            // release 构建则回绕成极大值（返回错误结果）。
+            ("start", &(page_num.saturating_sub(1) * 20).to_string()),
         ])
         .send()
         .await

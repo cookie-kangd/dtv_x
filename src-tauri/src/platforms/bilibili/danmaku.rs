@@ -42,9 +42,13 @@ pub async fn start_bilibili_danmaku_listener(
 
     // Spawn std thread to run sync BiliLiveClient loop
     std::thread::spawn(move || {
-        // 兜底：B站初始化/连接路径存在 unwrap/panic（网络异常、风控响应等），
-        // 在线程内 catch_unwind 捕获后指数退避重试，避免弹幕线程静默死亡且无提示。
+        // B站初始化/连接路径已改为返回 Result（不再 panic），这里按失败次数做指数退避重试。
+        // 连续失败超过阈值后降为低频重试（而非原来的无限快速重试），避免房间号非法 /
+        // 持续被风控时线程长期空转、日志刷屏；同时保留低频重试，网络恢复后能自动连回。
+        const FAST_RETRY_LIMIT: u32 = 5;
+        const SLOW_RETRY_MS: u64 = 60_000;
         let mut backoff_ms: u64 = 1000;
+        let mut failures: u32 = 0;
         loop {
             if stop_flag_for_thread.load(Ordering::Relaxed) {
                 break;
@@ -53,10 +57,11 @@ pub async fn start_bilibili_danmaku_listener(
             let room_for_run = room_id_clone.clone();
             let cookie_for_run = cookie_clone.clone();
             let stop_for_run = stop_flag_for_thread.clone();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            // 保留一层 catch_unwind 作为最后兜底，正常失败路径已不再依赖它。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || -> Result<(), String> {
                 let mut client = match cookie_for_run.as_ref() {
-                    Some(c) => BiliLiveClient::new_with_cookie(c.as_str(), room_for_run.as_str()),
-                    None => BiliLiveClient::new_without_cookie(room_for_run.as_str()),
+                    Some(c) => BiliLiveClient::new_with_cookie(c.as_str(), room_for_run.as_str())?,
+                    None => BiliLiveClient::new_without_cookie(room_for_run.as_str())?,
                 };
                 client.send_auth();
 
@@ -101,16 +106,47 @@ pub async fn start_bilibili_danmaku_listener(
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
+                Ok(())
             }));
-            match result {
-                Ok(()) => break, // 正常退出（收到停止信号）
-                Err(_) => {
-                    eprintln!(
-                        "[Bili Danmaku {}] listener panicked, retrying in {}ms.",
-                        room_id_clone, backoff_ms
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                    backoff_ms = (backoff_ms * 2).min(30_000);
+            let err: Option<String> = match result {
+                Ok(Ok(())) => None, // 正常退出（收到停止信号）
+                Ok(Err(e)) => Some(e),
+                Err(_) => Some("弹幕线程内部 panic".to_string()),
+            };
+            match err {
+                None => break,
+                Some(e) => {
+                    failures += 1;
+                    let delay = if failures <= FAST_RETRY_LIMIT {
+                        let d = backoff_ms;
+                        backoff_ms = (backoff_ms * 2).min(30_000);
+                        d
+                    } else {
+                        SLOW_RETRY_MS
+                    };
+                    // 日志降频：前几次每次都打，之后每 10 次打一次，避免刷屏
+                    if failures <= FAST_RETRY_LIMIT || failures % 10 == 0 {
+                        eprintln!(
+                            "[Bili Danmaku {}] 连接失败（第 {} 次），{}ms 后重试：{}",
+                            room_id_clone, failures, delay, e
+                        );
+                    }
+                    // 可中断等待：分段 sleep，保证关闭播放器 / 切换房间时线程能立即退出
+                    //（原实现一次性 sleep 最长 30s，期间停止信号完全无法被处理）
+                    let mut remaining = delay;
+                    let mut interrupted = false;
+                    while remaining > 0 {
+                        if stop_flag_for_thread.load(Ordering::Relaxed) {
+                            interrupted = true;
+                            break;
+                        }
+                        let step = remaining.min(500);
+                        std::thread::sleep(std::time::Duration::from_millis(step));
+                        remaining -= step;
+                    }
+                    if interrupted {
+                        break;
+                    }
                 }
             }
         }

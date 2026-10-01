@@ -28,9 +28,8 @@ import {
 import { arrangeControlClusters } from "@/components/player/controlLayout";
 import { Platform } from "@/platforms/common/types";
 import { getDouyuStreamConfig, stopDouyuProxy } from "@/platforms/douyu/playerHelper";
-import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
+import { getHuyaStreamConfig, stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
-import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
 import { getTwitchStreamConfig } from "@/platforms/twitch/playerHelper";
 import { useImageProxy } from "@/hooks/useImageProxy";
@@ -45,6 +44,19 @@ declare global {
 }
 
 const qualityOptions = ["原画", "高清", "标清"] as const;
+
+// ===== 直播自动重连策略 =====
+// 分两层：
+//   1) 播放器内核自愈（flv.disconnectRetryCount / hls.retryCount）——负责秒级短抖动，用户无感知；
+//   2) 应用层重连（本组常量）——内核放弃后接管。必须「重新获取流地址」而不是重试旧 URL，
+//      因为斗鱼/虎牙/B站的播放地址带时效 token，断线几十秒后旧地址基本已失效。
+const RECONNECT_MAX_ATTEMPTS = 6;
+const RECONNECT_BASE_DELAY_MS = 1000; // 退避基数：1s,2s,4s,8s,16s,20s(封顶)
+const RECONNECT_MAX_DELAY_MS = 20000;
+// 卡死看门狗：直播中 currentTime 长时间不推进，判定为「假死」
+// （内核没抛 error、但画面停住——弱网/丢包时很常见，必须靠主动检测兜底）
+const STALL_CHECK_INTERVAL_MS = 3000;
+const STALL_STUCK_MS = 12000;
 
 const PLAYER_DRAG_EXCLUDED_SELECTOR = [
   // App chrome / topbar (主播信息栏 & 关闭/关注按钮等)
@@ -252,12 +264,38 @@ export function MainPlayer({
   const [streamError, setStreamError] = useState<string | null>(null);
   const [isOfflineError, setIsOfflineError] = useState(false);
   const [isFullScreen, setIsFullScreen] = useState(false);
+  const [reconnectNotice, setReconnectNotice] = useState<string | null>(null);
+
+  // ===== 自动重连运行时状态（全部用 ref，避免定时器闭包读到陈旧值）=====
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimerRef = useRef<number | null>(null);
+  // 一旦确认「主播未开播 / 房间不存在」就置位，阻断自动重连（否则会对着下播的房间空转）；
+  // 成功播放或用户手动重载时解除。注意：网络中断**不**置位，必须继续重连。
+  const reconnectBlockedRef = useRef(false);
+  const stallWatchdogRef = useRef<number | null>(null);
+  const lastProgressRef = useRef<{ time: number; at: number }>({ time: -1, at: 0 });
+  // 看门狗需要读取最新业务状态，用一个 ref 镜像，避免把它塞进 effect 依赖导致定时器反复重建
+  const watchdogCtxRef = useRef<{ loading: boolean; offline: boolean; hasError: boolean; live: boolean | null }>({
+    loading: false,
+    offline: false,
+    hasError: false,
+    live: null
+  });
 
   const [playerTitle, setPlayerTitle] = useState<string | null>(null);
   const [playerAnchorName, setPlayerAnchorName] = useState<string | null>(null);
   const [playerAvatar, setPlayerAvatar] = useState<string | null>(null);
   const [playerIsLive, setPlayerIsLive] = useState<boolean | null>(null);
   const [isWindows, setIsWindows] = useState(false);
+
+  // 把最新播放状态镜像给卡死看门狗：看门狗跑在定时器里、不在渲染周期内，读不到最新 state。
+  // 这里赋值是幂等的、不触发渲染，StrictMode 双渲染也安全。
+  watchdogCtxRef.current = {
+    loading: isLoadingStream,
+    offline: isOfflineError,
+    hasError: !!streamError,
+    live: playerIsLive
+  };
   const [isMaximized, setIsMaximized] = useState(false);
 
   const lineOptions: LineOption[] = useMemo(() => lineOptionsByPlatform[platform] ?? [], [platform]);
@@ -567,18 +605,129 @@ export function MainPlayer({
     | null
     | ((
         trigger: "refresh" | "quality" | "line",
-        overrides?: { quality?: string; line?: string | null }
+        overrides?: { quality?: string; line?: string | null },
+        opts?: { isAutoReconnect?: boolean }
       ) => Promise<void>)
   >(null);
   const qualityReloadArmedRef = useRef(false);
   const reloadInFlightRef = useRef(false);
-  const pendingReloadRef = useRef<null | { trigger: "refresh" | "quality" | "line"; overrides?: { quality?: string; line?: string | null } }>(
-    null
-  );
+  const pendingReloadRef = useRef<null | {
+    trigger: "refresh" | "quality" | "line";
+    overrides?: { quality?: string; line?: string | null };
+    opts?: { isAutoReconnect?: boolean };
+  }>(null);
 
   const isSessionActive = useCallback((sessionId: number) => {
     return !disposedRef.current && activeSessionIdRef.current === sessionId;
   }, []);
+
+  // ===== 直播自动重连（应用层）=====
+  // 分工：播放器内核负责秒级抖动自愈（flv.disconnectRetryCount / hls.retryCount），
+  // 内核放弃后、或画面「假死」，由这里接管：指数退避 + 重新取流。
+
+  const clearReconnectTimers = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (stallWatchdogRef.current !== null) {
+      window.clearInterval(stallWatchdogRef.current);
+      stallWatchdogRef.current = null;
+    }
+    lastProgressRef.current = { time: -1, at: 0 };
+  }, []);
+
+  /** 画面真正恢复播放后调用：重置退避计数、解除阻断、清掉重连提示。 */
+  const markReconnectHealthy = useCallback(() => {
+    reconnectAttemptRef.current = 0;
+    reconnectBlockedRef.current = false;
+    setReconnectNotice(null);
+  }, []);
+
+  /**
+   * 触发一次自动重连（指数退避 1s→2s→4s→8s→16s→20s）。
+   * 关键：重连走 reloadStream("refresh") 重新取流，而不是重试旧 URL——
+   * 斗鱼/虎牙/B站的播放地址都带时效 token，断线几十秒后旧地址通常已经失效，
+   * 单纯重试旧地址正是「内核重试耗尽后就再也连不上」的另一半原因。
+   */
+  const scheduleReconnect = useCallback((reason: string) => {
+    if (disposedRef.current) return;
+    // 已确认「主播未开播 / 房间不存在」→ 不再对着下播的房间空转重连。
+    // 注意这里刻意不用 isOfflineError：取流失败（可能是网络问题）也会把它置 true，
+    // 若用它做闸门，网络一断就再也连不回来了。
+    if (reconnectBlockedRef.current) return;
+    if (reconnectTimerRef.current !== null) return; // 已有待执行的重连，避免叠加
+    if (reloadInFlightRef.current) return; // 正在取流，等它结束再说
+
+    const attempt = reconnectAttemptRef.current;
+    if (attempt >= RECONNECT_MAX_ATTEMPTS) {
+      setReconnectNotice(null);
+      setStreamError(
+        `网络连接中断，已自动重连 ${RECONNECT_MAX_ATTEMPTS} 次仍未成功。\n请检查网络连接后点击「再试一次」。`
+      );
+      return;
+    }
+
+    reconnectAttemptRef.current = attempt + 1;
+    const seq = attempt + 1;
+    const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
+    console.info(`[Player] 连接中断（${reason}），${delay}ms 后进行第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次自动重连`);
+    setReconnectNotice(
+      delay >= 1000
+        ? `连接中断，${Math.round(delay / 1000)} 秒后自动重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`
+        : `连接中断，正在自动重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`
+    );
+
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (disposedRef.current) return;
+      setReconnectNotice(`正在重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`);
+      void reloadStreamRef.current?.("refresh", undefined, { isAutoReconnect: true });
+    }, delay);
+  }, []);
+
+  /**
+   * 卡死看门狗：每 3 秒检查 currentTime 是否推进。
+   * 兜住「播放器没抛 error、但画面其实停住了」的假死场景——弱网丢包时很常见，
+   * 只监听 error 事件会漏掉这一类。
+   */
+  const startStallWatchdog = useCallback(() => {
+    if (stallWatchdogRef.current !== null) return;
+    lastProgressRef.current = { time: -1, at: 0 };
+    stallWatchdogRef.current = window.setInterval(() => {
+      if (disposedRef.current) return;
+      const ctx = watchdogCtxRef.current;
+      // 加载中 / 已报错 / 主播未开播：不判定，避免误伤
+      if (ctx.loading || ctx.hasError || ctx.offline) return;
+
+      let video: HTMLVideoElement | null = null;
+      try {
+        const root = playerRef.current?.root as HTMLElement | null;
+        video = (root?.querySelector("video") as HTMLVideoElement) ?? null;
+      } catch {
+        video = null;
+      }
+      // 用户主动暂停、已播完：不算卡死
+      if (!video || video.paused || video.ended) return;
+
+      const now = Date.now();
+      const prev = lastProgressRef.current;
+      if (video.currentTime !== prev.time) {
+        lastProgressRef.current = { time: video.currentTime, at: now };
+        // 画面确实在推进 = 真的在播。这里主动重置退避状态，
+        // 比只依赖播放器事件名更可靠（事件名可能随版本变化）。
+        if (reconnectAttemptRef.current > 0 || reconnectBlockedRef.current) {
+          markReconnectHealthy();
+        }
+        return;
+      }
+      const stuckSince = prev.at || now;
+      if (now - stuckSince >= STALL_STUCK_MS) {
+        lastProgressRef.current = { time: video.currentTime, at: now };
+        scheduleReconnect("画面卡住");
+      }
+    }, STALL_CHECK_INTERVAL_MS);
+  }, [markReconnectHealthy, scheduleReconnect]);
 
   useEffect(() => {
     if (platform === Platform.BILIBILI || platform === Platform.HUYA) {
@@ -634,6 +783,12 @@ export function MainPlayer({
   }, []);
 
   const destroyPlayer = useCallback(() => {
+    // 切房间/切画质/销毁时，停掉挂起的自动重连定时器与卡死看门狗，
+    // 避免旧会话的定时器在新会话里误触发一次重连。
+    // 注意：这里刻意不重置 reconnectAttemptRef —— 自动重连内部也会经过 destroyPlayer，
+    // 若在此清零，退避计数永远归零，会退化成无限重连。
+    clearReconnectTimers();
+
     try {
       unlistenRef.current?.();
     } catch {
@@ -679,7 +834,7 @@ export function MainPlayer({
     linePluginRef.current = null;
 
     setIsFullScreen(false);
-  }, []);
+  }, [clearReconnectTimers]);
 
   const stopAllDanmakuBackends = useCallback(async () => {
     // Business rule: only one room at a time. Stopping all backends is the safest way to avoid cross-platform leaks.
@@ -920,8 +1075,10 @@ export function MainPlayer({
         playerOptions.useHlsPlugin = true;
         playerOptions.hls = {
           isLive: true,
-          retryCount: 3,
-          retryDelay: 2000,
+          // 弱网容忍：默认 3 次 / 1000ms 对直播偏紧，抖一下就放弃。
+          // 提高到 5 次 / 1500ms，配合应用层自动重连形成两级兜底。
+          retryCount: 5,
+          retryDelay: 1500,
           enableWorker: true,
           withCredentials: false,
           lowLatencyMode: false,
@@ -984,7 +1141,17 @@ export function MainPlayer({
           stashInitialSize: 128,
           lazyLoad: true,
           lazyLoadMaxDuration: 30,
-          deferLoadAfterSourceOpen: true
+          deferLoadAfterSourceOpen: true,
+          // ===== 弱网 / 断流重连（关键修复）=====
+          // xgplayer-flv 的 disconnectRetryCount 默认是 0 —— 也就是「直播流一旦断开就再也不重试」，
+          // 这正是网络瞬断几十毫秒就导致直播直接中断、必须手动点刷新的根本原因。
+          // 这里给一个较大的自愈窗口：内核静默重拉，用户几乎无感（不闪加载层、不重建播放器）。
+          // 超出该窗口后，由应用层的自动重连（reloadStream + 指数退避）接手。
+          retryCount: 3, // HTTP 请求失败重试次数（默认 3，显式声明）
+          retryDelay: 1000, // 请求失败重试间隔（默认 1000ms）
+          disconnectRetryCount: 10, // ★断流重试次数（默认 0 = 不重试）
+          loadTimeout: 10000, // 请求超时（默认 10000ms）
+          maxReaderInterval: 5000 // 连续多少毫秒收不到数据判定为断流（默认 5000ms）
         };
       }
 
@@ -1020,6 +1187,33 @@ export function MainPlayer({
       } catch {
         // ignore
       }
+
+      // ===== 自动重连：错误监听 =====
+      // 内核重试耗尽后不会自己恢复，必须由应用层接手 —— 这正是「网络瞬断后直播直接中断、
+      // 只能手动点刷新」的原因（旧代码只监听了全屏/destroy 事件，完全没监听 error）。
+      try {
+        player.on?.("error", (err: any) => {
+          if (!isSessionActive(sessionId)) return;
+          const detail = (err && (err.errorType || err.type || err.errorCode || err.message)) || "unknown";
+          console.warn("[Player] 播放错误事件，准备自动重连:", err);
+          // 延后一拍再调度：若此刻恰好处于 reloadStream 的 in-flight 窗口，
+          // scheduleReconnect 的守卫会把这次调用丢掉，白白错过一次重连机会。
+          window.setTimeout(() => {
+            if (!isSessionActive(sessionId)) return;
+            scheduleReconnect(String(detail));
+          }, 0);
+        });
+        // 画面真正恢复播放 → 重置退避计数并清掉提示
+        player.on?.("playing", () => {
+          if (!isSessionActive(sessionId)) return;
+          markReconnectHealthy();
+        });
+      } catch {
+        // ignore
+      }
+
+      // 启动卡死看门狗：兜住「不抛 error、但画面停住」的假死场景
+      startStallWatchdog();
 
       refreshPluginRef.current = player.registerPlugin?.(RefreshControl, {
         position: POSITIONS.CONTROLS_LEFT,
@@ -1110,18 +1304,44 @@ export function MainPlayer({
       await startDanmaku(sessionId, overlay, platform, backendRoomId, filterRoomId);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentLine, currentQuality, danmuSettings, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku]
+    [
+      currentLine,
+      currentQuality,
+      danmuSettings,
+      isDanmuEnabled,
+      isSessionActive,
+      lineOptions,
+      platform,
+      roomId,
+      startDanmaku,
+      // 以下三个均为稳定引用（useCallback 空依赖/单依赖），加入不会造成 mountPlayer 频繁重建
+      scheduleReconnect,
+      markReconnectHealthy,
+      startStallWatchdog
+    ]
   );
 
   const reloadStream = useCallback(
-    async (_trigger: "refresh" | "quality" | "line", overrides?: { quality?: string; line?: string | null }) => {
+    async (
+      _trigger: "refresh" | "quality" | "line",
+      overrides?: { quality?: string; line?: string | null },
+      opts?: { isAutoReconnect?: boolean }
+    ) => {
       if (reloadInFlightRef.current) {
-        pendingReloadRef.current = { trigger: _trigger, overrides };
+        pendingReloadRef.current = { trigger: _trigger, overrides, opts };
         return;
       }
       reloadInFlightRef.current = true;
       const sessionId = ++sessionSeqRef.current;
       activeSessionIdRef.current = sessionId;
+
+      // 非自动重连（切房间/切画质/用户点刷新）视为「重新开始」：重置退避计数、解除阻断、清掉提示；
+      // 自动重连必须保留计数，否则永远到不了上限、会无限重试拖垮自己和服务器。
+      if (!opts?.isAutoReconnect) {
+        reconnectAttemptRef.current = 0;
+        reconnectBlockedRef.current = false;
+        setReconnectNotice(null);
+      }
 
       setIsLoadingStream(true);
       setStreamError(null);
@@ -1146,6 +1366,12 @@ export function MainPlayer({
       } catch {
         // ignore
       }
+
+      // 取流失败且判定为「网络中断」时，不能立刻调用 scheduleReconnect ——
+      // 那一刻 reloadInFlightRef 还是 true（函数开头置位、finally 才复位），
+      // 会被 scheduleReconnect 的 in-flight 守卫直接挡掉，导致重连永远不触发。
+      // 因此先记下原因，等 finally 复位后再调度。
+      let pendingReconnectReason: string | null = null;
 
       try {
         if (platform === Platform.DOUYU) {
@@ -1336,26 +1562,57 @@ export function MainPlayer({
         }
       } catch (e: any) {
         if (!isSessionActive(sessionId)) return;
-        // When the target room fails to load (e.g. offline), keep UI consistent by clearing any previous playback surface.
+        // 取流失败：先清掉上一路的播放画面/缓冲，避免残留。
         destroyPlayer();
         const msg = e?.message ? String(e.message) : String(e);
-        setStreamError(maybeAppendHevcInstallHint(msg));
-        // Per product decision: stream load failure => treat as "not live" (最多重试一次后仍失败则认为主播不在线)
-        setIsOfflineError(true);
-        setPlayerIsLive(false);
+
+        if (isOfflineMessage(msg) || reconnectBlockedRef.current) {
+          // 业务层判定：主播确实未开播 / 房间不存在。
+          // 显示「主播未开播」并**停止自动重连**，否则会对着已下播的房间反复空转。
+          reconnectBlockedRef.current = true;
+          reconnectAttemptRef.current = 0;
+          setReconnectNotice(null);
+          setStreamError(maybeAppendHevcInstallHint(msg));
+          setIsOfflineError(true);
+          setPlayerIsLive(false);
+        } else {
+          // 网络层中断：取流请求失败，但没有「未开播」特征 —— 大概率只是断网/超时。
+          // 关键：绝不能沿用旧的「取流失败一律当作主播未开播」逻辑，
+          // 那会在断网时弹出误导性的「主播未开播」，并让自动重连当场失效。
+          // 这里保持画面为「正在重连」，交由退避调度器继续尝试，网络恢复即自动续播。
+          setStreamError(null);
+          setIsOfflineError(false);
+          pendingReconnectReason = "取流失败";
+        }
       } finally {
         if (isSessionActive(sessionId)) {
           setIsLoadingStream(false);
         }
         reloadInFlightRef.current = false;
+        // 网络中断：等 in-flight 守卫复位后再调度重连
+        if (pendingReconnectReason !== null) {
+          scheduleReconnect(pendingReconnectReason);
+        }
         const pending = pendingReloadRef.current;
         pendingReloadRef.current = null;
         if (pending) {
-          void reloadStream(pending.trigger, pending.overrides);
+          void reloadStream(pending.trigger, pending.overrides, pending.opts);
         }
       }
     },
-    [currentLine, currentQuality, destroyPlayer, isSessionActive, lineOptions, mountPlayer, platform, roomId, stopAllDanmakuBackends, stopAllProxies]
+    [
+      currentLine,
+      currentQuality,
+      destroyPlayer,
+      isSessionActive,
+      lineOptions,
+      mountPlayer,
+      platform,
+      roomId,
+      stopAllDanmakuBackends,
+      stopAllProxies,
+      scheduleReconnect
+    ]
   );
 
   useEffect(() => {
@@ -1591,6 +1848,14 @@ export function MainPlayer({
 
               {isLoadingStream ? (
                 <div className="loading-player" style={{ position: "absolute", inset: 0, zIndex: 20 }}>
+                </div>
+              ) : null}
+
+              {/* 自动重连提示：只做轻量提示，不挡住画面的交互（pointer-events: none） */}
+              {reconnectNotice && !streamError ? (
+                <div className="reconnect-toast">
+                  <span className="reconnect-spinner" aria-hidden="true" />
+                  <span>{reconnectNotice}</span>
                 </div>
               ) : null}
 

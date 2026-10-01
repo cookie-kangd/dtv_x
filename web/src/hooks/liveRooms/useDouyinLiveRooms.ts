@@ -13,6 +13,8 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
   const [currentOffset, setCurrentOffset] = useState(0);
   const [hasMore, setHasMore] = useState(true);
   const msTokenRef = useRef<string | null>(null);
+  // 请求序号：用于丢弃「过期响应」（切换分类时旧分类的响应可能晚于新分类到达）
+  const requestSeqRef = useRef(0);
 
   const canFetch = useMemo(() => !!partitionId && !!partitionTypeId, [partitionId, partitionTypeId]);
 
@@ -60,6 +62,9 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
         return;
       }
 
+      // 竞态防护：响应回来时若请求序号已变（切换分类 / 组件卸载），丢弃过期响应
+      const seq = ++requestSeqRef.current;
+
       if (loadMore) setIsLoadingMore(true);
       else setIsLoading(true);
       setError(null);
@@ -77,6 +82,8 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
           msToken: msToken
         });
 
+        if (seq !== requestSeqRef.current) return; // 过期响应，丢弃
+
         if (response && Array.isArray(response.rooms)) {
           const newRooms = response.rooms.map(mapRawRoomToCommonStreamer);
           setRooms((prev) => (loadMore ? [...prev, ...newRooms] : newRooms));
@@ -89,6 +96,7 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
           setHasMore(false);
         }
       } catch (e: any) {
+        if (seq !== requestSeqRef.current) return; // 过期响应，丢弃
         logger.error("[useDouyinLiveRooms] Error fetching rooms:", e);
         // 提取更友好的错误信息
         let errorMsg = typeof e === "string" ? e : (e?.message || "Failed to fetch rooms");
@@ -104,8 +112,11 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
           setHasMore(false);
         }
       } finally {
-        if (loadMore) setIsLoadingMore(false);
-        else setIsLoading(false);
+        // 只有当前有效请求才允许关闭 loading，避免过期请求把新请求的 loading 状态关掉
+        if (seq === requestSeqRef.current) {
+          if (loadMore) setIsLoadingMore(false);
+          else setIsLoading(false);
+        }
       }
     },
     [mapRawRoomToCommonStreamer, partitionId, partitionTypeId]
@@ -145,6 +156,13 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
     void loadInitialRooms();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [partitionId, partitionTypeId, canFetch]);
+
+  // 卸载后作废所有在途请求，避免组件已卸载仍写入状态
+  useEffect(() => {
+    return () => {
+      requestSeqRef.current += 1;
+    };
+  }, []);
 
   return { rooms, isLoading, isLoadingMore, error, hasMore, loadInitialRooms, loadMoreRooms };
 }

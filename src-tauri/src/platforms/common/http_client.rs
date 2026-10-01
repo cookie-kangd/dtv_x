@@ -205,7 +205,7 @@ impl HttpClient {
         let json_response = response
             .json::<T>()
             .await
-            .map_err(|e| format!("aFailed to parse JSON response from {}: {}", url, e))?;
+            .map_err(|e| format!("Failed to parse JSON response from {}: {}", url, e))?;
         Ok(json_response)
     }
 
@@ -241,7 +241,7 @@ impl HttpClient {
         let json_response = response
             .json::<T>()
             .await
-            .map_err(|e| format!("bFailed to parse JSON response from {}: {}", url, e))?;
+            .map_err(|e| format!("Failed to parse JSON response from {}: {}", url, e))?;
         Ok(json_response)
     }
 
@@ -271,7 +271,7 @@ impl HttpClient {
         let json_response = response
             .json::<T>()
             .await
-            .map_err(|e| format!("cFailed to parse JSON response from {}: {}", url, e))?;
+            .map_err(|e| format!("Failed to parse JSON response from {}: {}", url, e))?;
         Ok(json_response)
     }
 

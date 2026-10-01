@@ -180,7 +180,8 @@ pub async fn fetch_live_list(offset: u32, cate2: String, limit: u32) -> Frontend
 
                     let frontend_data = LiveListDataWrapper {
                         list: streamers_transformed,
-                        total: douyu_data.total as u32, // API returns i32, wrapper expects u32
+                        // API 返回 i32，取负值直接 as u32 会回绕成 ~42 亿，导致前端分页错乱，先夹到 >= 0
+                        total: douyu_data.total.max(0) as u32,
                     };
                     FrontendLiveListResponse {
                         error: 0,
