@@ -7,7 +7,9 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use tauri::Manager;
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 mod logging;
 mod cache_cleaner;
@@ -17,7 +19,9 @@ mod sync_transfer;
 mod platforms;
 mod proxy;
 mod version_check;
-use platforms::common::{DouyinDanmakuState, FollowHttpClient, HuyaDanmakuState};
+use platforms::common::{
+    BilibiliDanmakuState, DouyinDanmakuState, FollowHttpClient, HuyaDanmakuState, TwitchDanmakuState,
+};
 use platforms::douyin::danmu::signature::generate_douyin_ms_token;
 use platforms::douyin::fetch_douyin_partition_rooms;
 use platforms::douyin::fetch_douyin_room_info;
@@ -173,6 +177,56 @@ fn open_in_default_browser(app: tauri::AppHandle, url: String) -> Result<(), Str
         .map_err(|e| e.to_string())
 }
 
+/// 把所有后台弹幕监听/本地代理的停止信号发出去。
+/// 进程一旦退出这些任务自然消亡，所以这一步主要是「尽快断开 WebSocket / 释放端口」，
+/// 避免退出瞬间还挂着连接、把 WebView2 的 shutdown 拖住（表现为关窗后进程残留在后台）。
+fn shutdown_background_tasks(app: &tauri::AppHandle) {
+    // 斗鱼用的是 oneshot
+    if let Some(state) = app.try_state::<DouyuDanmakuHandles>() {
+        let sender = state.0.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+    // 其余平台统一是 mpsc::Sender<()>
+    macro_rules! stop_mpsc {
+        ($t:ty) => {
+            if let Some(state) = app.try_state::<$t>() {
+                let tx = state.0.lock().ok().and_then(|mut guard| guard.take());
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(());
+                }
+            }
+        };
+    }
+    stop_mpsc!(DouyinDanmakuState);
+    stop_mpsc!(BilibiliDanmakuState);
+    stop_mpsc!(HuyaDanmakuState);
+    stop_mpsc!(TwitchDanmakuState);
+
+    // 本地代理服务（actix）：释放监听端口
+    if let Some(state) = app.try_state::<proxy::ProxyServerHandle>() {
+        let handle = state.0.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(handle) = handle {
+            handle.stop(false);
+        }
+    }
+}
+
+/// 已经决定真正退出：此时关闭窗口不再走「最小化到托盘」，必须真关。
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 真正的退出：关掉所有窗口（含 B站登录等子窗口，否则它们会拖住退出流程、
+/// 留下「关了主窗口却还剩一个画面在跑」的残留进程），再退出应用。
+fn really_quit(app: &tauri::AppHandle) {
+    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+    shutdown_background_tasks(app);
+    for (_label, window) in app.webview_windows() {
+        let _ = window.close();
+    }
+    app.exit(0);
+}
+
 // Main function corrected
 fn main() {
     logging::init();
@@ -210,19 +264,89 @@ fn main() {
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED
                 )
                 .build())
-            .setup(|_app| {
+            .setup(|app| {
                 // Apply macOS vibrancy to the main window when running on macOS
                 #[cfg(target_os = "macos")]
                 {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
-                    if let Some(window) = _app.get_webview_window("main") {
+                    if let Some(window) = app.get_webview_window("main") {
                         match apply_vibrancy(&window, NSVisualEffectMaterial::HudWindow, None, None) {
                             Ok(_) => println!("vibrancy applied successfully"),
                             Err(e) => eprintln!("vibrancy error: {:?}", e),
                         }
                     }
                 }
+
+                // ===== 系统托盘 =====
+                // 关闭主窗口时最小化到这里，而不是直接退出进程。
+                let show_item = MenuItemBuilder::with_id("show", "显示窗口").build(app)?;
+                let quit_item = MenuItemBuilder::with_id("quit", "退出 DTV_X").build(app)?;
+                let menu = MenuBuilder::new(app)
+                    .items(&[&show_item, &quit_item])
+                    .build()?;
+
+                // default_window_icon() 返回的是借用，这里复制成自有数据，避免生命周期问题
+                let tray = match app.default_window_icon() {
+                    Some(icon) => TrayIconBuilder::with_id("main").icon(
+                        tauri::image::Image::new(icon.rgba().to_vec(), icon.width(), icon.height())
+                    ),
+                    None => TrayIconBuilder::with_id("main"),
+                };
+
+                let _ = tray
+                    .tooltip("DTV_X")
+                    .menu(&menu)
+                    // 左键单击 = 直接唤出窗口；右键才弹菜单
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => really_quit(app),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    })
+                    .build(app);
+
                 Ok(())
+            })
+            .on_window_event(|window, event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    // 已决定真正退出 → 放行，让窗口真的关掉
+                    if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    if window.label() == "main" {
+                        // 关闭主窗口 = 最小化到托盘，进程继续在后台跑。
+                        // 顺手把 B站登录等子窗口一并关掉：它们如果还开着，既会留在屏幕上
+                        // （就是「关了窗口却还剩一个画面在刷」），又会拖住进程没法真正退出。
+                        for (label, child) in window.app_handle().webview_windows() {
+                            if label != "main" {
+                                let _ = child.close();
+                            }
+                        }
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                }
             })
             .manage(client) // Manage the reqwest client
             .manage(follow_http_client) // 专用关注刷新客户端，避免占用默认连接池
@@ -303,10 +427,18 @@ fn main() {
             .build(tauri::generate_context!())
             .expect("error while building tauri application")
             .run(|app_handle, event| {
-                // 应用退出时按设置清理 WebView2 缓存（登录态/设置/关注列表不受影响）
-                if let tauri::RunEvent::Exit = event {
-                    let flag = app_handle.state::<cache_cleaner::ExitCleanupFlag>();
-                    cache_cleaner::cleanup_on_exit(app_handle, flag.inner());
+                match event {
+                    // 进程即将退出：先让后台任务收手，尽快断开 WebSocket / 释放端口，
+                    // 免得退出瞬间还挂着连接把 WebView2 的关闭流程拖住
+                    tauri::RunEvent::ExitRequested { .. } => {
+                        shutdown_background_tasks(app_handle);
+                    }
+                    // 应用退出时按设置清理 WebView2 缓存（登录态/设置/关注列表不受影响）
+                    tauri::RunEvent::Exit => {
+                        let flag = app_handle.state::<cache_cleaner::ExitCleanupFlag>();
+                        cache_cleaner::cleanup_on_exit(app_handle, flag.inner());
+                    }
+                    _ => {}
                 }
             });
 }

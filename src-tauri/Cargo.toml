@@ -19,7 +19,9 @@ tauri-build = { version = "2.7.0", features = [] }
 prost-build = "0.12"
 
 [dependencies]
-tauri = { version = "2.12.0", features = ["macos-private-api"] }
+# tray-icon：系统托盘（关闭窗口最小化到托盘）；
+# image-png / image-ico：让 tauri 能解码打包图标，default_window_icon() 才有值、托盘才有图标
+tauri = { version = "2.12.0", features = ["macos-private-api", "tray-icon", "image-png", "image-ico"] }
 tauri-plugin-opener = "2.6.0"
 tauri-plugin-window-state = "2"
 window-vibrancy = "0.7.1"
