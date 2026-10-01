@@ -51,8 +51,20 @@ const qualityOptions = ["原画", "高清", "标清"] as const;
 //   2) 应用层重连（本组常量）——内核放弃后接管。必须「重新获取流地址」而不是重试旧 URL，
 //      因为斗鱼/虎牙/B站的播放地址带时效 token，断线几十秒后旧地址基本已失效。
 const RECONNECT_MAX_ATTEMPTS = 6;
-const RECONNECT_BASE_DELAY_MS = 1000; // 退避基数：1s,2s,4s,8s,16s,20s(封顶)
-const RECONNECT_MAX_DELAY_MS = 20000;
+// 退避阶梯（刻意比教科书实现保守，起步 3s 而非 1s）：
+//   1) 斗鱼/虎牙/B站的取流接口都有频控，秒级密集重取流极易被判异常而直接拒绝 ——
+//      表现就是「每次自动重连都取流失败、手动点刷新却一次就成」。拉长间隔反而更容易恢复；
+//   2) 一次重建要销毁旧播放器、停弹幕、重新取流、重新 mount，本身就要几秒，
+//      1s 后重试基本是在跟自己抢资源。
+const RECONNECT_DELAYS_MS = [3000, 6000, 12000, 20000, 30000, 45000];
+// ★ 根治「无限重连」的两道闸门：
+//   A) 稳定确认：画面必须**连续**推进这么久，才认定这次重连真的成功、把重连预算回满。
+//      以前只看 playing 事件就立刻回血，弱网下「播两秒又断」会无限循环 1/6→2/6→…→失败→再 1/6。
+//   B) 总时长窗：一轮重连（从第一次中断算起）超过这个时长就彻底放弃，交还控制权给用户。
+const RECONNECT_HEALTHY_STABLE_MS = 15000;
+const RECONNECT_ROUND_WINDOW_MS = 240000; // 4 分钟，覆盖退避总和(116s) + 每次重建耗时
+// 连续「取流阶段」失败这么多次，判定该房间当前就是取不到流，不再空转
+const FETCH_FAIL_GIVEUP_STREAK = 3;
 // 卡死看门狗：直播中 currentTime 长时间不推进，判定为「假死」
 // （内核没抛 error、但画面停住——弱网/丢包时很常见，必须靠主动检测兜底）
 const STALL_CHECK_INTERVAL_MS = 3000;
@@ -284,6 +296,13 @@ export function MainPlayer({
   const reconnectScheduledAtRef = useRef(0);
   // 本次 reloadStream 的起始时刻（看门狗用它判断取流是否挂死）
   const reloadStartedAtRef = useRef(0);
+  // 本轮重连的起始时刻（第一次中断的时刻）——用于总时长封顶，杜绝「无限重连」
+  const reconnectRoundStartRef = useRef(0);
+  // 画面首次被观察到「正在推进」的时刻；只有连续推进满 RECONNECT_HEALTHY_STABLE_MS
+  // 才认定这次重连真正成功并回满预算。中途画面一停就清零重来。
+  const healthySinceRef = useRef(0);
+  // 连续「取流阶段」失败次数（取流成功即清零）——用于对取不到流的房间及时止损
+  const fetchFailStreakRef = useRef(0);
   // 是否处于「自动重连重建」模式：用于让 destroyPlayer 保留全屏态
   const autoReconnectModeRef = useRef(false);
   // 一旦确认「主播未开播 / 房间不存在」就置位，阻断自动重连（否则会对着下播的房间空转）；
@@ -672,14 +691,34 @@ export function MainPlayer({
     }
   }, []);
 
-  /** 画面真正恢复播放后调用：重置退避计数、解除阻断、清掉重连提示与所有挂起状态。 */
-  const markReconnectHealthy = useCallback(() => {
+  /** 确认真正恢复：回满重连预算、解除阻断、清掉提示与所有挂起状态。 */
+  const commitReconnectHealthy = useCallback(() => {
     reconnectAttemptRef.current = 0;
     reconnectBlockedRef.current = false;
     reconnectGaveUpRef.current = false;
     reconnectDeferredRef.current = false;
     reconnectScheduledAtRef.current = 0;
+    reconnectRoundStartRef.current = 0;
+    fetchFailStreakRef.current = 0;
+    healthySinceRef.current = 0;
     setReconnectNotice(null);
+  }, []);
+
+  /**
+   * 观察到画面在推进 / 收到 playing 事件时调用。
+   * ★ 关键：这里**不**直接回满预算，只记下起始时刻；
+   *   必须由看门狗确认「连续稳定推进满 RECONNECT_HEALTHY_STABLE_MS」后才回血。
+   *   以前在 playing 事件里立刻归零，弱网下「播两秒又断」会把预算无限刷新，
+   *   用户看到的就是一直在 1/6→2/6→…→失败、然后又从 1/6 开始的无限重连。
+   */
+  const notePlaybackProgress = useCallback(() => {
+    // 画面能推进 = 流确实拿到了，取流失败连击清零
+    fetchFailStreakRef.current = 0;
+    if (healthySinceRef.current === 0) {
+      healthySinceRef.current = Date.now();
+      // 稳定确认期内先把提示收掉，避免画面其实已经在播、却还挂着「正在重连」
+      setReconnectNotice(null);
+    }
   }, []);
 
   /**
@@ -709,6 +748,28 @@ export function MainPlayer({
     }
 
     const attempt = reconnectAttemptRef.current;
+    const now = Date.now();
+
+    // ===== 闸门 B：本轮重连总时长封顶 =====
+    // 退避总和已 116s，加上每次重建耗时，4 分钟足够覆盖各种慢场景。
+    // 超过这个时长说明已经不是「网络瞬断」，果断停止并交还控制权给用户——
+    // 否则在持续弱网下会一轮接一轮地重连下去，用户眼里就是「无限重连」。
+    if (reconnectRoundStartRef.current > 0 && now - reconnectRoundStartRef.current > RECONNECT_ROUND_WINDOW_MS) {
+      console.warn("[Player] 本轮自动重连超过总时长上限，停止自动重连");
+      reconnectGaveUpRef.current = true;
+      reconnectAttemptRef.current = 0;
+      reconnectScheduledAtRef.current = 0;
+      reconnectRoundStartRef.current = 0;
+      reconnectDeferredRef.current = false;
+      setReconnectNotice(null);
+      setStreamError(
+        `网络连接中断，自动重连持续超过 ${Math.round(
+          RECONNECT_ROUND_WINDOW_MS / 60000
+        )} 分钟仍未恢复。\n请检查网络连接后点击「再试一次」。`
+      );
+      return;
+    }
+
     if (attempt >= RECONNECT_MAX_ATTEMPTS) {
       // 次数用尽：停止自动重连，给出明确出口（错误页 + 「再试一次」按钮）。
       // 必须置 gaveUp 标志并把计数归零，否则看门狗会把「已达上限」也当成
@@ -716,6 +777,8 @@ export function MainPlayer({
       reconnectGaveUpRef.current = true;
       reconnectAttemptRef.current = 0;
       reconnectScheduledAtRef.current = 0;
+      reconnectRoundStartRef.current = 0;
+      reconnectDeferredRef.current = false;
       setReconnectNotice(null);
       setStreamError(
         `网络连接中断，已自动重连 ${RECONNECT_MAX_ATTEMPTS} 次仍未成功。\n请检查网络连接后点击「再试一次」。`
@@ -723,9 +786,12 @@ export function MainPlayer({
       return;
     }
 
+    // 本轮重连的第一枪：记下起始时刻，作为总时长封顶的基准
+    if (reconnectRoundStartRef.current === 0) reconnectRoundStartRef.current = now;
+
     reconnectAttemptRef.current = attempt + 1;
     const seq = attempt + 1;
-    const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
+    const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
     console.info(`[Player] 连接中断（${reason}），${delay}ms 后进行第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次自动重连`);
     setReconnectNotice(
       delay >= 1000
@@ -763,7 +829,7 @@ export function MainPlayer({
 
       // ===== 职责一：重连活性巡检 =====
       // 「重连进行中」只认两件事：有取流在跑，或有待执行的退避定时器。
-      // 注意不能把「重连计数 >0」也算进来 —— 重连成功后计数要等 markReconnectHealthy
+      // 注意不能把「重连计数 >0」也算进来 —— 重连成功后计数要等稳定确认才回满
       // 才清零，若把它当作进行中，看门狗就永远走不到画面推进判定，反而永远清不掉状态。
       const reconnectRunning = reloadInFlightRef.current || reconnectTimerRef.current !== null;
       if (reconnectRunning) {
@@ -794,15 +860,25 @@ export function MainPlayer({
       const playing = !!video && !video.paused && !video.ended;
       const prev = lastProgressRef.current;
 
-      // 画面确实在推进 = 真的在播。主动重置重连状态，
-      // 比只依赖播放器事件名更可靠（事件名可能随版本变化，重建后的实例也未必再发 playing）。
+      // 画面确实在推进 = 真的在播。比只依赖播放器事件名更可靠
+      // （事件名可能随版本变化，重建后的实例也未必再发 playing）。
       if (playing && video && video.currentTime !== prev.time) {
         lastProgressRef.current = { time: video.currentTime, at: now };
-        if (reconnectAttemptRef.current > 0 || reconnectBlockedRef.current || ctx.reconnecting) {
-          markReconnectHealthy();
+        // 只记「开始稳定」，不立刻回血
+        notePlaybackProgress();
+        // 连续稳定满 RECONNECT_HEALTHY_STABLE_MS 才认定这次重连真的成功、回满预算
+        if (
+          (reconnectAttemptRef.current > 0 || reconnectBlockedRef.current || ctx.reconnecting) &&
+          healthySinceRef.current > 0 &&
+          now - healthySinceRef.current >= RECONNECT_HEALTHY_STABLE_MS
+        ) {
+          console.info("[Player] 画面已连续稳定播放，重连预算已回满");
+          commitReconnectHealthy();
         }
         return;
       }
+      // 画面没推进（含暂停/还没起播）：稳定计时要从头再来，不能让「播两秒」骗到回血
+      healthySinceRef.current = 0;
 
       // ===== 职责二之一：重连链条断裂兜底 =====
       // 已不在取流、也没有待执行定时器（否则上面就 return 了），但重连流程尚未终结
@@ -827,7 +903,7 @@ export function MainPlayer({
         scheduleReconnect("画面卡住");
       }
     }, STALL_CHECK_INTERVAL_MS);
-  }, [markReconnectHealthy, scheduleReconnect]);
+  }, [commitReconnectHealthy, notePlaybackProgress, scheduleReconnect]);
 
   useEffect(() => {
     if (platform === Platform.BILIBILI || platform === Platform.HUYA) {
@@ -1310,10 +1386,11 @@ export function MainPlayer({
             scheduleReconnect(String(detail));
           }, 0);
         });
-        // 画面真正恢复播放 → 重置退避计数并清掉提示
+        // 收到 playing 只代表「起播了」，不等于「稳住了」——
+        // 只记起始时刻，连续稳定满 RECONNECT_HEALTHY_STABLE_MS 才由看门狗回满预算。
         player.on?.("playing", () => {
           if (!isSessionActive(sessionId)) return;
-          markReconnectHealthy();
+          notePlaybackProgress();
         });
       } catch {
         // ignore
@@ -1423,7 +1500,7 @@ export function MainPlayer({
       startDanmaku,
       // 以下三个均为稳定引用（useCallback 空依赖/单依赖），加入不会造成 mountPlayer 频繁重建
       scheduleReconnect,
-      markReconnectHealthy,
+      notePlaybackProgress,
       startStallWatchdog
     ]
   );
@@ -1461,6 +1538,9 @@ export function MainPlayer({
         reconnectGaveUpRef.current = false;
         reconnectDeferredRef.current = false;
         reconnectScheduledAtRef.current = 0;
+        reconnectRoundStartRef.current = 0;
+        healthySinceRef.current = 0;
+        fetchFailStreakRef.current = 0;
         clearReconnectTimer();
         setReconnectNotice(null);
       }
@@ -1719,7 +1799,23 @@ export function MainPlayer({
           // 网络层中断：取流请求失败，但没有「未开播」特征 —— 大概率只是断网/超时。
           // 关键：绝不能沿用旧的「取流失败一律当作主播未开播」逻辑，
           // 那会在断网时弹出误导性的「主播未开播」，并让自动重连当场失效。
-          // 这里保持画面为「正在重连」，交由退避调度器继续尝试，网络恢复即自动续播。
+          fetchFailStreakRef.current += 1;
+          if (fetchFailStreakRef.current >= FETCH_FAIL_GIVEUP_STREAK) {
+            // 连「取流」这一步都连续过不去，说明不是播放中断、而是根本拿不到流
+            // （网络中断 / 平台频控 / 接口异常）。继续重连只是对着空气空转，
+            // 直接停手并把控制权交还用户，避免用户眼里变成「无限重连」。
+            reconnectGaveUpRef.current = true;
+            reconnectAttemptRef.current = 0;
+            reconnectScheduledAtRef.current = 0;
+            reconnectRoundStartRef.current = 0;
+            reconnectDeferredRef.current = false;
+            setReconnectNotice(null);
+            setStreamError(
+              `暂时无法获取直播流（连续 ${fetchFailStreakRef.current} 次取流失败）。\n请检查网络连接后点击「再试一次」。`
+            );
+            // return 不会跳过 finally，in-flight 锁仍会被正确释放
+            return;
+          }
           setStreamError(null);
           setIsOfflineError(false);
           pendingReconnectReason = "取流失败";
