@@ -27,6 +27,8 @@ type VersionInfo = {
   notes?: string[];
   url?: string;
   published_at?: string;
+  /** 安装包字节数，用于让 Rust 侧判断本地是否已下载完整安装包 */
+  size?: number;
 };
 
 const GITHUB_RELEASES_URL = "https://github.com/cookie-kangd/dtv_x/releases";
@@ -116,6 +118,7 @@ export function Navbar({
   const [updatePhase, setUpdatePhase] = useState<"idle" | "downloading" | "installing" | "error">("idle");
   const [updatePercent, setUpdatePercent] = useState<number>(0);
   const [updateMsg, setUpdateMsg] = useState<string>("");
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
 
   // 应用内更新：下载进度事件（Rust 侧 download_and_install_cmd 发出）
   useEffect(() => {
@@ -141,13 +144,16 @@ export function Navbar({
     setUpdatePercent(0);
     setUpdateMsg("正在连接下载源…");
     try {
+      // Rust 侧行为：本地已有完整安装包 → 跳过下载直接进入安装；
+      // 否则下载完成后关闭文件句柄 → 延迟分离启动安装向导 → 本应用立即退出。
       await invoke("download_and_install_cmd", {
         url: versionInfo.url,
-        version: versionInfo.version
+        version: versionInfo.version,
+        size: versionInfo.size ?? null
       });
       // 成功路径：Rust 侧会启动安装程序并退出应用
       setUpdatePhase("installing");
-      setUpdateMsg("安装程序已启动，本应用即将退出");
+      setUpdateMsg("安装向导已启动，本应用即将退出");
     } catch (err) {
       setUpdatePhase("error");
       setUpdateMsg(typeof err === "string" ? err : String(err));
@@ -234,37 +240,55 @@ export function Navbar({
     });
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
+  // 请求序号：手动打开弹窗触发的检查若先返回，不会被更早的慢响应覆盖
+  const versionCheckSeqRef = useRef(0);
 
-    (async () => {
+  /** 主动检查一次更新（挂载时 + 每次打开版本弹窗时都会调用） */
+  const checkUpdate = useCallback(async () => {
+    const seq = ++versionCheckSeqRef.current;
+    setIsCheckingUpdate(true);
+    try {
       // 版本检查不是关键功能：失败不重试、不报错、不提示
-      try {
-        const res = await invoke<any>("check_version_cmd");
-        if (cancelled) return;
-        const local = typeof res?.local_version === "string" ? res.local_version : "";
-        setLocalVersion(local);
-        const remote = res?.remote;
-        if (remote && typeof remote.version === "string" && remote.version.trim()) {
-          const info: VersionInfo = {
-            version: remote.version,
-            title: typeof remote.title === "string" ? remote.title : undefined,
-            notes: Array.isArray(remote.notes) ? remote.notes.filter((x: any) => typeof x === "string") : undefined,
-            url: typeof remote.url === "string" ? remote.url : undefined,
-            published_at: typeof remote.published_at === "string" ? remote.published_at : undefined
-          };
-          setVersionInfo(info);
-        }
-        setHasUpdate(!!res?.has_update);
-      } catch {
-        // ignore
+      const res = await invoke<any>("check_version_cmd");
+      if (seq !== versionCheckSeqRef.current) return; // 已过期，丢弃
+      const local = typeof res?.local_version === "string" ? res.local_version : "";
+      setLocalVersion(local);
+      const remote = res?.remote;
+      if (remote && typeof remote.version === "string" && remote.version.trim()) {
+        const info: VersionInfo = {
+          version: remote.version,
+          title: typeof remote.title === "string" ? remote.title : undefined,
+          notes: Array.isArray(remote.notes) ? remote.notes.filter((x: any) => typeof x === "string") : undefined,
+          url: typeof remote.url === "string" ? remote.url : undefined,
+          published_at: typeof remote.published_at === "string" ? remote.published_at : undefined,
+          size: typeof remote.size === "number" ? remote.size : undefined
+        };
+        setVersionInfo(info);
       }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
+      setHasUpdate(!!res?.has_update);
+    } catch {
+      // ignore
+    } finally {
+      if (seq === versionCheckSeqRef.current) setIsCheckingUpdate(false);
+    }
   }, []);
+
+  // 启动时检查一次（用于标题栏的 NEW 徽标）
+  useEffect(() => {
+    void checkUpdate();
+  }, [checkUpdate]);
+
+  /** 点击版本按钮：打开弹窗，并每次都主动检查一次更新 */
+  const openUpdateModal = useCallback(() => {
+    setUpdateOpen(true);
+    if (updatePhase === "error") {
+      // 上次更新失败：清掉错误提示，重新进入可点击状态（安装包会被复用，不会重新下载）
+      setUpdatePhase("idle");
+      setUpdateMsg("");
+      setUpdatePercent(0);
+    }
+    void checkUpdate();
+  }, [checkUpdate, updatePhase]);
 
   const searchPlatform: SearchPlatform | null = useMemo(() => {
     if (activePlatform === "bilibili") return "bilibili";
@@ -854,7 +878,7 @@ export function Navbar({
           className={styles.versionBtn}
           title="版本信息"
           aria-label="版本信息"
-          onClick={() => setUpdateOpen(true)}
+          onClick={openUpdateModal}
         >
           <span className={styles.versionText}>v{localVersion || "?"}</span>
           {hasUpdate ? <span className={styles.badgeNew}>NEW</span> : null}
@@ -932,7 +956,11 @@ export function Navbar({
             >
               <div className={styles.overlayHeader}>
                 <div className={styles.overlayTitle}>
-                  {hasUpdate && versionInfo ? versionInfo.title || `发现新版本 v${versionInfo.version}` : "版本信息"}
+                  {hasUpdate && versionInfo
+                    ? versionInfo.title || `发现新版本 v${versionInfo.version}`
+                    : isCheckingUpdate
+                      ? "正在检查更新…"
+                      : "版本信息"}
                 </div>
                 <button type="button" className={styles.overlayClose} onClick={() => setUpdateOpen(false)} aria-label="关闭">
                   <X size={16} />
@@ -941,7 +969,13 @@ export function Navbar({
               <div className={styles.overlayBody}>
                 <div className={styles.updateMeta}>
                   <span>当前版本：v{localVersion || "?"}</span>
-                  {hasUpdate && versionInfo ? <span>最新版本：v{versionInfo.version}</span> : <span>已是最新</span>}
+                  {hasUpdate && versionInfo ? (
+                    <span>最新版本：v{versionInfo.version}</span>
+                  ) : isCheckingUpdate ? (
+                    <span>正在检查更新…</span>
+                  ) : (
+                    <span>已是最新</span>
+                  )}
                   {hasUpdate && versionInfo?.published_at ? <span>发布日期：{versionInfo.published_at}</span> : null}
                 </div>
                 {hasUpdate && versionInfo?.notes?.length ? (
@@ -962,7 +996,7 @@ export function Navbar({
                     </div>
                     <div className={styles.updateProgressText}>
                       {updatePhase === "installing"
-                        ? updateMsg || "安装程序已启动，本应用即将退出"
+                        ? updateMsg || "安装向导已启动，本应用即将退出"
                         : `正在下载更新 ${updatePercent.toFixed(1)}%`}
                     </div>
                   </div>
@@ -981,8 +1015,10 @@ export function Navbar({
                         {updatePhase === "downloading"
                           ? "正在下载…"
                           : updatePhase === "installing"
-                            ? "正在启动安装程序…"
-                            : "立即更新"}
+                            ? "正在退出并启动安装…"
+                            : updatePhase === "error"
+                              ? "重试更新"
+                              : "立即更新"}
                       </button>
                       <button
                         type="button"

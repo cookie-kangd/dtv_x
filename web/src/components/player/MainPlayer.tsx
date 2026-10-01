@@ -57,6 +57,13 @@ const RECONNECT_MAX_DELAY_MS = 20000;
 // （内核没抛 error、但画面停住——弱网/丢包时很常见，必须靠主动检测兜底）
 const STALL_CHECK_INTERVAL_MS = 3000;
 const STALL_STUCK_MS = 12000;
+// ===== 重连活性兜底（根治「自动重连若干次后就一直转圈、手动刷新才恢复」）=====
+// 事件驱动的重连有一个致命弱点：链条上任何一环静默失败（守卫吞掉请求、
+// await 永不返回），就再也没有人来推进下一次重连，且看门狗也会因为
+// loading=true / video 不存在而躺平 —— 表现就是「转圈转到天荒地老」。
+// 因此必须由一个独立于播放器生命周期的心跳来巡检重连是否还在推进。
+const RELOAD_HARD_TIMEOUT_MS = 45000; // 单次取流/重建超过此时长一律视为挂死
+const RECONNECT_STALL_MS = 30000; // 重连链条停滞（无定时器也无取流）超过此时长即强制补一次
 
 const PLAYER_DRAG_EXCLUDED_SELECTOR = [
   // App chrome / topbar (主播信息栏 & 关闭/关注按钮等)
@@ -269,17 +276,34 @@ export function MainPlayer({
   // ===== 自动重连运行时状态（全部用 ref，避免定时器闭包读到陈旧值）=====
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
+  // 取流期间被守卫挡下的重连请求（不再丢弃，等本次取流结束后补偿调度）
+  const reconnectDeferredRef = useRef(false);
+  // 已经用尽重连次数、把控制权交还用户：此时停止一切自动重连，直到用户手动重载
+  const reconnectGaveUpRef = useRef(false);
+  // 最近一次成功排上重连定时器的时刻（看门狗用它判断重连链条是否停滞）
+  const reconnectScheduledAtRef = useRef(0);
+  // 本次 reloadStream 的起始时刻（看门狗用它判断取流是否挂死）
+  const reloadStartedAtRef = useRef(0);
+  // 是否处于「自动重连重建」模式：用于让 destroyPlayer 保留全屏态
+  const autoReconnectModeRef = useRef(false);
   // 一旦确认「主播未开播 / 房间不存在」就置位，阻断自动重连（否则会对着下播的房间空转）；
   // 成功播放或用户手动重载时解除。注意：网络中断**不**置位，必须继续重连。
   const reconnectBlockedRef = useRef(false);
   const stallWatchdogRef = useRef<number | null>(null);
   const lastProgressRef = useRef<{ time: number; at: number }>({ time: -1, at: 0 });
   // 看门狗需要读取最新业务状态，用一个 ref 镜像，避免把它塞进 effect 依赖导致定时器反复重建
-  const watchdogCtxRef = useRef<{ loading: boolean; offline: boolean; hasError: boolean; live: boolean | null }>({
+  const watchdogCtxRef = useRef<{
+    loading: boolean;
+    offline: boolean;
+    hasError: boolean;
+    live: boolean | null;
+    reconnecting: boolean;
+  }>({
     loading: false,
     offline: false,
     hasError: false,
-    live: null
+    live: null,
+    reconnecting: false
   });
 
   const [playerTitle, setPlayerTitle] = useState<string | null>(null);
@@ -294,7 +318,8 @@ export function MainPlayer({
     loading: isLoadingStream,
     offline: isOfflineError,
     hasError: !!streamError,
-    live: playerIsLive
+    live: playerIsLive,
+    reconnecting: reconnectNotice !== null
   };
   const [isMaximized, setIsMaximized] = useState(false);
 
@@ -625,22 +650,35 @@ export function MainPlayer({
   // 分工：播放器内核负责秒级抖动自愈（flv.disconnectRetryCount / hls.retryCount），
   // 内核放弃后、或画面「假死」，由这里接管：指数退避 + 重新取流。
 
-  const clearReconnectTimers = useCallback(() => {
+  /** 只清「待执行的重连定时器」与画面推进记忆。 */
+  const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    lastProgressRef.current = { time: -1, at: 0 };
+  }, []);
+
+  /**
+   * 停止卡死看门狗。
+   * 注意：看门狗**不**随 destroyPlayer 停止 —— 它必须独立于播放器生命周期存活，
+   * 否则「取流失败 → destroyPlayer → 等着重建」这段最需要兜底的空窗期里，
+   * 恰好没有任何人在监控重连是否还在推进。只有组件卸载才停它。
+   */
+  const stopStallWatchdog = useCallback(() => {
     if (stallWatchdogRef.current !== null) {
       window.clearInterval(stallWatchdogRef.current);
       stallWatchdogRef.current = null;
     }
-    lastProgressRef.current = { time: -1, at: 0 };
   }, []);
 
-  /** 画面真正恢复播放后调用：重置退避计数、解除阻断、清掉重连提示。 */
+  /** 画面真正恢复播放后调用：重置退避计数、解除阻断、清掉重连提示与所有挂起状态。 */
   const markReconnectHealthy = useCallback(() => {
     reconnectAttemptRef.current = 0;
     reconnectBlockedRef.current = false;
+    reconnectGaveUpRef.current = false;
+    reconnectDeferredRef.current = false;
+    reconnectScheduledAtRef.current = 0;
     setReconnectNotice(null);
   }, []);
 
@@ -656,11 +694,28 @@ export function MainPlayer({
     // 注意这里刻意不用 isOfflineError：取流失败（可能是网络问题）也会把它置 true，
     // 若用它做闸门，网络一断就再也连不回来了。
     if (reconnectBlockedRef.current) return;
+    // 已经用尽重连次数并把控制权交还用户 —— 在用户手动重载之前不再自作主张
+    if (reconnectGaveUpRef.current) return;
     if (reconnectTimerRef.current !== null) return; // 已有待执行的重连，避免叠加
-    if (reloadInFlightRef.current) return; // 正在取流，等它结束再说
+
+    if (reloadInFlightRef.current) {
+      // ★ 这里曾经直接 return —— 那是「自动重连两次后就一直转圈」的关键一环：
+      //   播放器的 error 事件经 setTimeout(0) 延后一拍触发，但一次 reloadStream 的
+      //   await 链（弹幕停止 IPC、取流网络请求、动态 import、重建播放器）远超一个宏任务，
+      //   于是这次重连请求被守卫静默吞掉，之后没有任何人再发起下一次 —— 链条当场断裂。
+      //   现在改为记下请求，等本次取流结束后由 finally 补偿调度。
+      reconnectDeferredRef.current = true;
+      return;
+    }
 
     const attempt = reconnectAttemptRef.current;
     if (attempt >= RECONNECT_MAX_ATTEMPTS) {
+      // 次数用尽：停止自动重连，给出明确出口（错误页 + 「再试一次」按钮）。
+      // 必须置 gaveUp 标志并把计数归零，否则看门狗会把「已达上限」也当成
+      // 「重连链条停滞」而反复补调度，陷入无意义的重试循环。
+      reconnectGaveUpRef.current = true;
+      reconnectAttemptRef.current = 0;
+      reconnectScheduledAtRef.current = 0;
       setReconnectNotice(null);
       setStreamError(
         `网络连接中断，已自动重连 ${RECONNECT_MAX_ATTEMPTS} 次仍未成功。\n请检查网络连接后点击「再试一次」。`
@@ -678,6 +733,7 @@ export function MainPlayer({
         : `连接中断，正在自动重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`
     );
 
+    reconnectScheduledAtRef.current = Date.now();
     reconnectTimerRef.current = window.setTimeout(() => {
       reconnectTimerRef.current = null;
       if (disposedRef.current) return;
@@ -687,19 +743,46 @@ export function MainPlayer({
   }, []);
 
   /**
-   * 卡死看门狗：每 3 秒检查 currentTime 是否推进。
-   * 兜住「播放器没抛 error、但画面其实停住了」的假死场景——弱网丢包时很常见，
-   * 只监听 error 事件会漏掉这一类。
+   * 卡死看门狗：每 3 秒一跳，承担两个职责。
+   *
+   * 职责一（重连活性巡检）—— 兜住「重连链条静默断裂」：
+   *   只要处于重连流程（取流中或重连计数 >0），就检查它是否真的在推进。
+   *   挂死的 await 会被硬超时强制解锁；链条断了（既无定时器也不在取流）会被强制补一次。
+   *   这正是「自动重连两次后就一直转圈、手动刷新才恢复」的根治手段。
+   *
+   * 职责二（画面假死检测）—— 兜住「播放器没抛 error、但画面其实停住了」：
+   *   弱网丢包时很常见，只监听 error 事件会漏掉这一类。
    */
   const startStallWatchdog = useCallback(() => {
     if (stallWatchdogRef.current !== null) return;
     lastProgressRef.current = { time: -1, at: 0 };
     stallWatchdogRef.current = window.setInterval(() => {
       if (disposedRef.current) return;
+      const now = Date.now();
       const ctx = watchdogCtxRef.current;
-      // 加载中 / 已报错 / 主播未开播：不判定，避免误伤
-      if (ctx.loading || ctx.hasError || ctx.offline) return;
 
+      // ===== 职责一：重连活性巡检 =====
+      // 「重连进行中」只认两件事：有取流在跑，或有待执行的退避定时器。
+      // 注意不能把「重连计数 >0」也算进来 —— 重连成功后计数要等 markReconnectHealthy
+      // 才清零，若把它当作进行中，看门狗就永远走不到画面推进判定，反而永远清不掉状态。
+      const reconnectRunning = reloadInFlightRef.current || reconnectTimerRef.current !== null;
+      if (reconnectRunning) {
+        // 取流 / 重建挂死：超过硬超时一律判定为死锁，作废该会话并重排重连。
+        // 没有这一步，一个永不返回的 await 就能把 reloadInFlightRef 永久钉在 true，
+        // 之后所有重连请求都被守卫吞掉 —— 那正是用户看到的「一直转圈」。
+        if (reloadInFlightRef.current && now - reloadStartedAtRef.current > RELOAD_HARD_TIMEOUT_MS) {
+          console.warn("[Player] 取流/重建超过硬超时，判定为挂死：作废该会话并重排重连");
+          reloadInFlightRef.current = false;
+          pendingReloadRef.current = null;
+          activeSessionIdRef.current = ++sessionSeqRef.current; // 让挂死的旧会话彻底作废，避免它稍后回魂
+          setIsLoadingStream(false);
+          scheduleReconnect("取流超时");
+        }
+        // 此时 loading 必然为真、画面本来就该静止 —— 不做画面推进判定
+        return;
+      }
+
+      // 读取画面推进情况（下面两种判定都要用）
       let video: HTMLVideoElement | null = null;
       try {
         const root = playerRef.current?.root as HTMLElement | null;
@@ -708,19 +791,36 @@ export function MainPlayer({
         video = null;
       }
       // 用户主动暂停、已播完：不算卡死
-      if (!video || video.paused || video.ended) return;
-
-      const now = Date.now();
+      const playing = !!video && !video.paused && !video.ended;
       const prev = lastProgressRef.current;
-      if (video.currentTime !== prev.time) {
+
+      // 画面确实在推进 = 真的在播。主动重置重连状态，
+      // 比只依赖播放器事件名更可靠（事件名可能随版本变化，重建后的实例也未必再发 playing）。
+      if (playing && video && video.currentTime !== prev.time) {
         lastProgressRef.current = { time: video.currentTime, at: now };
-        // 画面确实在推进 = 真的在播。这里主动重置退避状态，
-        // 比只依赖播放器事件名更可靠（事件名可能随版本变化）。
-        if (reconnectAttemptRef.current > 0 || reconnectBlockedRef.current) {
+        if (reconnectAttemptRef.current > 0 || reconnectBlockedRef.current || ctx.reconnecting) {
           markReconnectHealthy();
         }
         return;
       }
+
+      // ===== 职责二之一：重连链条断裂兜底 =====
+      // 已不在取流、也没有待执行定时器（否则上面就 return 了），但重连流程尚未终结
+      // （退避计数还挂着，或「正在重连」提示还没被清掉）—— 说明链条断了：
+      // 上一次调度被谁吞掉、或某个 await 提前返回后没人接手。必须强制补一次，否则永远转圈。
+      if (reconnectAttemptRef.current > 0 || ctx.reconnecting) {
+        if (reconnectScheduledAtRef.current > 0 && now - reconnectScheduledAtRef.current > RECONNECT_STALL_MS) {
+          console.warn("[Player] 重连链条停滞，强制补排一次重连");
+          scheduleReconnect("重连停滞");
+        }
+        return;
+      }
+
+      // ===== 职责二之二：普通「画面假死」判定 =====
+      // 加载中 / 已报错 / 主播未开播 / 用户暂停 / 未播放过：不判定，避免误伤
+      if (ctx.loading || ctx.hasError || ctx.offline) return;
+      if (!video || !playing) return;
+
       const stuckSince = prev.at || now;
       if (now - stuckSince >= STALL_STUCK_MS) {
         lastProgressRef.current = { time: video.currentTime, at: now };
@@ -783,11 +883,14 @@ export function MainPlayer({
   }, []);
 
   const destroyPlayer = useCallback(() => {
-    // 切房间/切画质/销毁时，停掉挂起的自动重连定时器与卡死看门狗，
+    // 切房间/切画质/销毁时，停掉挂起的自动重连定时器，
     // 避免旧会话的定时器在新会话里误触发一次重连。
-    // 注意：这里刻意不重置 reconnectAttemptRef —— 自动重连内部也会经过 destroyPlayer，
-    // 若在此清零，退避计数永远归零，会退化成无限重连。
-    clearReconnectTimers();
+    // 注意一：这里刻意不重置 reconnectAttemptRef —— 自动重连内部也会经过 destroyPlayer，
+    //   若在此清零，退避计数永远归零，会退化成无限重连。
+    // 注意二：这里刻意**不**停卡死看门狗 —— 它必须跨「取流失败 → 重建」这段空窗期存活，
+    //   否则自动重连挂死时就没有任何人在兜底（那正是「一直转圈」能无限持续的成因之一）。
+    //   看门狗只在组件卸载时由 stopStallWatchdog() 停止。
+    clearReconnectTimer();
 
     try {
       unlistenRef.current?.();
@@ -833,8 +936,11 @@ export function MainPlayer({
     qualityPluginRef.current = null;
     linePluginRef.current = null;
 
-    setIsFullScreen(false);
-  }, [clearReconnectTimers]);
+    // 自动重连触发的重建要保留全屏态：断网重连时把用户踢出全屏是很糟的体验。
+    // 用模式标记而不是参数，是因为自动重连路径上 destroyPlayer 的调用点很多
+    // （各平台分支的失败回退、catch 兜底），逐个传参会漏。
+    if (!autoReconnectModeRef.current) setIsFullScreen(false);
+  }, [clearReconnectTimer]);
 
   const stopAllDanmakuBackends = useCallback(async () => {
     // Business rule: only one room at a time. Stopping all backends is the safest way to avoid cross-platform leaks.
@@ -1196,8 +1302,9 @@ export function MainPlayer({
           if (!isSessionActive(sessionId)) return;
           const detail = (err && (err.errorType || err.type || err.errorCode || err.message)) || "unknown";
           console.warn("[Player] 播放错误事件，准备自动重连:", err);
-          // 延后一拍再调度：若此刻恰好处于 reloadStream 的 in-flight 窗口，
-          // scheduleReconnect 的守卫会把这次调用丢掉，白白错过一次重连机会。
+          // 延后一拍再调度，尽量避开 reloadStream 的 in-flight 窗口。
+          // 即便仍然撞上窗口也不会丢：scheduleReconnect 会转为「补偿调度」，
+          // 由该次 reloadStream 的 finally 补上（旧实现是静默丢弃，重连链条会当场断裂）。
           window.setTimeout(() => {
             if (!isSessionActive(sessionId)) return;
             scheduleReconnect(String(detail));
@@ -1328,18 +1435,33 @@ export function MainPlayer({
       opts?: { isAutoReconnect?: boolean }
     ) => {
       if (reloadInFlightRef.current) {
-        pendingReloadRef.current = { trigger: _trigger, overrides, opts };
-        return;
+        if (opts?.isAutoReconnect) {
+          // 取流中：记下这次重连请求，等本次取流结束后补偿调度（不能丢弃，见 scheduleReconnect 注释）
+          reconnectDeferredRef.current = true;
+          return;
+        }
+        // 用户手动操作（点刷新 / 切画质 / 切线路）必须**抢占**：
+        // 否则一旦某次自动重连的 await 挂死，in-flight 守卫会把用户的手动重载
+        // 也一起挡在门外（塞进 pending 而永不消费），用户就只能干看着转圈。
+        console.warn("[Player] 用户手动重载抢占进行中的取流会话");
+        reloadInFlightRef.current = false;
+        pendingReloadRef.current = null;
       }
       reloadInFlightRef.current = true;
+      reloadStartedAtRef.current = Date.now();
       const sessionId = ++sessionSeqRef.current;
       activeSessionIdRef.current = sessionId;
 
-      // 非自动重连（切房间/切画质/用户点刷新）视为「重新开始」：重置退避计数、解除阻断、清掉提示；
+      // 非自动重连（切房间/切画质/用户点刷新）视为「重新开始」：重置退避与所有重连相关状态；
       // 自动重连必须保留计数，否则永远到不了上限、会无限重试拖垮自己和服务器。
       if (!opts?.isAutoReconnect) {
+        autoReconnectModeRef.current = false;
         reconnectAttemptRef.current = 0;
         reconnectBlockedRef.current = false;
+        reconnectGaveUpRef.current = false;
+        reconnectDeferredRef.current = false;
+        reconnectScheduledAtRef.current = 0;
+        clearReconnectTimer();
         setReconnectNotice(null);
       }
 
@@ -1351,29 +1473,44 @@ export function MainPlayer({
       setPlayerAnchorName(null);
       setPlayerAvatar(null);
 
+      // ★ 自动重连必须走「彻底重建」，绝不复用播放器的软切换（switchURL）：
+      //   1) 断流恢复场景下，旧实例的 MSE SourceBuffer、flv 内核 reader、重试计数
+      //      都已经处于耗尽/异常状态，软切换只是把新 URL 塞进一个已经坏掉的管道；
+      //   2) 内核还会因为「新旧地址字符串相同」而把 switchURL 当成空操作
+      //      （斗鱼/虎牙短期内取到的地址常常完全一样），于是既不报错也不播放 ——
+      //      画面就一直停在转圈上。这正是「自动重连两次后就一直转圈」的直接成因。
+      //   提前销毁后，下面各平台的 canSoftSwitch 判定必然为 false，统一走 mountPlayer 全量重建。
+      if (opts?.isAutoReconnect) {
+        autoReconnectModeRef.current = true; // 让 destroyPlayer 保留全屏态
+        destroyPlayer();
+      }
+
       const effectiveQuality = overrides?.quality ?? currentQuality;
       const effectiveLine = typeof overrides?.line !== "undefined" ? overrides.line : currentLine;
 
       // 每次重载先清掉动态画质列表（Twitch 分支会按取流结果重新填充）
       setQualityOptionsOverride(null);
 
-      await stopAllDanmakuBackends();
-      await stopAllProxies();
-      if (!isSessionActive(sessionId)) return;
-
-      try {
-        await applyDanmuFontFamilyForOS();
-      } catch {
-        // ignore
-      }
-
       // 取流失败且判定为「网络中断」时，不能立刻调用 scheduleReconnect ——
       // 那一刻 reloadInFlightRef 还是 true（函数开头置位、finally 才复位），
-      // 会被 scheduleReconnect 的 in-flight 守卫直接挡掉，导致重连永远不触发。
+      // 会被 scheduleReconnect 的 in-flight 守卫挡掉，导致重连永远不触发。
       // 因此先记下原因，等 finally 复位后再调度。
       let pendingReconnectReason: string | null = null;
 
+      // 注意：以下所有步骤都必须收在 try 里 —— 这里曾经有一条 `if (!isSessionActive) return;`
+      // 位于 try **之外**，一旦命中就会跳过 finally：reloadInFlightRef 被永久钉在 true、
+      // loading 永久为真，之后每一次重连都被守卫吞掉，画面就一直转圈直到手动刷新。
       try {
+        await stopAllDanmakuBackends();
+        await stopAllProxies();
+        if (!isSessionActive(sessionId)) return;
+
+        try {
+          await applyDanmuFontFamilyForOS();
+        } catch {
+          // ignore
+        }
+
         if (platform === Platform.DOUYU) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
           try {
@@ -1563,6 +1700,7 @@ export function MainPlayer({
       } catch (e: any) {
         if (!isSessionActive(sessionId)) return;
         // 取流失败：先清掉上一路的播放画面/缓冲，避免残留。
+        // 自动重连场景下这一步在函数开头已经做过，重复调用无害（此时 playerRef 已是 null）。
         destroyPlayer();
         const msg = e?.message ? String(e.message) : String(e);
 
@@ -1571,6 +1709,8 @@ export function MainPlayer({
           // 显示「主播未开播」并**停止自动重连**，否则会对着已下播的房间反复空转。
           reconnectBlockedRef.current = true;
           reconnectAttemptRef.current = 0;
+          reconnectScheduledAtRef.current = 0;
+          reconnectDeferredRef.current = false;
           setReconnectNotice(null);
           setStreamError(maybeAppendHevcInstallHint(msg));
           setIsOfflineError(true);
@@ -1585,22 +1725,37 @@ export function MainPlayer({
           pendingReconnectReason = "取流失败";
         }
       } finally {
-        if (isSessionActive(sessionId)) {
+        autoReconnectModeRef.current = false;
+        // 只有自己仍是最新会话时才收尾 —— 被抢占 / 被判挂死作废的旧会话
+        // 绝不能把新会话的 in-flight 锁与 loading 状态误清掉。
+        const stillCurrent = isSessionActive(sessionId);
+        if (stillCurrent) {
+          reloadInFlightRef.current = false;
           setIsLoadingStream(false);
         }
-        reloadInFlightRef.current = false;
         // 网络中断：等 in-flight 守卫复位后再调度重连
-        if (pendingReconnectReason !== null) {
+        if (stillCurrent && pendingReconnectReason !== null) {
           scheduleReconnect(pendingReconnectReason);
         }
-        const pending = pendingReloadRef.current;
-        pendingReloadRef.current = null;
-        if (pending) {
-          void reloadStream(pending.trigger, pending.overrides, pending.opts);
+        // 补偿调度：本次取流期间被守卫挡下的重连请求（见 scheduleReconnect 注释）
+        const deferred = reconnectDeferredRef.current;
+        if (deferred) {
+          reconnectDeferredRef.current = false;
+          if (stillCurrent && pendingReconnectReason === null) {
+            scheduleReconnect("补偿调度");
+          }
+        }
+        if (stillCurrent) {
+          const pending = pendingReloadRef.current;
+          pendingReloadRef.current = null;
+          if (pending) {
+            void reloadStream(pending.trigger, pending.overrides, pending.opts);
+          }
         }
       }
     },
     [
+      clearReconnectTimer,
       currentLine,
       currentQuality,
       destroyPlayer,
@@ -1626,6 +1781,8 @@ export function MainPlayer({
     return () => {
       disposedRef.current = true;
       destroyPlayer();
+      // 看门狗独立于播放器生命周期，必须在这里显式停掉，否则 interval 会一直空转
+      stopStallWatchdog();
 
       const capturedGen = mountGenRef.current;
       const stopAll = () => {
@@ -1640,10 +1797,14 @@ export function MainPlayer({
         stopAll();
       }
     };
-  }, [destroyPlayer, stopAllDanmakuBackends, stopAllProxies]);
+  }, [destroyPlayer, stopAllDanmakuBackends, stopAllProxies, stopStallWatchdog]);
 
   useEffect(() => {
     disposedRef.current = false;
+    // 看门狗从进房间起就常驻，不依赖播放器是否成功创建：
+    // 「一直转圈」的典型场景恰恰是播放器从没建起来、或建到一半挂死，
+    // 若只在 mountPlayer 里启动它，这些场景就完全没有兜底。
+    startStallWatchdog();
     void reloadStream("refresh");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform, roomId]);
