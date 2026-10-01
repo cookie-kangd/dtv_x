@@ -317,11 +317,12 @@
   padding: 18px;
   border-radius: 40px;
   z-index: 50;
+  /* 这里原本还有 backdrop-filter: blur(32px)。已删除：
+     背景是 rgba(20,20,20,0.985)，98.5% 不透明，模糊在视觉上完全看不出来，
+     但 GPU 每帧仍要真实执行一次 32px 高斯模糊 —— 纯粹的浪费。 */
   background: rgba(20, 20, 20, 0.985);
   border: 1px solid rgba(255, 255, 255, 0.1);
   box-shadow: 0 30px 60px rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(32px);
-  -webkit-backdrop-filter: blur(32px);
   overflow: hidden;
   display: flex;
   flex-direction: column;

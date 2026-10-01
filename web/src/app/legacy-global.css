@@ -279,13 +279,6 @@ ul {
   }
 }
 
-.mica {
-  background-color: var(--glass-bg);
-  backdrop-filter: blur(32px) saturate(220%);
-  -webkit-backdrop-filter: blur(32px) saturate(220%);
-  border: 1px solid var(--glass-border);
-}
-
 .fluent-card {
   background-color: var(--bg-secondary);
   border: 1px solid var(--border);

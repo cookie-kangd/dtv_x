@@ -74,8 +74,37 @@ const STALL_STUCK_MS = 12000;
 // await 永不返回），就再也没有人来推进下一次重连，且看门狗也会因为
 // loading=true / video 不存在而躺平 —— 表现就是「转圈转到天荒地老」。
 // 因此必须由一个独立于播放器生命周期的心跳来巡检重连是否还在推进。
-const RELOAD_HARD_TIMEOUT_MS = 45000; // 单次取流/重建超过此时长一律视为挂死
+// 单次取流/重建超过此时长一律视为挂死。
+// 20s 而非 45s：正常重建（停弹幕→停代理→取流→mount）只要几秒，
+// 45s 的观感就是「转圈转到天荒地老」，用户根本等不到看门狗来救就已经去手动刷新了。
+const RELOAD_HARD_TIMEOUT_MS = 20000;
 const RECONNECT_STALL_MS = 30000; // 重连链条停滞（无定时器也无取流）超过此时长即强制补一次
+
+// 单个 Rust invoke 的兜底超时：绝不能让一个永不返回的 invoke 把整条重连链钉死。
+// 停止类命令是幂等的，超时后继续往下走是安全的（下次重连会再停一次）。
+const INVOKE_TIMEOUT_MS = 4000;
+
+/**
+ * 给单个 invoke 套超时兜底。
+ * 背景：一次自动重连要串行 await 十几个 Rust 命令（停弹幕×5、停代理×2、取流、起弹幕…），
+ * 只要其中任何一个永不返回，reloadInFlightRef 就被永久钉在 true，
+ * 之后每次重连都被 in-flight 守卫挡下、只记一个「补偿调度」而永远等不到补偿
+ * —— 用户看到的就是「一直黑屏转圈，手动点刷新才好」。
+ * 注意：这里只让 await 不再阻塞，不取消底层调用；停止类命令幂等，重复执行无害。
+ */
+const invokeWithTimeout = async <T,>(promise: Promise<T>, label: string): Promise<T> => {
+  let timer: number | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error(`${label} 超时`)), INVOKE_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
+  }
+};
 
 const PLAYER_DRAG_EXCLUDED_SELECTOR = [
   // App chrome / topbar (主播信息栏 & 关闭/关注按钮等)
@@ -1020,45 +1049,31 @@ export function MainPlayer({
 
   const stopAllDanmakuBackends = useCallback(async () => {
     // Business rule: only one room at a time. Stopping all backends is the safest way to avoid cross-platform leaks.
-    try {
-      await invoke("stop_danmaku_listener", { roomId: "" });
-    } catch {
-      // ignore
-    }
-    try {
-      await invoke("stop_douyin_danmu_listener");
-    } catch {
-      // ignore
-    }
-    try {
-      await invoke("stop_huya_danmaku_listener", { roomId: "" });
-    } catch {
-      // ignore
-    }
-    try {
-      await invoke("stop_bilibili_danmaku_listener");
-    } catch {
-      // ignore
-    }
-    try {
-      await invoke("stop_twitch_danmaku_listener", { roomId: "" });
-    } catch {
-      // ignore
-    }
+    //
+    // ★ 并行 + 逐个超时兜底（原来是串行 await 五个）：
+    //   这五个 stop 互不依赖，串行执行时耗时累加（每个几百 ms 就很可观），
+    //   更糟的是任何一个挂住就会把整条重连链钉死。改成 Promise.all 后总耗时
+    //   取决于最慢的那一个，且每个都有独立超时上限。
+    await Promise.all(
+      [
+        invokeWithTimeout(invoke("stop_danmaku_listener", { roomId: "" }), "stop_danmaku_listener"),
+        invokeWithTimeout(invoke("stop_douyin_danmu_listener"), "stop_douyin_danmu_listener"),
+        invokeWithTimeout(invoke("stop_huya_danmaku_listener", { roomId: "" }), "stop_huya_danmaku_listener"),
+        invokeWithTimeout(invoke("stop_bilibili_danmaku_listener"), "stop_bilibili_danmaku_listener"),
+        invokeWithTimeout(invoke("stop_twitch_danmaku_listener", { roomId: "" }), "stop_twitch_danmaku_listener")
+      ].map((p) => p.catch(() => undefined))
+    );
   }, []);
 
   const stopAllProxies = useCallback(async () => {
     // Only one room at a time; stop both to avoid "switch platform" leaks.
-    try {
-      await stopDouyuProxy();
-    } catch {
-      // ignore
-    }
-    try {
-      await stopHuyaProxy();
-    } catch {
-      // ignore
-    }
+    // 同上：并行 + 超时兜底，避免停代理挂住整条重连链。
+    await Promise.all(
+      [
+        invokeWithTimeout(stopDouyuProxy(), "stopDouyuProxy"),
+        invokeWithTimeout(stopHuyaProxy(), "stopHuyaProxy")
+      ].map((p) => p.catch(() => undefined))
+    );
   }, []);
 
   const startDanmaku = useCallback(
@@ -1512,17 +1527,36 @@ export function MainPlayer({
       opts?: { isAutoReconnect?: boolean }
     ) => {
       if (reloadInFlightRef.current) {
+        // 上一次取流是否已经明显挂死（远超正常耗时却仍未收尾）
+        const hung =
+          reloadStartedAtRef.current > 0 &&
+          Date.now() - reloadStartedAtRef.current > RELOAD_HARD_TIMEOUT_MS;
+
         if (opts?.isAutoReconnect) {
-          // 取流中：记下这次重连请求，等本次取流结束后补偿调度（不能丢弃，见 scheduleReconnect 注释）
-          reconnectDeferredRef.current = true;
-          return;
+          if (hung) {
+            // ★ 自动重连的「自抢占」。
+            //   上一次取流若已挂死，它自己永远走不到 finally，也就永远没人去消费
+            //   reconnectDeferredRef —— 旧实现在这里只是记一个标记就 return，
+            //   重连链条当场断裂，只能干等看门狗的硬超时来救（期间画面就是一直转圈）。
+            //   既然已经确认挂死，就直接抢占，让自动重连也能立刻自救。
+            console.warn("[Player] 上次取流已挂死，自动重连强制抢占");
+            reloadInFlightRef.current = false;
+            pendingReloadRef.current = null;
+            // 作废旧会话：避免它稍后「回魂」时把新会话的锁和 loading 误清掉
+            activeSessionIdRef.current = ++sessionSeqRef.current;
+          } else {
+            // 取流中：记下这次重连请求，等本次取流结束后补偿调度（不能丢弃，见 scheduleReconnect 注释）
+            reconnectDeferredRef.current = true;
+            return;
+          }
+        } else {
+          // 用户手动操作（点刷新 / 切画质 / 切线路）必须**抢占**：
+          // 否则一旦某次自动重连的 await 挂死，in-flight 守卫会把用户的手动重载
+          // 也一起挡在门外（塞进 pending 而永不消费），用户就只能干看着转圈。
+          console.warn("[Player] 用户手动重载抢占进行中的取流会话");
+          reloadInFlightRef.current = false;
+          pendingReloadRef.current = null;
         }
-        // 用户手动操作（点刷新 / 切画质 / 切线路）必须**抢占**：
-        // 否则一旦某次自动重连的 await 挂死，in-flight 守卫会把用户的手动重载
-        // 也一起挡在门外（塞进 pending 而永不消费），用户就只能干看着转圈。
-        console.warn("[Player] 用户手动重载抢占进行中的取流会话");
-        reloadInFlightRef.current = false;
-        pendingReloadRef.current = null;
       }
       reloadInFlightRef.current = true;
       reloadStartedAtRef.current = Date.now();
@@ -1562,7 +1596,19 @@ export function MainPlayer({
       //   提前销毁后，下面各平台的 canSoftSwitch 判定必然为 false，统一走 mountPlayer 全量重建。
       if (opts?.isAutoReconnect) {
         autoReconnectModeRef.current = true; // 让 destroyPlayer 保留全屏态
-        destroyPlayer();
+        // ★ 第一次重连刻意走与「手动点刷新」完全相同的路径 —— 能软切换就软切换。
+        //
+        //   这是本轮修复的核心。手动刷新是用户反复验证有效的路径，它走的是
+        //   player.switchURL()；而之前的自动重连每次都强制 destroyPlayer() + mountPlayer()
+        //   彻底重建，等于把已验证有效的那条路主动排除在外，于是出现
+        //   「自动重连一直黑屏转圈、手动点一下刷新立刻就好」的怪象。
+        //
+        //   只有连续失败（第 2 次起）才升级为彻底重建，用它兜住另一种情况：
+        //   重取到的流地址与旧地址字符串完全相同，内核会把 switchURL 当成空操作
+        //   （既不报错也不播放），这时必须重建才行。
+        if (reconnectAttemptRef.current >= 2) {
+          destroyPlayer();
+        }
       }
 
       const effectiveQuality = overrides?.quality ?? currentQuality;
