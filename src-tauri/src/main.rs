@@ -285,13 +285,11 @@ fn main() {
                     .items(&[&show_item, &quit_item])
                     .build()?;
 
-                // default_window_icon() 返回的是借用，这里复制成自有数据，避免生命周期问题
-                let tray = match app.default_window_icon() {
-                    Some(icon) => TrayIconBuilder::with_id("main").icon(
-                        tauri::image::Image::new(icon.rgba().to_vec(), icon.width(), icon.height())
-                    ),
-                    None => TrayIconBuilder::with_id("main"),
-                };
+                // 托盘图标：用 include_image! 把 PNG 字节编进二进制，得到 Image<'static>。
+                // 注意不能用 app.default_window_icon() —— 它返回的是借用，
+                // 而 Image::new(rgba: &'a [u8], ..) 也只接受借用，凑不出 'static。
+                let tray = TrayIconBuilder::with_id("main")
+                    .icon(tauri::include_image!("icons/32x32.png"));
 
                 let _ = tray
                     .tooltip("DTV_X")
