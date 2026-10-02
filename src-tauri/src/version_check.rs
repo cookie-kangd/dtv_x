@@ -393,8 +393,11 @@ async fn launch_installer(app: &AppHandle, path: &std::path::Path) -> Result<(),
 
     match launch_installer_detached(path) {
         Ok(_) => {
-            // 立即退出，释放 dtv_x.exe 自身占用，让安装向导可以直接覆盖安装
-            app.exit(0);
+            // 立即退出，释放 dtv_x.exe 自身占用，让安装向导可以直接覆盖安装。
+            // 走和托盘「退出」完全相同的路径：置QUITTING + 停所有后台任务 + 关所有窗口。
+            // 原来这里直接 app.exit(0)，QUITTING 还是 false，
+            // 万一退出过程中触发窗口事件，会误走「隐藏到托盘」分支。
+            crate::really_quit(app);
             Ok(())
         }
         Err(e) => {

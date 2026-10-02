@@ -43,8 +43,16 @@ pub struct AuthMessage {
 
 impl AuthMessage {
     pub fn from(map: &HashMap<String, String>) -> AuthMessage {
+        // uid 来自 Cookie 里的 mid，正常是数字，但风控/异常响应时可能返回非数字。
+        // 原来的 parse().unwrap() 会 panic —— 虽被弹幕线程的 catch_unwind 兜住不至于崩应用，
+        // 后果是「B站弹幕静默失效 + 每 60s 重试刷日志」，很难排查。
+        // uid 缺失或非法时退回 0（项目里 init_server_no_cookie 本来就传 "0"），不阻断连接。
+        let uid = map
+            .get("uid")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         AuthMessage {
-            uid: map.get("uid").unwrap().parse::<u64>().unwrap(),
+            uid,
             roomid: map.get("room_id").unwrap().parse::<u64>().unwrap(),
             protover: 3,
             platform: "web".to_string(),

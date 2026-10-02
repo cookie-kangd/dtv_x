@@ -35,10 +35,13 @@ pub async fn fetch_douyu_room_info(
     );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     headers.insert("Pragma", HeaderValue::from_static("no-cache"));
-    headers.insert(
-        "Referer",
-        HeaderValue::from_str(&format!("https://www.douyu.com/{}", room_id)).unwrap(),
-    );
+    // room_id 来自前端 invoke，属于用户可控输入：若含非 ASCII 字符或换行，
+    // HeaderValue::from_str 会返回 Err，原来的 unwrap() 直接 panic。
+    // 这里用 ? 把它变成一条可读的普通错误，而不是让 IPC 任务以不可解释的方式失败。
+    let referer = format!("https://www.douyu.com/{}", room_id);
+    let referer_value = HeaderValue::from_str(&referer)
+        .map_err(|_| format!("房间号非法（不能含非 ASCII 字符或换行）：{}", room_id))?;
+    headers.insert("Referer", referer_value);
     headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"));
 
     let response_result = follow_http

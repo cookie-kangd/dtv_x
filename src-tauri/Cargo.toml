@@ -1,6 +1,6 @@
 [package]
 name = "dtv_x"
-version = "0.2.6"
+version = "0.2.7"
 description = "DTV X - Live Stream Client"
 authors = ["cookie-kangd"]
 edition = "2021"
@@ -23,6 +23,10 @@ prost-build = "0.12"
 # image-png / image-ico：让 tauri 能解码打包图标，default_window_icon() 才有值、托盘才有图标
 tauri = { version = "2.12.0", features = ["macos-private-api", "tray-icon", "image-png", "image-ico"] }
 tauri-plugin-opener = "2.6.0"
+# 单实例互斥：同一个 exe 只允许一个进程在跑。
+# 没有它时，窗口关到托盘后再次双击快捷方式会开出第二个 DTV_X：
+# 两份弹幕监听 + 两个静态图片代理（端口相同会AddrInUse）+ 两套 WebView2，内存直接翻倍。
+tauri-plugin-single-instance = "2.5.2"
 tauri-plugin-window-state = "2"
 window-vibrancy = "0.7.1"
  serde = { version = "1.0", features = ["derive"] }

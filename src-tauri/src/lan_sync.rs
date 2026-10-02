@@ -369,6 +369,32 @@ async fn stop_running(running: RunningLanSync) {
     }
 }
 
+/// 同步停止局域网同步服务（应用退出时用）。
+///
+/// 与 `stop_running` 的区别：不 await `handle.stop(true)`。
+/// 退出流程（`really_quit`）是同步路径，不能 await；而 mDNS 注销与 shutdown
+/// 本身是同步的，actix 的优雅停服交给进程退出兜底即可——
+/// 关键是别让 mDNS 继续对外广播「本机可用」，否则退出瞬间局域网里
+/// 还能扫到一个实际已经关掉的同步服务。
+pub fn stop_now(state: &LanSyncServerState) {
+    let taken = state.0.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(running) = taken {
+        // actix 的 stop(true) 返回 future，这里不等待：进程退出会一并回收。
+        // 仅做 mDNS 的显式注销，这是退出干净度真正需要的部分。
+        // 注意拆开取，避免部分移动后再用整个 running。
+        let mdns = running.mdns;
+        let handle = running.handle;
+        if let Some(mdns) = mdns {
+            let _ = mdns.daemon.unregister(&mdns.fullname);
+            let _ = mdns.daemon.shutdown();
+        }
+        // 触发异步优雅停服，不阻塞当前线程
+        tauri::async_runtime::spawn(async move {
+            handle.stop(true).await;
+        });
+    }
+}
+
 #[tauri::command]
 pub async fn lan_sync_start_server(
     payload: LanSyncPayload,

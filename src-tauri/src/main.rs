@@ -211,14 +211,39 @@ fn shutdown_background_tasks(app: &tauri::AppHandle) {
             handle.stop(false);
         }
     }
+
+    // 局域网同步服务：显式注销 mDNS，避免退出瞬间还在对外广播
+    // 「本机可同步」——实际上服务已经没了，扫到的是个连不上的空壳。
+    if let Some(state) = app.try_state::<lan_sync::LanSyncServerState>() {
+        lan_sync::stop_now(&state);
+    }
 }
 
 /// 已经决定真正退出：此时关闭窗口不再走「最小化到托盘」，必须真关。
-static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// pub(crate)：version_check 在安装器启动成功后也要走同一条退出路径，
+/// 否则那里 app.exit(0) 时 QUITTING仍是 false，窗口事件会误走 hide 分支。
+pub(crate) static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 真正的退出：关掉所有窗口（含 B站登录等子窗口，否则它们会拖住退出流程、
+/// 把主窗口唤到前台。托盘左键、托盘菜单「显示」、以及「再次双击快捷方式」
+/// 三处都要用同一套动作，缺任何一步都会出现「点了没反应」的情况：
+/// - show：窗口可能被关到托盘隐藏了，必须先显示
+/// - unminimize：窗口可能处于最小化状态，show 之后仍是最小化态，需要还原
+/// - set_focus：显示出来不一定拿到焦点（尤其从托盘唤起时）
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        // 通知前端：窗口已回到前台，可以恢复播放（与 main-window-hidden 成对）。
+        // 注意必须放在 show 之后：前端收到就play，此时窗口已可见，autoplay 才不会被拦。
+        let _ = app.emit("main-window-shown", ());
+    }
+}
+
+/// 真正的退出：关掉所有窗口（含B站登录等子窗口，否则它们会拖住退出流程、
 /// 留下「关了主窗口却还剩一个画面在跑」的残留进程），再退出应用。
-fn really_quit(app: &tauri::AppHandle) {
+/// pub(crate)：version_check 的「安装器已启动 → 退出」也复用它，保证退出行为一致。
+pub(crate) fn really_quit(app: &tauri::AppHandle) {
     QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
     shutdown_background_tasks(app);
     for (_label, window) in app.webview_windows() {
@@ -257,6 +282,13 @@ fn main() {
     tauri::Builder::default()
             .plugin(tauri_plugin_os::init())
             .plugin(tauri_plugin_opener::init())
+            // 单实例互斥：必须注册在靠前的位置。
+            // 第二次启动时本进程不会走到 run()，而是把参数交给已有实例后立刻退出，
+            // 所以不存在「开出第二个窗口 / 起第二套弹幕与代理」的问题。
+            // 这里唤起已有窗口，才能做到「双击快捷方式 = 把托盘里的窗口叫回来」。
+            .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+                show_main_window(app);
+            }))
             .plugin(tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
                     tauri_plugin_window_state::StateFlags::SIZE
@@ -297,13 +329,7 @@ fn main() {
                     // 左键单击 = 直接唤出窗口；右键才弹菜单
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id().as_ref() {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.unminimize();
-                                let _ = window.set_focus();
-                            }
-                        }
+                        "show" => show_main_window(app),
                         "quit" => really_quit(app),
                         _ => {}
                     })
@@ -314,12 +340,7 @@ fn main() {
                             ..
                         } = event
                         {
-                            let app = tray.app_handle();
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.unminimize();
-                                let _ = window.set_focus();
-                            }
+                            show_main_window(tray.app_handle());
                         }
                     })
                     .build(app);
@@ -341,6 +362,12 @@ fn main() {
                                 let _ = child.close();
                             }
                         }
+                        // 通知前端：窗口已隐藏，请暂停播放并停掉弹幕/代理。
+                        // 为什么必须用 Rust 事件而不是前端 document.visibilityState：
+                        // Tauri 的 hide() 只是隐藏窗口，WebView2 页面仍是 active，
+                        // 不保证触发 visibilitychange —— 那样关窗后 <video> 会继续解码、
+                        // 弹幕 WebSocket 继续收发、本地代理继续转发，白白吃流量和 CPU。
+                        let _ = window.app_handle().emit("main-window-hidden", ());
                         let _ = window.hide();
                         api.prevent_close();
                     }

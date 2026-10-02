@@ -1,112 +1,128 @@
-# DTV_X v0.2.6 更新内容
+# DTV_X v0.2.7 更新内容
 
-本版修掉一个从 v0.2.3 一直潜伏、靠手动刷新也救不回来的故障，并做了一轮资源占用清理。
+本版修掉一个「关窗口到托盘之后资源全在后台空跑」的问题，同时补上一个真实的崩溃风险点。
 
-> **关注列表的「自动刷新」失效了：状态永远不更新，点刷新也没反应。**
+> **点右上角 X 关到托盘后，再双击快捷方式会开出第二个 DTV_X。**
 
-## 🐛 关注列表自动刷新：互斥锁被永久钉死
+## 🚫 单实例互斥：同一个 exe 只允许跑一个进程
 
-### 症状
+### 确认了：之前**根本没有**单实例机制
 
-- 到点了不刷新，直播中 / 已下播状态一直不变
-- **手动点刷新按钮也没用**——这是最迷惑的地方，因为按钮明明有响应动画
+代码里有一行注释写着「This backend is single-instance」——但那只是**一句自我声明**，
+项目里没有任何实现它的东西。该注释描述的是「业务上只处理一个房间」，
+和「操作系统层面只允许一个进程」是两回事，被混为一谈了。
 
-### 根因
+### 为什么关到托盘后才暴露
 
-刷新函数 `refreshList` 开头有一行互斥判断：
+平时双击快捷方式时，第二次启动会开出第二个窗口，用户一眼就能看到。
+但点X 关到托盘后，第一个进程**还活着**（这是设计如此），这时候再双击：
+用户以为在「重新打开」，实际是**开出了第二个进程**。于是：
 
-```ts
-if (isRefreshingRef.current) return;   // 正在刷新就跳过
-```
+- 两套 WebView2 同时跑，内存直接翻倍
+- 两套弹幕 WebSocket 同时连着同一个直播间
+- 两个本地图片代理抢同一个固定端口（34721），第二个会 `AddrInUse`
+- 托盘图标出现两个，退出时容易只关掉一个，另一个变成找不到窗口的残留进程
 
-这一行本身是对的（防止定时轮询和手动点击并发刷新）。问题出在**锁的释放只挂在 `finally` 上**：
+### 改法
 
-```ts
-isRefreshingRef.current = true;
-try {
-  await Promise.all(workers);   // ← 这里逐个 await invoke(...)
-} finally {
-  isRefreshingRef.current = false;
+引入官方插件 `tauri-plugin-single-instance`。它的机制是：
+
+- 第一个实例正常启动，拿到一个系统级的命名互斥体（Windows 上是命名互斥体）
+- 第二个实例启动时**不会走到 `run()`**，而是把命令行参数交给第一个实例后**立即退出**
+- 所以不存在「第二个窗口」「第二套弹幕与代理」的可能，从根上避免
+
+同时把唤起逻辑合并成一个 `show_main_window()`，三处共用（托盘左键、托盘菜单「显示」、
+再次双击快捷方式）——这三处原本是三份重复代码，且都少了必要步骤：
+
+```rust
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();      // 窗口可能被关到托盘隐藏了
+        let _ = window.unminimize();// show 之后可能仍是最小化态
+        let _ = window.set_focus();  // 显示出来不一定拿到焦点
+        let _ = app.emit("main-window-shown", ());
+    }
 }
 ```
 
-只要**任何一个**主播的 `invoke` 永不返回，这个 `await` 就永远不结束，`finally` 永远不执行，锁就永久停在 `true`。
+**现在双击快捷方式的正确行为是：把托盘里那个窗口叫回前台，而不是开一个新的。**
 
-从此以后：定时轮询每次进来都被第一行挡回去，手动刷新也被挡回去——**所有刷新路径同时失效**，而 UI 上没有任何提示。
+## 🛑 关窗口到托盘后，播放/弹幕/代理不再空跑
 
-### 为什么会卡死不返回
+### 这是本版最大的实际收益
 
-这是本版 Rust 侧修复的根因。项目里大部分 HTTP 请求都设了整体超时，但有 **10 处 `reqwest::Client::builder()` 只写了 `connect_timeout`、漏了 `.timeout()`**：
+之前点 X 关到托盘，只是窗口被隐藏了，**该跑的东西一样没停**：
+
+| 项目 | 状态 |
+|---|---|
+| `<video>` 解码 | 继续拉流、继续解码 |
+| 5 个弹幕 WebSocket | 继续收发（斗鱼/虎牙/B站/抖音/Twitch） |
+| actix 本地代理 | 继续转发 `/live.flv` |
+| 卡死看门狗 | 3秒一次继续空转 |
+
+也就是说**你以为关掉了，但它在后台继续吃流量和 CPU**。
+
+### 为什么前端自己发现不了
+
+前端原本只监听 `document.visibilityState`。但 **Tauri 的 `hide()` 只是隐藏窗口，
+WebView2 页面仍是 active 状态，不保证触发 `visibilitychange`**。所以这条兜底形同虚设。
+
+### 改法：由 Rust 显式发事件
+
+在 `on_window_event` 的隐藏分支里 emit `main-window-hidden`，
+前端收到后暂停视频、停掉全部弹幕后端与代理；唤起时 emit `main-window-shown` 恢复播放。
+
+```ts
+listen("main-window-hidden", () => {
+  video.pause();
+  void stopAllDanmakuBackends();
+  void stopAllProxies();
+});
+```
+
+**注意只「暂停」而不销毁播放器**：窗口可能只是临时切到托盘，保住会话能瞬间恢复播放，
+不必重新取流（省一次请求，也避免重新取流失败后又黑屏）。
+
+停弹幕/代理那两个函数本身就是并行 + 逐个 4 秒超时兜底的（v0.2.5 改过），
+所以即使后端某个停止命令卡住，也不会拖住这条链路。
+
+## 💥 修掉一个真实的 panic 风险
+
+`fetch_douyu_room_info.rs` 里构造 Referer 请求头时：
 
 ```rust
 // 改之前
-reqwest::Client::builder()
-    .connect_timeout(Duration::from_secs(15))   // 只管 TCP/TLS 握手
-    .no_proxy()
-    .build()
+HeaderValue::from_str(&format!("https://www.douyu.com/{}", room_id)).unwrap(),
 ```
 
-`connect_timeout` **只管连接建立阶段**。一旦连上了，响应体可以无限期挂住——弱网环境下对端「只收不发」（不返回数据也不断连）就能让这个请求永久占着。
-
-### 本次改法：两层都堵上
-
-**第一层 · Rust 侧补齐整体超时（10 处）**
-
-所有漏掉的 client 补上 `.timeout(30s)`，覆盖 B站取流 / 列表 / 搜索 / wbi、斗鱼列表与分类、虎牙搜索与弹幕取参数：
+`room_id` 来自前端 `invoke`，是**用户可控的任意字符串**。只要它含非 ASCII 字符或换行，
+`HeaderValue::from_str` 就返回 `Err`，`unwrap()` 直接 panic——把「用户输入了一个非法房间号」
+变成一个不可解释的失败。现已改为正常传播错误：
 
 ```rust
-reqwest::Client::builder()
-    .connect_timeout(Duration::from_secs(15))
-    .timeout(Duration::from_secs(30))   // 新增：整体上限
-    .no_proxy()
-    .build()
+let referer = format!("https://www.douyu.com/{}", room_id);
+let referer_value = HeaderValue::from_str(&referer)
+    .map_err(|_| format!("房间号非法（不能含非 ASCII 字符或换行）：{}", room_id))?;
+headers.insert("Referer", referer_value);
 ```
 
-其中 `bilibili/stream_url.rs` 这一处最关键——它是**每次重连都要调**的取流接口。原先每次重连都可能留下一个悬挂请求，切房间或反复重连后 socket 与内存会单调增长。
+## 🧹 另外三处清理
 
-**第二层 · 前端超时兜底（不依赖后端）**
+**B站弹幕 uid 解析不再 panic**：`uid` 来自 Cookie 里的 `mid`，正常是数字，
+但风控/异常响应时可能返回非数字。原来的 `parse().unwrap()` panic 虽被弹幕线程的
+`catch_unwind` 兜住不至于崩应用，后果却是「B站弹幕静默失效 + 每 60 秒重试刷一次日志」——
+极难排查。现已改为 `unwrap_or(0)`（项目里本来就有传 `"0"` 的先例）。
 
-光靠后端不够：网络栈、代理、系统休眠都可能让 invoke 迟迟不回。所以前端也自己加了一层：
+**统一退出路径**：更新器安装完成后原本直接 `app.exit(0)`，此时 `QUITTING` 仍是 `false`，
+万一退出过程中触发窗口事件会误走「隐藏到托盘」分支。现在改为和托盘「退出」走同一个
+`really_quit()`：置 `QUITTING` + 停全部后台任务 + 关所有窗口。
 
-- 新增 `invokeWithTimeout()`，单个主播状态查询最多等 20 秒
-- `refreshOne` 里 5 处 `invoke` 全部改用它
-- `refreshList` 加**总闸定时器**：按本轮实际主播数推算上限（每个 20s ÷ 并发 2 + 15s 余量），到点强制释放锁
-- `finally` 里补上卸载检查，组件已卸载就不再 setState
-
-这样即使后端再出现新的挂死路径，**刷新功能也不会被彻底锁死**——最坏情况是这一轮状态没更新，下一轮照样能进。
-
-## 🎨 资源占用清理
-
-这一轮扫了全项目的 CSS 合成成本、定时器 / 监听器泄漏和后端常驻任务，处理了以下几项：
-
-**光主题下关掉两处纯浪费的毛玻璃**
-
-判据很简单：**背景 alpha ≥ 0.9（不透明）时，`backdrop-filter` 必然不可见**。
-
-- `.navbar`：光主题下背景被覆盖成不透明的 `#f8fafc`，但仍挂着 `blur(28px) saturate(220%)`。而 navbar 是 `position: sticky`，**页面滚动时逐帧重算**——全站最贵的一处浪费
-- `.syncBtnGlass.primaryBtn`：光主题下被不透明渐变盖住，模糊同样看不见
-
-**去掉三处 `will-change: height`**
-
-`height` 是 layout 属性，Chromium 无法把它提升为合成层动画。写 `will-change: height` 的效果是「提前触发重排」——**只有副作用，没有收益**，还白白创建常驻合成层。已改为 `will-change: transform, opacity`。
-
-这三处是列表里**每一行都存在**的元素（跟随鼠标移动的高亮条），等于给 N 行常驻图层。
-
-**`transition: all` 改为显式列出属性**
-
-播放器控制条同时带 `backdrop-filter: blur(16px)`，而 `transition: all` 会把模糊也纳入过渡范围——鼠标每次进出 hover 都会触发一串高斯模糊重算。已改为只过渡 `background-color` 和 `border-color`。
-
-## 🔍 顺带说明：确认无需修的项
-
-这轮也排查了一批看着可疑但实际没问题的代码，列出来免得以后重复排查：
-
-- **弹幕数组有 200 条硬上限**（抖音 / 虎牙 / B站）——不是无界增长
-- **所有弹幕长连接都有停止信号 + 退避上限 30s**——退出时能正确打断
-- **播放器卸载清理完整**（销毁播放器、停看门狗、停 5 个弹幕后端、停 2 个代理，全部带 4 秒超时）
-- **`useEffect` 早退没有漏清理**——定时器创建都在 early return 之后
-- **所有 `void invoke()` 都接了 catch**，无 unhandled rejection
+**退出时注销 mDNS**：`shutdown_background_tasks` 之前只停了弹幕和本地代理，
+漏了局域网同步服务。结果是退出瞬间mDNS 还在对外广播「本机可同步」，
+而服务其实已经没了，扫到的是个连不上的空壳。现在退出时显式 `unregister` + `shutdown`。
 
 ## 说明
 
-- 从 **v0.2.5 可以直接应用内一键更新**
-- 本版没有改动任何播放 / 弹幕逻辑，只影响「关注列表状态刷新」与界面渲染开销
+- 从 **v0.2.6 可以直接应用内一键更新**
+- 本版涉及窗口生命周期，如果你习惯「关到托盘后继续听声音」，请注意：
+  现在关窗会**暂停播放并断开弹幕**，重新点开窗口会**自动恢复播放**

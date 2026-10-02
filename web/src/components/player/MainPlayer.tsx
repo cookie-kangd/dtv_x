@@ -987,6 +987,7 @@ export function MainPlayer({
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
 
+
   const destroyPlayer = useCallback(() => {
     // 切房间/切画质/销毁时，停掉挂起的自动重连定时器，
     // 避免旧会话的定时器在新会话里误触发一次重连。
@@ -1075,6 +1076,64 @@ export function MainPlayer({
       ].map((p) => p.catch(() => undefined))
     );
   }, []);
+
+  // 窗口被关到托盘（Rust 侧 hide）时暂停播放并停掉弹幕/代理；重新唤起时恢复。
+  //
+  // 为什么不能只靠上面的 visibilitychange：
+  // Tauri 的 hide() 只是隐藏窗口，WebView2 页面仍是 active，不保证触发 visibilitychange。
+  // 结果是关窗后 <video> 继续解码、5 个弹幕 WebSocket 继续收发、本地代理继续转发 /live.flv，
+  // 白白吃流量和 CPU，而且用户以为已经关掉了。必须由 Rust 显式发事件。
+  //
+  // 这里只「暂停」而不 destroyPlayer：窗口可能只是临时切到托盘，保住会话能瞬间恢复。
+  useEffect(() => {
+    let unlistenHidden: (() => void) | null = null;
+    let unlistenShown: (() => void) | null = null;
+    let disposed = false;
+
+    const setup = async () => {
+      try {
+        const un1 = await listen("main-window-hidden", () => {
+          if (disposed) return;
+          try {
+            const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
+            if (video) video.pause();
+          } catch {
+            // ignore
+          }
+          // 弹幕与代理在后台纯浪费：弹幕是长连接、代理在转发直播流。
+          void stopAllDanmakuBackends();
+          void stopAllProxies();
+        });
+        const un2 = await listen("main-window-shown", () => {
+          if (disposed) return;
+          try {
+            const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
+            if (video && video.paused && !video.ended && video.readyState > 0) {
+              void video.play().catch(() => {});
+            }
+          } catch {
+            // ignore
+          }
+        });
+        if (disposed) {
+          un1();
+          un2();
+          return;
+        }
+        unlistenHidden = un1;
+        unlistenShown = un2;
+      } catch {
+        // 非 tauri 环境：忽略
+      }
+    };
+    void setup();
+
+    return () => {
+      disposed = true;
+      try { unlistenHidden?.(); } catch { /* ignore */ }
+      try { unlistenShown?.(); } catch { /* ignore */ }
+    };
+  }, [stopAllDanmakuBackends, stopAllProxies]);
 
   const startDanmaku = useCallback(
     async (
