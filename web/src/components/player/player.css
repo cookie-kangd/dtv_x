@@ -121,7 +121,9 @@
   border-radius: 18px;
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
-  transition: all 0.3s ease;
+  /* 不用 transition: all —— 本元素带 backdrop-filter，hover 时若把模糊也纳入过渡，
+     会每帧重算高斯模糊（hover 是鼠标高频进出区域）。显式列出实际要变的属性。 */
+  transition: background-color 0.3s ease, border-color 0.3s ease;
   box-shadow: 0 4px 12px rgba(139, 92, 246, 0.1);
 }
 

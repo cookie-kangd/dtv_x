@@ -27,6 +27,10 @@ async fn fetch_huya_ids(room_id: &str) -> Result<(i64, i64), String> {
     let client = reqwest::Client::builder()
         .http1_only()
         .connect_timeout(Duration::from_secs(15))
+        // connect_timeout 只管 TCP/TLS 握手；连上之后响应体可以无限期挂住。
+        // 弱网下对端只收不发就会永久占用这个请求（看门狗作废会话后重取流会不断堆叠），
+        // 所以这里必须补上整体 timeout。
+        .timeout(Duration::from_secs(30))
         .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
@@ -364,6 +368,10 @@ async fn get_ws_info_tars(room_id_or_url: &str) -> Result<(String, Vec<u8>), Str
     let client = reqwest::Client::builder()
         .http1_only()
         .connect_timeout(Duration::from_secs(15))
+        // connect_timeout 只管 TCP/TLS 握手；连上之后响应体可以无限期挂住。
+        // 弱网下对端只收不发就会永久占用这个请求（看门狗作废会话后重取流会不断堆叠），
+        // 所以这里必须补上整体 timeout。
+        .timeout(Duration::from_secs(30))
         .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;

@@ -21,6 +21,10 @@ pub async fn generate_bilibili_w_webid(
         .user_agent(ua)
         .http1_only()
         .connect_timeout(std::time::Duration::from_secs(15))
+        // connect_timeout 只管 TCP/TLS 握手；连上之后响应体可以无限期挂住。
+        // 弱网下对端只收不发就会永久占用这个请求（看门狗作废会话后重取流会不断堆叠），
+        // 所以这里必须补上整体 timeout。
+        .timeout(std::time::Duration::from_secs(30))
         .no_proxy()
         .build()
         .map_err(|e| format!("Failed to build client: {}", e))?;

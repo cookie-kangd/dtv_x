@@ -19,6 +19,36 @@ const REFRESH_INITIAL_DELAY_MS = 1500;
 const DRAG_PREP_DELAY_MS = 150;
 const DRAG_MIN_PX = 8;
 
+// 单个主播状态查询的超时上限。
+// 与 MainPlayer 的 invokeWithTimeout 同一个道理：Rust 侧就算某个请求没设 timeout 而永久挂住，
+// 这里也必须自己兜住，否则 await 永不返回 → refreshList 的 finally 永远走不到 →
+// isRefreshingRef 永久为 true → 之后自动刷新和手动刷新全被挡下（表现为「自动刷新失效」）。
+const REFRESH_ONE_TIMEOUT_MS = 20_000;
+
+function invokeWithTimeout<T>(cmd: string, args?: Record<string, unknown>, timeoutMs = REFRESH_ONE_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${cmd} 超时（${timeoutMs}ms）`));
+    }, timeoutMs);
+    invoke<T>(cmd, args)
+      .then((v) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(v);
+      })
+      .catch((e) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(e);
+      });
+  });
+}
+
 function normalizeFollowKey(key: string) {
   const [p, id] = String(key || "").split(":");
   return `${String(p || "").toUpperCase()}:${String(id || "")}`;
@@ -32,7 +62,7 @@ function normalizeLiveStatus(isLive: boolean | null | undefined): FollowedStream
 
 async function refreshOne(streamer: FollowedStreamer) {
   if (streamer.platform === "DOUYU") {
-    const info = await invoke<any>("fetch_douyu_room_info", { roomId: streamer.id });
+    const info = await invokeWithTimeout<any>("fetch_douyu_room_info", { roomId: streamer.id });
     const showStatus = typeof info?.show_status === "number" ? info.show_status : Number(info?.show_status ?? 0);
     const rawVideoLoop = info?.video_loop ?? info?.videoLoop ?? null;
     const videoLoop =
@@ -55,7 +85,7 @@ async function refreshOne(streamer: FollowedStreamer) {
 
   if (streamer.platform === "HUYA") {
     try {
-      const info = await invoke<any>("get_huya_unified_cmd", { roomId: streamer.id, quality: null, line: null });
+      const info = await invokeWithTimeout<any>("get_huya_unified_cmd", { roomId: streamer.id, quality: null, line: null });
       return {
         nickname: info?.nick ?? streamer.nickname,
         avatarUrl: info?.avatar ?? streamer.avatarUrl,
@@ -74,7 +104,7 @@ async function refreshOne(streamer: FollowedStreamer) {
   if (streamer.platform === "BILIBILI") {
     const payload = { platform: PlatformEnum.BILIBILI, args: { room_id_str: streamer.id } };
     const cookie = typeof localStorage !== "undefined" ? localStorage.getItem("bilibili_cookie") || null : null;
-    const info = await invoke<any>("fetch_bilibili_streamer_info", { payload, cookie });
+    const info = await invokeWithTimeout<any>("fetch_bilibili_streamer_info", { payload, cookie });
     const live = Number(info?.status ?? 0) === 1;
     return {
       nickname: info?.anchor_name ?? streamer.nickname,
@@ -86,7 +116,7 @@ async function refreshOne(streamer: FollowedStreamer) {
 
   if (streamer.platform === "DOUYIN") {
     const payload = { platform: PlatformEnum.DOUYIN, args: { room_id_str: streamer.id } };
-    const info = await invoke<any>("fetch_douyin_streamer_info", { payload });
+    const info = await invokeWithTimeout<any>("fetch_douyin_streamer_info", { payload });
     const status = Number(info?.status ?? 0);
     // Douyin: status === 2 means live (align with player/follow helpers)
     const live = status === 2;
@@ -100,7 +130,7 @@ async function refreshOne(streamer: FollowedStreamer) {
 
   if (streamer.platform === "TWITCH") {
     // Twitch 关注的 id 即频道 login；轻量 GQL 快照，未开播也不报错
-    const info = await invoke<any>("get_twitch_streamer_status", { login: streamer.id });
+    const info = await invokeWithTimeout<any>("get_twitch_streamer_status", { login: streamer.id });
     return {
       nickname: info?.nickname ?? streamer.nickname,
       avatarUrl: info?.avatar ?? streamer.avatarUrl,
@@ -253,6 +283,8 @@ export function FollowsList() {
   // 刷新互斥锁用 ref 而非 state：state 在 useCallback 闭包里会陈旧，
   // 导致定时轮询调用到旧的 isRefreshing 值而误判/死锁。
   const isRefreshingRef = useRef(false);
+  // 组件是否仍挂载：卸载后不再 setState
+  const aliveRef = useRef(true);
 
   const refreshList = useCallback(async () => {
     if (isRefreshingRef.current) return;
@@ -264,6 +296,18 @@ export function FollowsList() {
     setShowCheckIcon(false);
     setProgressTotal(streamers.length);
     setProgressCurrent(0);
+
+    // 总闸：refreshList 内部任何一处抛异常/永不返回，都必须把互斥锁放开。
+    // 锁一旦漏在这里，isRefreshingRef 永久为 true，之后自动刷新和手动刷新都会被
+    // 开头那行「if (isRefreshingRef.current) return;」无声挡下——
+    // 表现就是「自动刷新好像失效了，点刷新也没反应」。
+    // （与 v0.2.5 修的播放器 reloadInFlightRef 泄漏是同一类问题）
+    // 上限按本轮实际主播数推算：每个主播最长 20s、并发 2，再留 15s 余量。
+    const totalCap = Math.ceil(streamers.length / FOLLOW_REFRESH_CONCURRENCY) * REFRESH_ONE_TIMEOUT_MS + 15_000;
+    const releaseLock = () => {
+      isRefreshingRef.current = false;
+    };
+    const watchdog = window.setTimeout(releaseLock, totalCap);
 
     try {
       const concurrency = FOLLOW_REFRESH_CONCURRENCY;
@@ -314,12 +358,24 @@ export function FollowsList() {
 
       follow.updateListOrder([...folderItems, ...liveItems, ...restItems]);
     } finally {
-      isRefreshingRef.current = false;
-      setIsRefreshing(false);
-      setShowCheckIcon(true);
-      window.setTimeout(() => setShowCheckIcon(false), 1000);
+      window.clearTimeout(watchdog);
+      releaseLock();
+      if (aliveRef.current) {
+        setIsRefreshing(false);
+        setShowCheckIcon(true);
+        window.setTimeout(() => setShowCheckIcon(false), 1000);
+      }
     }
   }, [follow]);
+
+  // 组件卸载时：释放锁 + 停止后续 setState
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      isRefreshingRef.current = false;
+    };
+  }, []);
 
   // 轮询始终调用最新版 refreshList，避免闭包里 isRefreshing 陈旧导致并发刷新
   const refreshListRef = useRef(refreshList);

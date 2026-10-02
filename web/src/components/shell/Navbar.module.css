@@ -20,6 +20,12 @@
 
 :global(:root[data-theme="light"]) .navbar {
   background: var(--bg-primary);
+  /* 光主题下背景是完全不透明的 #f8fafc，下层内容一点都透不出来，
+     但 navbar 是 position: sticky，页面滚动时 backdrop-filter 仍会逐帧
+     重算 28px 高斯模糊 + 220% 饱和度 —— 全站最贵的一处纯浪费。
+     不透明背景上 backdrop-filter 必然不可见，所以直接关掉。 */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .navbar:not(.navbarDark) {
@@ -494,6 +500,9 @@
   background: var(--accent-gradient);
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   color: var(--accent-text);
+  /* 同上：光主题下被不透明渐变盖住，模糊不可见，纯浪费 */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .syncBtnGlass.secondaryBtn {
