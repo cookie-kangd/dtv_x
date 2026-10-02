@@ -9,7 +9,9 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+// Emitter：app.emit() 是这个 trait 提供的方法，不是 AppHandle 的固有方法，必须显式导入。
+// （Manager 提供 get_webview_window / try_state 等；两者都要，别只导一个）
+use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 mod logging;
 mod cache_cleaner;
