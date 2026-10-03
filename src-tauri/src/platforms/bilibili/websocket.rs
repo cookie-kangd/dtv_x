@@ -356,20 +356,23 @@ pub fn connect(v: Value) -> Result<WebSocket<TlsStream<TcpStream>>, String> {
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr"))
         })
         .map_err(|e| format!("解析弹幕服务器地址 {url} 失败：{e}"))?;
-    let stream: TcpStream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("连接弹幕服务器 {url} 失败：{e}"))?;
     // ★ 必须设读超时：connect_timeout 只管握手。连接建立后再无任何读超时，
     //   服务端静默不推送时 self.ws.read() 会**永久阻塞**。
     //   而该函数跑在 danmaku.rs 的 std::thread::spawn 里，
     //   线程只在循环顶部检查 stop_flag —— 卡在 read() 上就永远退不出来，
     //   每次换房间都新 spawn 一个 → 线程与 socket 单调累积，进程退出也带不走。
     //   10s 超时后返回 WouldBlock/TimedOut，交给上层重连，线程得以检查 stop_flag 退出。
-    //   注意 set_read_timeout 是 &self 方法（原地生效并返回 &Self），
-    //   所以这里必须逐个调用 —— 链式 .and_then 会因闭包再borrow stream 而无法编译。
-    let stream = stream
+    //
+    //   签名（已核对 std 官方文档）：fn set_read_timeout(&self, Option<Duration>)
+    //       -> Result<(), Error>，set_write_timeout 同形。
+    //   两者都是 &self + 返回 Result<()>，所以**不要**重新赋值给 stream，
+    //   也不需要 mut —— 直接调用后用 ? 处理错误即可。
+    let stream: TcpStream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("连接弹幕服务器 {url} 失败：{e}"))?;
+    stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("设置弹幕 socket 读超时失败：{e}"))?;
-    let stream = stream
+    stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("设置弹幕 socket 写超时失败：{e}"))?;
     let stream: native_tls::TlsStream<TcpStream> = connector
