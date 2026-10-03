@@ -5,11 +5,21 @@ use url::Url;
 // awc removed for now due to API differences; using reqwest streaming
 use crate::StreamUrlStore;
 use serde::Deserialize;
-use std::io::ErrorKind;
-use std::net::TcpStream;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::{AppHandle, State};
+
+/// 本进程已启动的静态图片代理 base URL（如 `http://127.0.0.1:34721`）。
+///
+/// 存在的意义：静态代理的幂等判断**必须**基于「本进程是否启动过它」，
+/// 而不能靠「该端口能否连上」—— 后者会把任意占用该端口的其它进程误认成我们的代理，
+/// 让前端把错误 base 永久缓存、全站图片永久失效且无法自愈。
+static STATIC_PROXY_BASE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+
+fn static_proxy_base_cell() -> &'static StdMutex<Option<String>> {
+    STATIC_PROXY_BASE.get_or_init(|| StdMutex::new(None))
+}
 
 // Define a struct to hold the server handle in a Tauri managed state
 #[derive(Default)]
@@ -20,8 +30,13 @@ const HUYA_HYSDK_UA: &str =
     "HYSDK(Windows,30000002)_APP(pc_exe&7080000&official)_SDK(trans&2.34.0.5795)";
 
 async fn find_free_port() -> u16 {
-    // Using a fixed port as requested by the user for easier debugging
-    34719
+    // ★ 改为「让系统分配」：传 0 让操作系统挑一个当前空闲端口。
+    //   原来这里硬返回 34719，但名字叫 find_free_port 却从不检测占用 ——
+    //   一旦该端口被上次实例的残留 socket 或别的程序占住，bind 直接失败，
+    //   start_proxy 报Err → 前端归类为「取流失败」→ 重连 6 次后彻底放弃，
+    //   用户完全无法播放，而且没有任何补救路径。
+    //   现在由 bind 后从 server.addrs() 取回真实端口，天然免疫端口冲突。
+    0
 }
 
 #[derive(Deserialize)]
@@ -411,10 +426,19 @@ pub async fn start_proxy(
                 .gzip(false)
                 .brotli(false)
                 .no_deflate()
-                .pool_idle_timeout(None)
+                // 池空闲连接要设上限：设为None 会让空闲连接永久驻留，
+                // 长期浏览时白白占用 socket 与内存。
+                .pool_idle_timeout(Some(Duration::from_secs(30)))
                 .pool_max_idle_per_host(4)
                 .tcp_keepalive(Duration::from_secs(60))
-                .timeout(Duration::from_secs(7200))
+                // ★ 这里是「图片」专用 client，绝不能设 7200s（2 小时）。
+                //   图片代理与 FLV/HLS 转发共用同一个 actix HttpServer，
+                //   而 actix 的 worker 数= CPU 核数，是**共享**的。
+                //   列表滚动一次就能并发几十个 /image 请求，只要上游 CDN 挂住，
+                //   每个请求会占住一个 worker 长达 2 小时 —— 几十个就足以耗尽 worker 池，
+                //   /live.flv 与 /hls 跟着一起卡死，表现为「看直播突然整个画面冻住」。
+                //   图片是小资源，20s 拿不到就是失败，重试成本远低于拖垮播放。
+                .timeout(Duration::from_secs(20))
                 .build()
                 .expect("failed to build client"),
         );
@@ -449,8 +473,23 @@ pub async fn start_proxy(
             eprintln!("{}", err_msg);
             return Err(err_msg);
         }
-    }
-    .run();
+    };
+
+    // ★ 取回操作系统实际分配的端口。
+    //   find_free_port 现在传 0 让系统挑端口，所以必须用 addrs() 读回真实值，
+    //   否则 proxy_url 里会带着端口 0，前端拿到 http://127.0.0.1:0/live.flv 直接失效。
+    let bound_port: u16 = server
+        .addrs()
+        .into_iter()
+        .next()
+        .and_then(|addr| addr.as_std().ok())
+        .map(|std_addr| std_addr.port())
+        .ok_or_else(|| {
+            let msg = "[Rust/proxy.rs] 无法获取代理服务器实际绑定的端口".to_string();
+            eprintln!("{}", msg);
+            msg
+        })?;
+    let server = server.run();
 
     let server_handle_for_state = server.handle();
     *server_handle_state.0.lock().unwrap() = Some(server_handle_for_state);
@@ -460,11 +499,11 @@ pub async fn start_proxy(
         if let Err(e) = server.await {
             eprintln!("[Rust/proxy.rs] Proxy server run error: {}", e);
         } else {
-            println!("[Rust/proxy.rs] Proxy server on port {} shut down.", port);
+            println!("[Rust/proxy.rs] Proxy server on port {} shut down.", bound_port);
         }
     });
 
-    let proxy_url = format!("http://127.0.0.1:{}/live.flv", port);
+    let proxy_url = format!("http://127.0.0.1:{}/live.flv", bound_port);
     Ok(proxy_url)
 }
 
@@ -473,73 +512,113 @@ pub async fn start_static_proxy_server(
     _app_handle: AppHandle,
     stream_url_store: State<'_, StreamUrlStore>,
 ) -> Result<String, String> {
-    // Use a dedicated port for static image proxy to avoid interfering with FLV stream proxy
-    let port: u16 = 34721;
+    // Use a dedicated port range for static image proxy to avoid interfering with FLV stream proxy
+    //
+    // ★ 关键修复：原实现「端口能连上就认为代理已启动」，这是个危险的误判。
+    //   34721 被**任何其它进程**占用（或本应用上次异常退出的残留 socket）时，
+    //   这里会返回 http://127.0.0.1:34721，而前端 useImageProxy 会把这个
+    //   错误的 base 永久缓存进模块级变量、此后 early return 永不重试——
+    //   结果是全站封面/头像永久加载失败且无法自愈，只能重启应用。
+    //   现在改成：按候选端口逐个尝试 bind，谁成功用谁；真正的幂等交给
+    //   「本进程是否已启动」这个事实判断，而不是靠端口可连性猜测。
+    const PORT_CANDIDATES: [u16; 8] = [34721, 34722, 34723, 34724, 34725, 34726, 34727, 34728];
 
-    // If the server is already running, just return the base URL (idempotent behavior)
-    if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-        return Ok(format!("http://127.0.0.1:{}", port));
+    // 幂等：只有「本进程确实启动过静态代理」才直接复用。
+    // 端口可连 ≠ 是我们启动的，所以这里必须查自己的记录。
+    if let Some(existing) = static_proxy_base_cell().lock().unwrap().clone() {
+        return Ok(existing);
     }
 
     let stream_url_data_for_actix = web::Data::new(stream_url_store.inner().clone());
 
-    let server = match HttpServer::new(move || {
-        let app_data_stream_url = stream_url_data_for_actix.clone();
-        let app_data_reqwest_client = web::Data::new(
-            Client::builder()
-                .no_proxy()
-                .http1_only()
-                .gzip(false)
-                .brotli(false)
-                .no_deflate()
-                .pool_idle_timeout(None)
-                .pool_max_idle_per_host(4)
-                .tcp_keepalive(Duration::from_secs(60))
-                .timeout(Duration::from_secs(7200))
-                .build()
-                .expect("failed to build client"),
-        );
-        // 走系统代理的客户端（Twitch 等海外平台回源用）
-        let app_data_system_client = web::Data::new(SystemProxyHttpClient(
-            Client::builder()
-                .http1_only()
-                .pool_max_idle_per_host(8)
-                .tcp_keepalive(Duration::from_secs(60))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("failed to build system proxy client"),
-        ));
-        App::new()
-            .app_data(app_data_stream_url)
-            .app_data(app_data_reqwest_client)
-            .app_data(app_data_system_client)
-            .wrap(actix_cors::Cors::permissive())
-            .route("/live.flv", web::get().to(flv_proxy_handler))
-            .route("/image", web::get().to(image_proxy_handler))
-            .route("/hls", web::get().to(hls_proxy_handler))
-    })
-    .keep_alive(Duration::from_secs(120))
-    .bind(("127.0.0.1", port))
-    {
-        Ok(srv) => srv,
-        Err(e) => {
-            // If address already in use, assume server is running and return OK base URL
-            if e.kind() == ErrorKind::AddrInUse {
-                eprintln!(
-                    "[Rust/proxy.rs] Port {} already in use; assuming static proxy running.",
-                    port
-                );
-                return Ok(format!("http://127.0.0.1:{}", port));
-            }
-            let err_msg = format!(
-                "[Rust/proxy.rs] Failed to bind server to port {}: {}",
-                port, e
+    let build_server = |bound_port: u16| {
+        HttpServer::new(move || {
+            let app_data_stream_url = stream_url_data_for_actix.clone();
+            let app_data_reqwest_client = web::Data::new(
+                Client::builder()
+                    .no_proxy()
+                    .http1_only()
+                    .gzip(false)
+                    .brotli(false)
+                    .no_deflate()
+                    // 池空闲连接要设上限：设为 None 会让空闲连接永久驻留，
+                    // 长期浏览时白白占用 socket 与内存。
+                    .pool_idle_timeout(Some(Duration::from_secs(30)))
+                    .pool_max_idle_per_host(4)
+                    .tcp_keepalive(Duration::from_secs(60))
+                    // ★ 这里是「图片」专用 client，绝不能设 7200s（2 小时）。
+                    //   图片代理与 FLV/HLS 转发共用同一个 actix HttpServer，
+                    //   而 actix 的 worker 数 = CPU 核数，是**共享**的。
+                    //   列表滚动一次就能并发几十个 /image 请求，只要上游 CDN 挂住，
+                    //   每个请求会占住一个 worker 长达 2 小时 —— 几十个就足以耗尽
+                    //   worker 池，/live.flv 与 /hls 跟着一起卡死，
+                    //   表现为「看直播突然整个画面冻住」。
+                    //   图片是小资源，20s 拿不到就是失败，重远低于拖垮播放的代价。
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .expect("failed to build client"),
             );
-            eprintln!("{}", err_msg);
-            return Err(err_msg);
+            // 走系统代理的客户端（Twitch 等海外平台回源用）
+            let app_data_system_client = web::Data::new(SystemProxyHttpClient(
+                Client::builder()
+                    .http1_only()
+                    .pool_max_idle_per_host(8)
+                    .tcp_keepalive(Duration::from_secs(60))
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("failed to build system proxy client"),
+            ));
+            App::new()
+                .app_data(app_data_stream_url)
+                .app_data(app_data_reqwest_client)
+                .app_data(app_data_system_client)
+                .wrap(actix_cors::Cors::permissive())
+                .route("/live.flv", web::get().to(flv_proxy_handler))
+                .route("/image", web::get().to(image_proxy_handler))
+                .route("/hls", web::get().to(hls_proxy_handler))
+        })
+        .keep_alive(Duration::from_secs(120))
+        .bind(("127.0.0.1", bound_port))
+    };
+
+    // 逐个候选端口尝试，直到 bind 成功。
+    // 不再「遇到 AddrInUse 就假定已运行」—— 那正是错误 base 被永久缓存的源头。
+    let mut server = None;
+    let mut bound_port = 0u16;
+    let mut last_err: Option<std::io::Error> = None;
+    for candidate in PORT_CANDIDATES {
+        match build_server(candidate) {
+            Ok(srv) => {
+                server = Some(srv);
+                bound_port = candidate;
+                break;
+            }
+            Err(e) => {
+                eprintln!("[Rust/proxy.rs] 端口 {} 绑定失败，尝试下一个: {}", candidate, e);
+                last_err = Some(e);
+            }
         }
     }
-    .run();
+
+    let server = match server {
+        Some(srv) => srv,
+        None => {
+            let msg = format!(
+                "[Rust/proxy.rs] 所有候选端口均绑定失败: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            eprintln!("{}", msg);
+            return Err(msg);
+        }
+    };
+
+    // 记录真实 base，供后续幂等调用复用
+    let base = format!("http://127.0.0.1:{}", bound_port);
+    *static_proxy_base_cell().lock().unwrap() = Some(base.clone());
+
+    let server = server.run();
 
     // Do NOT overwrite the main proxy server handle; run static proxy independently
 
@@ -547,11 +626,11 @@ pub async fn start_static_proxy_server(
         if let Err(e) = server.await {
             eprintln!("[Rust/proxy.rs] Proxy server run error: {}", e);
         } else {
-            println!("[Rust/proxy.rs] Proxy server on port {} shut down.", port);
+            println!("[Rust/proxy.rs] Proxy server on port {} shut down.", bound_port);
         }
     });
 
-    Ok(format!("http://127.0.0.1:{}", port))
+    Ok(base)
 }
 
 #[tauri::command]
