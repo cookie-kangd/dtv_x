@@ -98,9 +98,16 @@ impl DouYu {
             "Accept-Language",
             HeaderValue::from_static("zh-CN,zh;q=0.9"),
         );
+        // ★ 必须设总超时：全仓库20+ 处 Client::builder() 都带 connect_timeout + timeout，
+        //   唯独斗鱼取流这条最关键的路径漏了。reqwest 的两个超时默认都是 None，
+        //   服务端不回数据时这条命令会**永不返回** → 前端 await 永久挂住 →
+        //   20s 后被看门狗作废会话 → 自动重连又新建一个 Client（带独立连接池与挂死 socket）。
+        //   反复重连会让这些挂死请求持续堆积，白白吃内存和带宽。
         let client = Client::builder()
             .redirect(Policy::limited(10))
             .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
             .default_headers(default_headers)
             .build()?;
 

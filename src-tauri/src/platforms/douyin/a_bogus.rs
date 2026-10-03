@@ -283,10 +283,13 @@ fn generate_rc4_bb_str(
     suffix: &str,
     arguments: [i32; 3],
 ) -> String {
+    // 与 version_check.rs / bilibili/auth.rs / web_fetcher.rs 的写法保持一致：
+    // 系统时钟被改到1970 之前（虚拟机快照回拨、手动改表、闰秒调整）时不能 panic，
+    // 退回 0 让签名继续走下去即可。
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+        .map(|t| t.as_millis() as i64)
+        .unwrap_or(0);
 
     // Double SM3 hashing to align with upstream Python behavior.
     let url_list = sm3_sum(&sm3_sum(format!("{}{}", url_search_params, suffix).as_bytes()));

@@ -69,13 +69,22 @@ const RECONNECT_DELAYS_MS = [3000, 6000, 12000, 20000, 30000, 45000];
 const RECONNECT_ROUND_WINDOW_MS = 240000; // 4 分钟，覆盖退避总和(116s) + 每次重建耗时
 // 连续「取流阶段」失败这么多次，判定该房间当前就是取不到流，不再空转
 const FETCH_FAIL_GIVEUP_STREAK = 3;
-// 卡死看门狗：直播中 currentTime 长时间不推进且缓冲耗尽，判定为「假死」
+// 卡死看门狗：直播中「缓冲长时间不再增长且播放头也不动」才判定为「假死」
 // （内核没抛 error、但画面停住——弱网/丢包时很常见，必须靠主动检测兜底）
 const STALL_CHECK_INTERVAL_MS = 3000;
-// ★ 20s 而非 12s：直播流在网络稳定时也可能十几秒内 currentTime 不推进
-//   （MSE live-edge 同步会把播放头钉在缓冲末尾等新数据、主播静止画面 + 低帧率编码、
-//    浏览器后台节流等）。12s 的阈值在实测中会持续误报，把正常播放判成「卡住」并触发重连。
-const STALL_STUCK_MS = 20000;
+// ★★ 30s 而非 12s/20s —— 这是「网络明明稳定却一直重连」的直接解药。
+//
+// 第一性原理：判断直播是否还活着，唯一可靠的信号是「**播放器还在持续收数据**」，
+// 而不是「画面在不在动」。直播是 live 流，画面完全静止（主播没动、静态画面）时
+// 编码器几乎不吐新帧，currentTime 可以合法地几十秒不推进；
+// 同时 MSE 为了追 live-edge 会主动把播放头钉在缓冲末尾，播放头不推进更是常态。
+//
+// 所以判据只用一条：**buffered.end() 是否还在增长**。
+//只要还在增长 = 数据还在到 = 一切正常，哪怕画面定格。
+// 增长停止（且播放头也不动）持续超过 STALL_STUCK_MS 才是真断流。
+// 用 30s 是因为要留足一整个 GOP + 关键帧间隔的余量；
+// 再短就会在网络轻微抖动时误报，反而制造 endless 重连。
+const STALL_STUCK_MS = 30000;
 // ===== 重连活性兜底（根治「自动重连若干次后就一直转圈」）=====
 // 事件驱动的重连有一个致命弱点：链条上任何一环静默失败（守卫吞掉请求、
 // await 永不返回），就再也没有人来推进下一次重连。因此必须由一个独立于
@@ -297,7 +306,27 @@ export function MainPlayer({
   const playerRef = useRef<any>(null);
   const playbackKindRef = useRef<null | "hls" | "flv">(null);
   const danmuOverlayRef = useRef<DanmuOverlayInstance | null>(null);
-  const unlistenRef = useRef<null | (() => void)>(null);
+  // 弹幕事件的 Tauri 监听器集合。
+  // ★ 刻意用 Set 而不是单个函数：reloadStream 明确支持「抢占」语义
+  //   （用户点刷新可以抢在旧会话还在 await listen() 时启动新会话），
+  //   于是两个会话的 listen() 可能交错返回。若用单值 ref，
+  //   后完成的那个会覆盖先完成的，被覆盖的 unlisten 就此丢失 ——
+  //   那个监听器会一直收到**所有平台**的 danmaku-message，
+  //   每次都进回调才被 isSessionActive 挡掉，白耗 IPC 反序列化与回调开销，
+  //   并且它持有的 overlay 引用会阻止旧弹幕实例被回收。
+  const unlistenRef = useRef<Set<() => void>>(new Set());
+
+  /** 解绑并清空所有弹幕事件监听器。 */
+  const clearDanmakuListeners = useCallback(() => {
+    unlistenRef.current.forEach((fn) => {
+      try {
+        fn();
+      } catch {
+        // ignore
+      }
+    });
+    unlistenRef.current.clear();
+  }, []);
 
   const disposedRef = useRef(false);
   const activeSessionIdRef = useRef(0);
@@ -348,13 +377,27 @@ export function MainPlayer({
   // 用户是否主动按了暂停。必须区分「用户主动暂停」与「播放器自己卡住」——
   // 两者在 video 元素上都表现为 paused === true，但前者绝不能触发重连。
   const userPausedRef = useRef(false);
-  // 窗口被关到托盘（Rust 侧 hide）时置位：期间 video 必然是暂停状态，
-  // 看门狗必须完全躺平，且唤回后的第一次恢复要强制走完整 reload（代理/弹幕已停）。
+  // 窗口被关到托盘（Rust 侧 hide）时置位，仅用于「后台要不要做重连判断」。
+  //
+  // ★ 产品要求：关到托盘后必须继续播放，直到用户真正退出应用为止。
+  //   因此这里**不再** pause 视频、**不再**停弹幕与代理 —— 那是 v0.2.7 的旧行为，
+  //   用户反馈「只要放后台就不播了」，已按需求推翻。
+  //
+  // 保留该标志的唯一原因是 Chromium 的后台节流：窗口不可见时
+  // requestAnimationFrame / 定时器会被降频，解码与取流也可能短暂滞后。
+  // 这期间若照常判定「卡死」，就会对完全正常的流发起重连 —— 那正是
+  // 「后台待久了回来发现重连过」的真实成因。所以后台只做数据流入观测，不判故障。
   const windowHiddenRef = useRef(false);
   // 画面最近一次「确实在推进」的 currentTime + 时刻。
   // 注意用 currentTime 判定推进本身就不可靠（直播是 live 流，播放头常被钉在缓冲末尾），
-  // 所以它只用于「粗略发现画面完全没动过」，真正的卡死判定还要叠加 readyState。
+  // 所以它只用于「粗略发现画面完全没动过」，真正的卡死判定要看缓冲是否仍在增长。
   const lastProgressRef = useRef<{ time: number; at: number }>({ time: -1, at: 0 });
+  // 最近一次观测到的「已缓冲到的位置」（buffered.end）与观测时刻。
+  // ★ 这才是直播流是否健康的**主判据**：readyState 在 MSE 直播下常态就是 2
+  //   （HAVE_CURRENT_DATA），用 readyState < 3 判定「缓冲耗尽」在直播中几乎恒成立，
+  //   会把稳定播放持续误判为卡死 —— 这就是「网络明明很好却一直重连」的根因。
+  //   buffered.end 持续增长 = 播放器仍在正常收流解码，与网络好坏直接相关。
+  const lastBufferedRef = useRef<{ end: number; at: number }>({ end: -1, at: 0 });
   // 看门狗需要读取最新业务状态，用一个 ref 镜像，避免把它塞进 effect 依赖导致定时器反复重建
   const watchdogCtxRef = useRef<{
     loading: boolean;
@@ -886,37 +929,90 @@ export function MainPlayer({
    *   只要处于重连流程（取流中或有待执行的退避定时器），就检查它是否真的在推进。
    *   挂死的 await 会被硬超时强制解锁。这是「自动重连两次后就一直转圈」的根治手段。
    *
-   * 职责二（画面假死检测）—— 兜住「播放器没抛 error、但画面其实停住了」：
+   * 职责二（断流检测）—— 兜住「播放器没抛 error、但流其实已经断了」：
    *   弱网丢包时很常见，只监听 error 事件会漏掉这一类。
    *
-   * ★ 与旧实现的关键差异（这是「网络稳定也触发重连」的直接根因）：
-   *   旧版用「video.currentTime 连续 12 秒不变」判定假死。直播是 live 流，
-   *   MSE 为了追 live-edge 会主动把播放头钉在缓冲末尾等新数据，currentTime
-   *   在网络完全正常时也会间歇性停住十几秒 —— 于是稳定播放被持续误判为假死，
-   *   不断触发重连；每次重连又重建播放器，进一步加剧卡顿，最终卡死在「重播」。
-   *   现在改为：currentTime 停住只是必要条件，必须叠加
-   *   「readyState 长期低于 HAVE_FUTURE_DATA（缓冲真的耗尽）」才判假死。
+   * ★★★ 这是「网络稳定却一直触发重连」的**真正根因**，判据在此彻底换掉：
+   *
+   *   旧判据：currentTime 不推进 + (readyState < 3) → 判假死 → 重连
+   *   ① currentTime 在直播中**合法地**长时间不推进：主播画面静止（静态画面/未动）
+   *      时编码器几乎不吐新帧；MSE 为追 live-edge 还会主动把播放头钉在缓冲末尾等新数据。
+   *      这两种情况在网络完美的机器上一样会发生。
+   *   ② readyState < 3 在 MSE 直播里**几乎恒成立**。readyState 描述的是
+   *      「当前可播数据的充足程度」，而 MSE 为了压低延迟会持续把已播过的缓冲区
+   *      回收掉，直播的 readyState 常态就是 2(HAVE_CURRENT_DATA)、偶尔 1。
+   *      所以这一条根本没有区分能力 —— 等于把判据退化成「只看画面动不动」。
+   *      两者一叠加，**稳定播放被判成卡死，然后触发重连**；重连又重建播放器，
+   *      进一步加剧卡顿，于是用户看到的就是「网络好得很却一直在重连」。
+   *
+   *   新判据（唯一信号）：**buffered.end() 是否还在增长**。
+   *   只要播放器还在往 SourceBuffer 里塞数据，就说明收流、解码、播放链路全通，
+   *   哪怕画面此刻完全静止也绝不能重连。只有「缓冲停止增长 + 播放头也不动」
+   *   持续 STALL_STUCK_MS，才是真的断流。
+   *
+   *   附带好处：流被限速/卡顿时 buffered 增长会变慢但不会停，
+   *   于是「慢但活着」与「死了」被正确区分开了。
    */
   const startStallWatchdog = useCallback(() => {
     if (stallWatchdogRef.current !== null) return;
     lastProgressRef.current = { time: -1, at: 0 };
+    lastBufferedRef.current = { end: -1, at: 0 };
     stallWatchdogRef.current = window.setInterval(() => {
       if (disposedRef.current) return;
       const now = Date.now();
       const ctx = watchdogCtxRef.current;
 
+      // 读取 <video> 与「已缓冲到的位置」（下面所有判定都要用）
+      let video: HTMLVideoElement | null = null;
+      try {
+        const root = playerRef.current?.root as HTMLElement | null;
+        video = (root?.querySelector("video") as HTMLVideoElement) ?? null;
+      } catch {
+        video = null;
+      }
+      // ★ buffered.end(最后一段) = 播放器目前已收到的最靠前的时间点。
+      //   它持续增长 = 还在正常收流。这与网络好坏、直播帧率高低都直接相关，
+      //   是唯一不含歧义的健康信号。取不到时返回 -1 表示「本轮无观测」。
+      let bufferedEnd = -1;
+      try {
+        if (video && video.buffered && video.buffered.length > 0) {
+          bufferedEnd = video.buffered.end(video.buffered.length - 1);
+        }
+      } catch {
+        bufferedEnd = -1;
+      }
+
       // ===== 免打扰期到期：补排被暂存的重连请求 =====
       // 免打扰期内到达的故障请求只置 deferred 不排定时器（见 scheduleReconnect）。
-      // 窗口一到期就必须由这里把它捡起来 —— 否则没有任何人会再发起这次重连，
-      // 表现是「无 error 提示、无 loading、无错误页，就是黑屏」，唯一出路是手动刷新。
-      if (
+      //
+      // ★ 补排前**必须**重新确认一次流是不是真的死了。
+      //   免打扰期内那次「故障」很可能只是内核自愈过程中抛出的一次 error，
+      //   而内核随后已经自己恢复了（缓冲一直在涨、画面在播）。
+      //   旧实现不检查就补排 → 每次内核自愈都会在 20s 后引发一次完整重取流，
+      //   这正是「网络稳定却持续重连」的第二条独立路径：
+      //   内核重试 → error → 暂存 → 20s 后无条件补排 → 重建播放器 → 又抖一下 → 循环。
+      const deferredDue =
         reconnectDeferredRef.current &&
         now >= reconnectCooldownUntilRef.current &&
         !reloadInFlightRef.current &&
-        reconnectTimerRef.current === null
-      ) {
+        reconnectTimerRef.current === null;
+      if (deferredDue) {
+        // 判定「现在是否真的健康」：缓冲在增长，或画面在推进，都说明已恢复。
+        const bPrev = lastBufferedRef.current;
+        const stillInflowing = bufferedEnd >= 0 && bufferedEnd > bPrev.end;
+        const pPrev = lastProgressRef.current;
+        const frameMoving =
+          !!video && !video.paused && !video.ended && video.currentTime !== pPrev.time;
+        if (stillInflowing || frameMoving) {
+          // 已恢复：丢弃这次暂存的故障请求，绝不重连。
+          reconnectDeferredRef.current = false;
+          lastBufferedRef.current = { end: bufferedEnd, at: now };
+          lastProgressRef.current = { time: video?.currentTime ?? -1, at: now };
+          commitReconnectHealthy();
+          return;
+        }
         reconnectDeferredRef.current = false;
-        console.info("[Player] 免打扰期结束，补排此前暂存的重连请求");
+        console.info("[Player] 免打扰期结束，确认流仍无数据流入，补排重连");
         scheduleReconnect("免打扰期结束补排");
         return;
       }
@@ -937,77 +1033,85 @@ export function MainPlayer({
           setIsLoadingStream(false);
           scheduleReconnect("取流超时");
         }
-        // 此时 loading 必然为真、画面本来就该静止 —— 不做画面推进判定
+        // 此时 loading 必然为真、画面本来就该静止 —— 不做断流判定
         return;
       }
 
-      // 读取画面推进情况（下面两种判定都要用）
-      let video: HTMLVideoElement | null = null;
-      try {
-        const root = playerRef.current?.root as HTMLElement | null;
-        video = (root?.querySelector("video") as HTMLVideoElement) ?? null;
-      } catch {
-        video = null;
-      }
       const playing = !!video && !video.paused && !video.ended;
       const prev = lastProgressRef.current;
+      const bCur = lastBufferedRef.current;
 
-      // 画面确实在推进 = 真的在播。比只依赖播放器事件名更可靠
-      // （事件名可能随版本变化，重建后的实例也未必再发 playing）。
-      if (playing && video && video.currentTime !== prev.time) {
+      // ===== 职责二：断流判定 =====
+      // 加载中 / 已报错 / 主播未开播：不判定，避免误伤
+      if (ctx.loading || ctx.hasError || ctx.offline) return;
+      if (!video) return;
+      // 用户主动暂停：绝不能判成断流（这是最容易被误伤的情况）
+      if (userPausedRef.current) return;
+      // 窗口关到托盘：后台照常播放，但 Chromium 会节流定时器与解码，
+      // 此时的「缓冲不增长」多半是节流而非断流，一律不判故障。
+      if (windowHiddenRef.current) {
         lastProgressRef.current = { time: video.currentTime, at: now };
-        notePlaybackProgress();
-        // 播放一旦真的推进了，本轮故障即告结束 —— 立刻回满预算并开启免打扰期。
-        // 不再要求「连续稳定 N 秒」：那个条件在 live 流上永远不成立（播放头会被钉住），
-        // 正是它让预算永远回不满、进而被看门狗反复当成「重连停滞」而无限补排。
-        // ★ 刻意不把 reconnectGaveUpRef 算进来：该标志的含义是「已把控制权交还用户、
-        //   停止自动重连」，并同时弹出了错误页。若在这里把它清掉，就会出现
-        //   「画面在播、屏幕中央却盖着『已重连 6 次仍未成功』的错误浮层」，
-        //   而且下一次 error 又能触发新一轮 6 次重连 —— 界面承诺与实际行为直接矛盾。
-        if (reconnectAttemptRef.current > 0 || ctx.reconnecting) {
-          commitReconnectHealthy();
+        lastBufferedRef.current = { end: bufferedEnd, at: now };
+        return;
+      }
+      // 免打扰期内不判断流：刚恢复的流最容易出现「重建缓冲 → 短暂停顿」，
+      // 这时触发重连只会把好端端的流又推倒重来（越重连越卡）。
+      if (now < reconnectCooldownUntilRef.current) {
+        // 窗口内的基准照样推进，避免窗口结束时把「窗口开始前的旧时刻」
+        // 当作断流起点而立刻误判
+        lastProgressRef.current = { time: video.currentTime, at: now };
+        lastBufferedRef.current = { end: bufferedEnd, at: now };
+        return;
+      }
+
+      // ===== ★ 主判据：缓冲是否仍在增长 =====
+      // 还在增长 = 收流解码链路全通 = 一切正常，哪怕画面完全静止。
+      if (bufferedEnd >= 0) {
+        if (bufferedEnd > bCur.end) {
+          // 有新数据到达 → 健康。顺带回满重连预算并开启免打扰期。
+          lastBufferedRef.current = { end: bufferedEnd, at: now };
+          lastProgressRef.current = { time: video.currentTime, at: now };
+          notePlaybackProgress();
+          if (reconnectAttemptRef.current > 0 || ctx.reconnecting) {
+            commitReconnectHealthy();
+          }
+          return;
+        }
+        // 缓冲一点没涨。直播流在极低帧率/静止画面下 buffered 可能长时间不动，
+        // 所以必须再叠加「播放头也完全不动」才判死，且要给足 30s。
+        if (playing && video.currentTime !== prev.time) {
+          // 画面在动但缓冲没涨：还在播（可能是本地解码追上了缓冲末尾），
+          // 同样视为健康，只是不回血（避免反复开免打扰窗口掩盖真问题）。
+          lastProgressRef.current = { time: video.currentTime, at: now };
+          lastBufferedRef.current = { end: bufferedEnd, at: now };
+          return;
+        }
+        // 缓冲不涨 + 画面不动 → 累计静止时长
+        const stillSince = bCur.at || now;
+        if (now - stillSince >= STALL_STUCK_MS) {
+          console.warn(
+            `[Player] 缓冲与播放头均无变化超过 ${STALL_STUCK_MS / 1000}s，判定断流`
+          );
+          lastBufferedRef.current = { end: bufferedEnd, at: now };
+          lastProgressRef.current = { time: video.currentTime, at: now };
+          scheduleReconnect("画面断流");
         }
         return;
       }
 
-      // ===== 职责二：普通「画面假死」判定 =====
-      // 加载中 / 已报错 / 主播未开播：不判定，避免误伤
-      if (ctx.loading || ctx.hasError || ctx.offline) return;
-      if (!video) return;
-      // 用户主动暂停：绝不能判成卡死（这是最容易被误伤的情况）
-      if (userPausedRef.current) return;
-      // 窗口关到托盘期间播放被主动停掉，画面静止是预期行为
-      if (windowHiddenRef.current) return;
-      // 免打扰期内不判假死：刚恢复的流最容易出现「重建缓冲 → 短暂停顿」，
-      // 这时触发重连只会把好端端的流又推倒重来（越重连越卡）。
-      if (now < reconnectCooldownUntilRef.current) {
-        // 窗口内的进度基准照样推进，避免窗口结束时把「窗口开始前的旧时刻」
-        // 当作卡死起点而立刻误判
-        lastProgressRef.current = { time: prev.time, at: now };
-        return;
-      }
-
-      // ★ 关键判据：必须叠加「缓冲耗尽」才算假死。
-      // readyState 达到 HAVE_FUTURE_DATA(3) 说明缓冲里还有数据要播，
-      // 播放头暂时不动是 live-edge 正常行为，绝不能判成卡死。
-      // 只有长期「没有新数据可播（readyState < 3）+ 播放头不动」才是真断流。
-      //
-      // ★ 这里**不能**用 `!playing` 直接 return：断流/软切换失败/autoplay 被拒时，
-      //   xgplayer 会把 <video> 置为 paused，此时画面是黑的且永远不会有 error 事件
-      //   （内核把 switchURL 当成空操作就是这种表现）。
-      //   若在这里躺平，就变成「无 error、无 loading、无错误页、无重连」的永久黑屏 ——
-      //   唯一出路是用户手动刷新。paused 状态下同样要靠 readyState + 播放头不动来兜底。
-      const bufferedStarved = video.readyState < 3;
-      if (!bufferedStarved) {
-        // 缓冲充足，只是播放头没动：把计时基准往后挪，别让旧的时间戳累积成误判
-        lastProgressRef.current = { time: prev.time, at: now };
-        return;
-      }
-
-      const stuckSince = prev.at || now;
-      if (now - stuckSince >= STALL_STUCK_MS) {
+      // ===== 兜底：完全取不到 buffered（某些环境 buffered.length 恒为 0）=====
+      // 这时退回到「播放头不动 + video 处于 waiting/暂停」的弱判据，
+      // 并用更宽松的 45s，避免在信息缺失时轻率重连。
+      if (playing && video.currentTime !== prev.time) {
         lastProgressRef.current = { time: video.currentTime, at: now };
-        scheduleReconnect("画面卡住");
+        notePlaybackProgress();
+        return;
+      }
+      const prev2 = lastProgressRef.current;
+      const stillSince2 = prev2.at || now;
+      if (now - stillSince2 >= 45000) {
+        lastProgressRef.current = { time: video.currentTime, at: now };
+        scheduleReconnect("画面无推进");
       }
     }, STALL_CHECK_INTERVAL_MS);
   }, [commitReconnectHealthy, notePlaybackProgress, scheduleReconnect]);
@@ -1076,12 +1180,7 @@ export function MainPlayer({
     //   看门狗只在组件卸载时由 stopStallWatchdog() 停止。
     clearReconnectTimer();
 
-    try {
-      unlistenRef.current?.();
-    } catch {
-      // ignore
-    }
-    unlistenRef.current = null;
+    clearDanmakuListeners();
 
     try {
       danmuOverlayRef.current?.clear?.();
@@ -1124,7 +1223,7 @@ export function MainPlayer({
     // 用模式标记而不是参数，是因为自动重连路径上 destroyPlayer 的调用点很多
     // （各平台分支的失败回退、catch 兜底），逐个传参会漏。
     if (!autoReconnectModeRef.current) setIsFullScreen(false);
-  }, [clearReconnectTimer]);
+  }, [clearReconnectTimer, clearDanmakuListeners]);
 
   const stopAllDanmakuBackends = useCallback(async () => {
     // Business rule: only one room at a time. Stopping all backends is the safest way to avoid cross-platform leaks.
@@ -1155,14 +1254,20 @@ export function MainPlayer({
     );
   }, []);
 
-  // 窗口被关到托盘（Rust 侧 hide）时暂停播放并停掉弹幕/代理；重新唤起时恢复。
+  // 关窗到托盘 → 继续播放（不停弹幕、不停代理）；再次唤起 → 什么都不用做。
   //
-  // 为什么不能只靠上面的 visibilitychange：
-  // Tauri 的 hide() 只是隐藏窗口，WebView2 页面仍是 active，不保证触发 visibilitychange。
-  // 结果是关窗后 <video> 继续解码、5 个弹幕 WebSocket 继续收发、本地代理继续转发 /live.flv，
-  // 白白吃流量和 CPU，而且用户以为已经关掉了。必须由 Rust 显式发事件。
+  // ★ v0.2.7 的旧行为已按用户要求推翻：那时 Rust hide 之后前端会
+  //   video.pause() + stopAllDanmakuBackends() + stopAllProxies()，
+  //   结果就是「只要 DTV_X 放在后台就不播了」。现在整条播放链路
+  //   （本地代理转发 + MSE 解码 + 弹幕）在后台完整保留，
+  //   只有用户真正退出应用时才随进程一起结束。
   //
-  // 这里只「暂停」而不 destroyPlayer：窗口可能只是临时切到托盘，保住会话能瞬间恢复。
+  // 唤回时也**不做**任何恢复动作：既然什么都没停，就没有东西需要恢复。
+  // ★ 特别不要在这里调 reloadStream —— 那是 v0.2.7 的补丁（因为代理被停了
+  //   才必须重新取流），现在这个前提不成立了，重取流只会白白重建播放器，
+  //   在用户眼前造成一次莫名其妙的重新加载。
+  //
+  // 唯一保留的动作：标记 windowHiddenRef，供看门狗在后台期间不判故障。
   useEffect(() => {
     let unlistenHidden: (() => void) | null = null;
     let unlistenShown: (() => void) | null = null;
@@ -1172,32 +1277,24 @@ export function MainPlayer({
       try {
         const un1 = await listen("main-window-hidden", () => {
           if (disposed) return;
+          // 只置标记：后台照常播放，弹幕与代理一律不动。
           windowHiddenRef.current = true;
-          try {
-            const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
-            if (video) video.pause();
-          } catch {
-            // ignore
-          }
-          // 弹幕与代理在后台纯浪费：弹幕是长连接、代理在转发直播流。
-          // 注意 hidden 是 fire-and-forget：若用户「关窗→立刻唤回」，
-          // shown 会先到、随后这两个停止才真正生效 —— 所以 shown 侧必须对称重启，
-          // 否则恢复后是「有画面没弹幕」或（代理停掉后）「直接黑屏」。
-          void stopAllDanmakuBackends();
-          void stopAllProxies();
         });
         const un2 = await listen("main-window-shown", () => {
           if (disposed) return;
-          // ★ 对称恢复：不能只video.play()。
-          //   斗鱼/虎牙/B站的 FLV 播放地址指向本地代理（http://127.0.0.1:34719/live.flv），
-          //   关窗时代理已停 —— 只恢复 video 会得到一个永久黑屏的播放器。
-          //   弹幕后端同样已停，必须重启，否则唤回后完全没有弹幕。
-          // 走一次完整的 reloadStream：取流 → 重启代理 → 起弹幕 → 播放，
-          // 失败也会由既有的重连机制兜底，比在这里手搓恢复逻辑可靠得多。
           windowHiddenRef.current = false;
-          // 停止过程中产生的 error 属于「人为造成」，不该触发一轮自动重连
-          reconnectCooldownUntilRef.current = Date.now() + RECONNECT_COOLDOWN_MS;
-          void reloadStreamRef.current?.("refresh");
+          // 把进度基准推到当前时刻，避免窗口刚回来时残留的旧时间戳
+          // 被当成「已经卡了很久」而立刻误判一次假死。
+          lastProgressRef.current = { time: -1, at: Date.now() };
+          lastBufferedRef.current = { end: -1, at: Date.now() };
+          // 少数情况下 Chromium 会在窗口隐藏期间自动暂停媒体（省电策略等），
+          // 这里兜底恢复一次；本来就在播的视频完全不受影响。
+          try {
+            const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
+            if (video && video.paused && !userPausedRef.current) void video.play().catch(() => {});
+          } catch {
+            // ignore
+          }
         });
         if (disposed) {
           un1();
@@ -1217,7 +1314,7 @@ export function MainPlayer({
       try { unlistenHidden?.(); } catch { /* ignore */ }
       try { unlistenShown?.(); } catch { /* ignore */ }
     };
-  }, [stopAllDanmakuBackends, stopAllProxies]);
+  }, []);
 
   const startDanmaku = useCallback(
     async (
@@ -1227,12 +1324,7 @@ export function MainPlayer({
       roomIdToStart: string,
       roomIdToFilter?: string
     ) => {
-      try {
-        unlistenRef.current?.();
-      } catch {
-        // ignore
-      }
-      unlistenRef.current = null;
+      clearDanmakuListeners();
 
        if (!roomIdToStart) return;
        if (!isSessionActive(sessionId)) return;
@@ -1313,9 +1405,22 @@ export function MainPlayer({
         }
       });
 
-      unlistenRef.current = unlisten;
+      // ★ 入集合前必须再确认一次会话仍然有效。
+      //   上面这一串 await（stopAllDanmakuBackends → start_*_listener → listen）
+      //   让出了好几次事件循环，期间完全可能发生「用户点刷新抢占并启动了新会话」。
+      //   若不检查就入集合，这个已被废弃的监听器会一直留在 Set 里，
+      //   持续接收所有平台的 danmaku-message、持续占用 overlay 引用。
+      if (!isSessionActive(sessionId)) {
+        try {
+          unlisten();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      unlistenRef.current.add(unlisten);
     },
-    [isDanmuEnabled, isSessionActive, stopAllDanmakuBackends]
+    [isDanmuEnabled, isSessionActive, stopAllDanmakuBackends, clearDanmakuListeners]
   );
 
   const mountPlayer = useCallback(
@@ -1490,8 +1595,19 @@ export function MainPlayer({
           retryCount: 3, // HTTP 请求失败重试次数（默认 3，显式声明）
           retryDelay: 1000, // 请求失败重试间隔（默认 1000ms）
           disconnectRetryCount: 10, // ★断流重试次数（默认 0 = 不重试）
-          loadTimeout: 10000, // 请求超时（默认 10000ms）
-          maxReaderInterval: 5000 // 连续多少毫秒收不到数据判定为断流（默认 5000ms）
+          loadTimeout: 15000, // 请求超时。默认 10000ms 在国内网络下偏紧，容易误报
+          // ★★30s 而非默认的 5000ms —— 这是「网络稳定却触发重连」的第二个独立根因。
+          // maxReaderInterval 的语义是「连续多少毫秒收不到数据判定为断流」。
+          // 直播流天然会长时间收不到数据：
+          //   · 主播画面静止时编码器可能好几秒不吐新帧；
+          //   · 弹幕/礼物特效期间部分流会有瞬时停顿；
+          //   · 弱网抖动一次就轻松超过 5 秒。
+          // 一旦内核在 5s 处判定断流，它会先静默重拉（disconnectRetryCount），
+          // 而重拉本身又会抛出 error —— 于是应用层每次都收到「故障」信号，
+          // 在网络完全正常的情况下反复发起重连，把好端端的流推倒重来。
+          // 放宽到 30s 后，内核只对真正的长时间断流才有反应，
+          // 短暂抖动完全由它自己无感重拉，用户看不到任何异常。
+          maxReaderInterval: 30000
         };
       }
 

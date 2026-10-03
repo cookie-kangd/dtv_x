@@ -86,9 +86,17 @@ fn _encode_wbi(
 }
 
 fn get_wbi_keys(headers: HeaderMap) -> Result<(String, String), String> {
+    // ★ 必须同时设 connect_timeout 和总timeout。
+    //   reqwest::blocking 的两者默认都是 None —— 只设 connect_timeout 时，
+    //   「TCP 连上了但服务端迟迟不返回响应体」这种弱网场景会**无限期阻塞**。
+    //   而这里跑在 B 站弹幕的独立线程里（danmaku.rs 用 std::thread::spawn），
+    //   该线程只在循环顶部检查 stop_flag，一旦卡在阻塞调用里就永远退不出来；
+    //   每次换房间都会再 spawn 一个 → 线程与socket 单调累积，进程退出也带不走。
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("创建 WBI 请求客户端失败：{e}"))?;
 
@@ -128,6 +136,8 @@ pub fn init_uid(headers: HeaderMap) -> (reqwest::StatusCode, String) {
     let client = match reqwest::blocking::Client::builder()
         .https_only(true)
         .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
     {
         Ok(c) => c,
@@ -168,6 +178,8 @@ pub fn init_host_server(headers: HeaderMap, room_id: u64) -> Result<(reqwest::St
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("创建弹幕服务器请求客户端失败：{e}"))?;
 

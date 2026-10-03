@@ -15,9 +15,12 @@ pub async fn perform_anchor_search(keyword: &str) -> Result<String, Box<dyn std:
         HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"),
     );
 
+    // 补齐超时：缺 connect_timeout/timeout 时服务端不回数据会永久阻塞搜索。
     let client = Client::builder()
         .redirect(Policy::limited(10))
         .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .default_headers(default_headers)
         .build()?;
 

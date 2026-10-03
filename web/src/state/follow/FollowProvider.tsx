@@ -330,7 +330,41 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
         );
       },
       updateOrder: (nextOrder) => setListOrder(normalizeListOrder(nextOrder)),
-      updateListOrder: (nextOrder) => setListOrder(normalizeListOrder(nextOrder)),
+      // ★ 关注列表每 2 分钟自动轮询一次，refreshList 会无条件调updateListOrder
+      //   把主播按「直播中/ 未开播」重新分组。normalizeListOrder 内部 filter/map/concat
+      //   必定返回**新数组引用**，于是 setListOrder 每次都判定为「变化」：
+      //   写一次 localStorage + 让整棵关注列表重渲染 ——
+      //   即使所有主播的直播状态一个都没变。
+      //   这里比对归一化后的结果与当前值，内容相同就返回原引用，等于什么都没发生。
+      //   （与 updateStreamers 的 `changed ? next : prev` 同一思路）
+      updateListOrder: (nextOrder) =>
+        setListOrder((prev) => {
+          const normalized = normalizeListOrder(nextOrder);
+          if (prev.length === normalized.length) {
+            let same = true;
+            for (let i = 0; i < prev.length; i += 1) {
+              const a = prev[i];
+              const b = normalized[i];
+              if (a.type !== b.type) {
+                same = false;
+                break;
+              }
+              if (a.type === "folder" && a.data.id !== b.data.id) {
+                same = false;
+                break;
+              }
+              if (
+                a.type === "streamer" &&
+                `${a.data.platform}:${a.data.id}` !== `${b.data.platform}:${b.data.id}`
+              ) {
+                same = false;
+                break;
+              }
+            }
+            if (same) return prev;
+          }
+          return normalized;
+        }),
 
       createFolder: (name) => {
         const trimmed = (name || "").trim();

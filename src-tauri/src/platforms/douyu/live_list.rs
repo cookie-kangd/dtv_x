@@ -103,7 +103,9 @@ pub async fn fetch_live_list(offset: u32, cate2: String, limit: u32) -> Frontend
         offset, cate2, limit
     );
 
-    let client = reqwest::Client::builder()
+    // build() 失败（TLS 后端初始化失败等）不能 unwrap —— 这在用户刷列表时是可达路径，
+    // 直接 panic 会把失败变成不可读的错误。这里退化成一条明确的失败响应。
+    let client = match reqwest::Client::builder()
         .http1_only()
         .connect_timeout(std::time::Duration::from_secs(15))
         // connect_timeout 只管 TCP/TLS 握手；连上之后响应体可以无限期挂住。
@@ -112,8 +114,16 @@ pub async fn fetch_live_list(offset: u32, cate2: String, limit: u32) -> Frontend
         .timeout(std::time::Duration::from_secs(30))
         .no_proxy()
         .build()
-        .map_err(|e| e.to_string())
-        .unwrap();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return FrontendLiveListResponse {
+                error: 500,
+                msg: Some(format!("创建斗鱼列表请求失败：{e}")),
+                data: None,
+            };
+        }
+    };
     let response_result = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1")

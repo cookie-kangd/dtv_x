@@ -236,8 +236,9 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        // 通知前端：窗口已回到前台，可以恢复播放（与 main-window-hidden 成对）。
-        // 注意必须放在 show 之后：前端收到就play，此时窗口已可见，autoplay 才不会被拦。
+        // 通知前端：窗口已回到前台（与 main-window-hidden 成对）。
+        // 注意：关到托盘期间播放**从未停止**，所以这里前端不需要重建播放器，
+        // 事件只用于清掉后台节流期间积累的检测基准。
         let _ = app.emit("main-window-shown", ());
     }
 }
@@ -364,11 +365,12 @@ fn main() {
                                 let _ = child.close();
                             }
                         }
-                        // 通知前端：窗口已隐藏，请暂停播放并停掉弹幕/代理。
-                        // 为什么必须用 Rust 事件而不是前端 document.visibilityState：
-                        // Tauri 的 hide() 只是隐藏窗口，WebView2 页面仍是 active，
-                        // 不保证触发 visibilitychange —— 那样关窗后 <video> 会继续解码、
-                        // 弹幕 WebSocket 继续收发、本地代理继续转发，白白吃流量和 CPU。
+                        // 仅通知前端「窗口已隐藏」，用于让看门狗在后台期间不判故障。
+                        // ★ 刻意**不**让前端暂停播放/停弹幕/停代理：
+                        //   用户明确要求「放在后台也要播放，只要没关闭应用」。
+                        //   关到托盘只是隐藏窗口，WebView2 仍在正常解码，
+                        //   整条播放链路（本地代理转发 + MSE + 弹幕）保持运行。
+                        //   真正结束这一切的唯一方式是托盘菜单「退出」。
                         let _ = window.app_handle().emit("main-window-hidden", ());
                         let _ = window.hide();
                         api.prevent_close();

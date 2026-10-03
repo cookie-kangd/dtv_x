@@ -116,8 +116,20 @@ export function useTwitchLiveRooms(categoryKey: string | null, zhOnly: boolean =
   }, [fetchPage, hasMore, isLoading, isLoadingMore]);
 
   useEffect(() => {
+    // ★ 必须先判categoryKey 为空（本平台非 Twitch 时它就是 null）。
+    //   CommonStreamerList 在斗鱼/虎牙/抖音/B站页面也会挂载本 hook，
+    //   此前只有 lastInitialKeyRef 去重、**没有** canFetch 守卫，
+    //   而 key 会算成 "|zh"（≠ 初始的 null）→ 照样执行 loadInitialRooms()
+    //   → 用户每进入任意列表页都白打一次跨境 Twitch GQL 请求。
+    //   Twitch 需走系统代理，国内网络上通常还会挂到超时，纯属浪费。
+    //   写法与 useHuyaLiveRooms / useDouyuLiveRooms 等其余四个 hook 保持一致。
+    if (!categoryKey) {
+      setRooms([]);
+      setHasMore(false);
+      return;
+    }
     // 组合键包含 zhOnly：切换「推荐只看中文」后当前列表立即按新设置重载
-    const key = `${categoryKey ?? ""}|${slug ? "any" : zhOnly ? "zh" : "all"}`;
+    const key = `${categoryKey}|${slug ? "any" : zhOnly ? "zh" : "all"}`;
     if (lastInitialKeyRef.current === key) return;
     lastInitialKeyRef.current = key;
     cursorRef.current = null;

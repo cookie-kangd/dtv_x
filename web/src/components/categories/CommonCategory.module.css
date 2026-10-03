@@ -7,7 +7,9 @@
   min-height: 0;
   overflow: visible;
   transition: none;
-  will-change: max-height;
+  /* 不写 will-change: max-height —— max-height 是 layout 属性，
+     浏览器无法把它提升为合成层，这条声明除了浪费一条「已提升」的心智之外毫无效果。
+     本项目 player.css / FollowsList.module.css 里已因同一原因删除过 will-change: height。 */
   transform: translateZ(0);
   width: 100%;
   position: relative;

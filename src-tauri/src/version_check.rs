@@ -54,7 +54,10 @@ pub async fn check_version_cmd(
     // dtv_x 更新检查：直接读本仓库 GitHub 最新 Release，
     // 下载链接自动拼 gh-proxy 镜像前缀，国内网络可加速下载。
     const RELEASES_API: &str = "https://api.github.com/repos/cookie-kangd/dtv_x/releases/latest";
-    const MIRROR_PREFIX: &str = "https://v4.gh-proxy.org/";
+    // 镜像前缀统一用模块级那个常量，不要在此处再声明一份：
+    // 同名双份常量的典型隐患就是「改了一处漏了另一处」——
+    // 一旦只改下载用的那份，检查提示里拼出的镜像URL 会与实际下载逻辑不一致，
+    // 表现为「提示有更新但下载 404」。
     const RELEASES_PAGE: &str = "https://github.com/cookie-kangd/dtv_x/releases";
 
     let remote: Option<RemoteVersionInfo> = match client
