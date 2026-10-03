@@ -146,51 +146,108 @@ fn installer_dir() -> std::path::PathBuf {
 
 /// 判断本地已有安装包是否完整可用。
 /// expected_size 来自 Release 资产 size；缺失时退化为「文件大于 1MB 即认为可用」。
+/// 同时校验 MZ 头：上一次下载中途断网可能留下一个长度凑巧对的残缺文件，
+/// 复用它会让用户点了「立即更新」却什么都没发生。
 fn install_package_ready(path: &std::path::Path, expected_size: Option<u64>) -> bool {
-    match std::fs::metadata(path) {
+    let size_ok = match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => match expected_size {
             Some(s) if s > 0 => meta.len() == s,
             _ => meta.len() > 1024 * 1024,
         },
         _ => false,
+    };
+    size_ok && is_windows_exe(path)
+}
+
+/// 校验落盘文件确实是一个 Windows PE 可执行文件。
+///
+/// 必须校验：镜像站（gh-proxy）在限流、超时或路径失效时会返回 HTML 错误页，
+/// 而 GitHub API 返回的 size 只保证「长度对得上」，不保证「内容是 exe」。
+/// 如果把一张 HTML 错误页当安装包启动，用户看到的就是「双击后一闪而过、
+/// 什么都没发生」，比直接报错更难排查。
+fn is_windows_exe(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 2];
+    match f.read_exact(&mut magic) {
+        Ok(()) if &magic == b"MZ" => true,
+        _ => false,
     }
 }
 
-/// 以「延迟 + 分离进程」方式启动 NSIS 安装向导，随后立刻退出本应用。
+/// 判断当前进程是否运行在「正式安装目录」内。
 ///
-/// 为什么要延迟：本应用退出需要一点时间（WebView2 子进程回收等），若安装程序
-/// 立刻起来，其初始化阶段可能检测到「应用仍在运行」而弹出确认框。延迟 2 秒启动，
-/// 保证安装向导看到的是一个已经退干净的进程，用户直接一路下一步即可。
+/// 判据是同目录下存在 NSIS 写出的卸载器 `uninstall.exe`。
+/// 结果决定谁来关闭本应用：
+/// - 已安装：交给安装器自己的 Restart Manager 关闭（用户可在向导里点「否」取消，
+///   此时应用还活着，体验最接近手动双击安装包）；
+/// - 便携运行（exe 在下载目录等非安装位置）：必须本应用先退出，
+///   否则安装器覆盖文件时必然失败。
+fn running_from_install_dir() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    dir.join("uninstall.exe").is_file()
+}
+
+/// 直接启动 NSIS 安装包，等价于用户在资源管理器里双击它。
 ///
-/// 为什么用 cmd + ping 做延迟：分离进程里没有控制台，`timeout` 会报
-/// 「不支持输入重定向」，`ping -n` 是无需控制台的通用延时手段。
-fn launch_installer_detached(path: &std::path::Path) -> std::io::Result<()> {
+/// 这里绝对不能借道 `cmd /C "ping ... & start \"\" \"x.exe\""`：
+/// 1. Rust 的 `Command` 按 Windows 命令行规则转义参数，内层引号会变成 `\"`，
+///    而 cmd.exe 不认识反斜杠转义（它只认自己的引号规则），于是 `start` 拿到的是
+///    一串带反斜杠的垃圾参数 → 弹出 CMD 窗口 + 报错，正是之前的现象。
+/// 2. `CREATE_NO_WINDOW` 与 `DETACHED_PROCESS` 同时给时，前者会被系统忽略
+///    （MSDN 明确：CREATE_NO_WINDOW 与 DETACHED_PROCESS 互斥），
+///    所以那个黑色 CMD 窗口一定会闪出来。
+/// 3. `ping` 做延时本身就不可靠，还额外引入一个 cmd 进程。
+///
+/// NSIS 安装包是 GUI 子系统程序，本身不会分配控制台，所以直接 spawn 它
+/// 既不会闪出任何黑窗口，也不需要任何延时技巧。
+///
+/// 参数说明（来自 Tauri NSIS 模板）：
+/// - `/UPDATE`：走「更新」分支，跳过先跑一遍旧版卸载器的步骤，
+///   从而保留开始菜单/桌面快捷方式、开机自启和应用数据。
+///   不传它的话，每次更新都会被当成「卸载 + 重装」，
+///   既多一步交互，又可能把用户的配置数据删掉。
+/// - `/P`：passive 模式，只显示一个带进度条的小窗口，不弹任何对话框，
+///   并且安装前由安装器直接强制结束正在运行的旧进程（跳过「是否关闭程序」的询问）。
+/// - `/R`：passive 模式安装成功后自动重启应用（passive 会跳过结束页，
+///   结束页那个「运行」复选框不存在，只能靠这个开关）。
+fn spawn_installer(path: &std::path::Path, silent: bool) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-        // ping 127.0.0.1 -n 3 ≈ 2 秒
-        let script = format!(
-            "ping 127.0.0.1 -n 3 >nul & start \"\" \"{}\"",
-            path.display()
-        );
-        let spawned = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(script)
-            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-            .spawn();
-        if spawned.is_ok() {
-            return Ok(());
+        let mut cmd = std::process::Command::new(path);
+        cmd.arg("/UPDATE");
+        if silent {
+            cmd.arg("/P");
+            cmd.arg("/R");
         }
-        // 分离启动失败时回退为直接启动（此时文件句柄已关闭，不会被文件占用拦住）
-        std::process::Command::new(path).spawn().map(|_| ())
+        // 只给 DETACHED_PROCESS：让安装器不挂在我们的控制台/进程树上，
+        // 我们退出后它继续活着跑完。
+        Ok(cmd
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .map(|_| ())?)
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new(path).spawn().map(|_| ())
+        let mut cmd = std::process::Command::new(path);
+        cmd.arg("/UPDATE");
+        if silent {
+            cmd.arg("/P");
+            cmd.arg("/R");
+        }
+        Ok(cmd.spawn().map(|_| ())?)
     }
 }
 
@@ -369,12 +426,17 @@ pub async fn download_and_install_cmd(
     Err(last_err)
 }
 
-/// 启动安装向导并立刻退出应用。
-/// 退出应用是必须的：否则安装程序覆盖 dtv_x.exe 时会因文件被占用而失败。
+/// 启动安装向导。
+///
+/// 两种模式，取决于当前进程是否跑在正式安装目录里：
+/// - 已安装：直接启动安装器，**不退出本应用**。安装器自带 Restart Manager，
+///   会在真正覆盖文件前把 DTV_X 关掉；万一用户在向导里点「否」取消安装，
+///   本应用还活着，不会出现「应用没了、装也没装上」的最坏情况。
+///   体验与手动双击安装包完全一致。
+/// - 便携运行（exe 不在安装目录）：安装器找不到也关不掉本进程，
+///   必须由我们自己退出，否则覆盖安装必然失败。
 async fn launch_installer(app: &AppHandle, path: &std::path::Path) -> Result<(), String> {
-    // 双保险：调用方已确保句柄关闭，这里再确认文件存在且非零
-    if !path.is_file() {
-        let msg = format!("安装包不存在：{}", path.display());
+    let fail = |msg: String| -> Result<(), String> {
         let _ = app.emit(
             "update-progress",
             UpdateProgress {
@@ -385,38 +447,66 @@ async fn launch_installer(app: &AppHandle, path: &std::path::Path) -> Result<(),
                 message: Some(msg.clone()),
             },
         );
-        return Err(msg);
+        Err(msg)
+    };
+
+    if !path.is_file() {
+        return fail(format!("安装包不存在：{}", path.display()));
+    }
+    // 大小对得上不代表内容是 exe：镜像站限流时会返回一张 HTML 错误页，
+    // 长度可能刚好接近。这种文件启动后什么都不会发生，必须提前拦下。
+    if !is_windows_exe(path) {
+        let _ = std::fs::remove_file(path);
+        return fail(
+            "下载到的安装包不是有效的可执行文件（可能是镜像站返回了错误页面）。\n请检查网络后重试，或点击「打开下载页」手动下载。"
+                .into(),
+        );
     }
 
-    // 稍等一拍，让前端把「正在启动安装向导」渲染出来
+    let installed = running_from_install_dir();
+
+    // 稍等一拍，让前端把「安装向导已启动」渲染出来再动作
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-    match launch_installer_detached(path) {
-        Ok(_) => {
-            // 立即退出，释放 dtv_x.exe 自身占用，让安装向导可以直接覆盖安装。
-            // 走和托盘「退出」完全相同的路径：置QUITTING + 停所有后台任务 + 关所有窗口。
-            // 原来这里直接 app.exit(0)，QUITTING 还是 false，
-            // 万一退出过程中触发窗口事件，会误走「隐藏到托盘」分支。
-            crate::really_quit(app);
+    match spawn_installer(path, !installed) {
+        Ok(()) => {
+            if installed {
+                // 已安装：安装器会自己处理本进程的关闭，这里不能退出，
+                // 否则用户在向导里点「取消」就两头落空。
+                // 发「launched」而不是「installing」：本应用还活着，
+                // 前端必须恢复按钮可点，否则用户取消安装后就再也无法重试。
+                let msg = "安装向导已启动，请按提示完成安装（DTV_X 会在覆盖文件前自动关闭）";
+                let _ = app.emit(
+                    "update-progress",
+                    UpdateProgress {
+                        phase: "launched".into(),
+                        downloaded: 0,
+                        total: 0,
+                        percent: 100.0,
+                        message: Some(msg.into()),
+                    },
+                );
+            } else {
+                // 便携运行：静默安装 + 安装完自动重启，然后退出本应用
+                let msg = "正在退出本应用并静默安装…";
+                let _ = app.emit(
+                    "update-progress",
+                    UpdateProgress {
+                        phase: "installing".into(),
+                        downloaded: 0,
+                        total: 0,
+                        percent: 100.0,
+                        message: Some(msg.into()),
+                    },
+                );
+                crate::really_quit(app);
+            }
             Ok(())
         }
-        Err(e) => {
-            let msg = format!(
-                "启动安装程序失败：{}。安装包已下载到 {}，可手动双击安装。",
-                e,
-                path.display()
-            );
-            let _ = app.emit(
-                "update-progress",
-                UpdateProgress {
-                    phase: "error".into(),
-                    downloaded: 0,
-                    total: 0,
-                    percent: 0.0,
-                    message: Some(msg.clone()),
-                },
-            );
-            Err(msg)
-        }
+        Err(e) => fail(format!(
+            "启动安装程序失败：{}。\n安装包已保存到 {}，可手动双击安装。",
+            e,
+            path.display()
+        )),
     }
 }
