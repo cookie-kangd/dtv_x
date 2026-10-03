@@ -388,6 +388,12 @@ export function MainPlayer({
   // 这期间若照常判定「卡死」，就会对完全正常的流发起重连 —— 那正是
   // 「后台待久了回来发现重连过」的真实成因。所以后台只做数据流入观测，不判故障。
   const windowHiddenRef = useRef(false);
+  // ★ 最近一次「真实用户操作」的时刻（点击/按键），用于区分
+  //   「用户主动暂停」与「系统/内核自动暂停」。
+  //   两者在 <video> 上都表现为 paused === true，语义却完全相反。
+  const lastUserInputAtRef = useRef(0);
+  // 后台期间「数据链路完全中断」的起始时刻（readyState 归零计时用）
+  const hiddenDeadSinceRef = useRef(0);
   // 画面最近一次「确实在推进」的 currentTime + 时刻。
   // 注意用 currentTime 判定推进本身就不可靠（直播是 live 流，播放头常被钉在缓冲末尾），
   // 所以它只用于「粗略发现画面完全没动过」，真正的卡死判定要看缓冲是否仍在增长。
@@ -1052,6 +1058,31 @@ export function MainPlayer({
       if (windowHiddenRef.current) {
         lastProgressRef.current = { time: video.currentTime, at: now };
         lastBufferedRef.current = { end: bufferedEnd, at: now };
+        // ★ 后台保活：即便已通过启动参数禁用了后台解码优化，
+        //   Chromium 仍可能因为省电策略把不可见窗口的 <video> 置为 paused。
+        //   用户在后台既看不到界面也不会去点播放，一旦被暂停就再没人能恢复，
+        //   最终演变成「挂一阵回来就解码失败」。这里每 3 秒兜一次。
+        //   userPausedRef 已在 pause 事件里做过真伪甄别，
+        //   系统自动暂停不会被误记成用户意图而挡住这里。
+        if (video.paused && !video.ended && !userPausedRef.current && !ctx.loading) {
+          void video.play().catch(() => {});
+        }
+        // 后台断流兜底：readyState 归零意味着连元数据/首帧都没有，
+        // 这是数据链路真的断了。它不会被后台节流误伤 ——
+        // 节流只影响解码与渲染节奏，不会把已有的 readyState 打回 0。
+        // 没有这一段，后台期间看门狗完全躺平，真断网时用户回到前台
+        // 只会看到一个早已死掉的播放器（v0.2.9 的「只能手动刷新」）。
+        if (video.readyState === 0) {
+          const since = hiddenDeadSinceRef.current || now;
+          hiddenDeadSinceRef.current = since;
+          if (now - since >= 60000) {
+            hiddenDeadSinceRef.current = 0;
+            console.warn("[Player] 后台期间数据链路中断超过 60s，自动重连");
+            scheduleReconnect("后台数据链路中断");
+          }
+        } else {
+          hiddenDeadSinceRef.current = 0;
+        }
         return;
       }
       // 免打扰期内不判断流：刚恢复的流最容易出现「重建缓冲 → 短暂停顿」，
@@ -1254,6 +1285,22 @@ export function MainPlayer({
     );
   }, []);
 
+  // 记录「真实用户操作」的时刻，供 player.on("pause") 区分
+  // 用户主动暂停 与 系统/内核自动暂停（详见该处的注释）。
+  // 用捕获阶段监听：xgplayer 自己的控件可能会 stopPropagation，
+  // 捕获阶段能保证这类点击同样被记到。
+  useEffect(() => {
+    const mark = () => {
+      lastUserInputAtRef.current = Date.now();
+    };
+    document.addEventListener("pointerdown", mark, true);
+    document.addEventListener("keydown", mark, true);
+    return () => {
+      document.removeEventListener("pointerdown", mark, true);
+      document.removeEventListener("keydown", mark, true);
+    };
+  }, []);
+
   // 关窗到托盘 → 继续播放（不停弹幕、不停代理）；再次唤起 → 什么都不用做。
   //
   // ★ v0.2.7 的旧行为已按用户要求推翻：那时 Rust hide 之后前端会
@@ -1287,11 +1334,42 @@ export function MainPlayer({
           // 被当成「已经卡了很久」而立刻误判一次假死。
           lastProgressRef.current = { time: -1, at: Date.now() };
           lastBufferedRef.current = { end: -1, at: Date.now() };
-          // 少数情况下 Chromium 会在窗口隐藏期间自动暂停媒体（省电策略等），
-          // 这里兜底恢复一次；本来就在播的视频完全不受影响。
+
+          let video: HTMLVideoElement | undefined;
           try {
-            const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
-            if (video && video.paused && !userPausedRef.current) void video.play().catch(() => {});
+            video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
+          } catch {
+            video = undefined;
+          }
+
+          // ★ 唤回自愈：后台期间这条流可能已经被判死（错误页 / 自动重连次数用尽 /
+          //   video.error 已置位）。用户回到前台应该直接看到恢复好的画面，
+          //   而不是盖着一层「解码失败」还得手动点刷新 —— 那正是 v0.2.9 的表现。
+          // 主播确实未开播（blocked）的情况排除在外：此时重载只会再撞一次未开播。
+          const dead =
+            !reconnectBlockedRef.current &&
+            (reconnectGaveUpRef.current || watchdogCtxRef.current.hasError || !!video?.error);
+          if (dead) {
+            console.info("[Player] 窗口唤回时检测到播放已中断，自动重新取流恢复");
+            // 解除「已放弃自动重连」的封印，让这一轮能真正跑起来
+            reconnectGaveUpRef.current = false;
+            reconnectAttemptRef.current = 0;
+            reconnectRoundStartRef.current = 0;
+            reconnectDeferredRef.current = false;
+            reconnectCooldownUntilRef.current = 0;
+            fetchFailStreakRef.current = 0;
+            setStreamError(null);
+            setIsOfflineError(false);
+            void reloadStreamRef.current?.("refresh");
+            return;
+          }
+
+          // 正常情况：Chromium 可能在隐藏期间自动暂停了媒体，兜底恢复一次；
+          // 本来就在播的视频完全不受影响。
+          try {
+            if (video && video.paused && !video.ended && !userPausedRef.current) {
+              void video.play().catch(() => {});
+            }
           } catch {
             // ignore
           }
@@ -1687,10 +1765,18 @@ export function MainPlayer({
           userPausedRef.current = false;
         });
         player.on?.("pause", () => {
-          // 只在「本来在播」的情况下才算用户主动暂停；
-          // 起播前的自动 pause（autoplay 被拒等）不算。
+          // ★ 只有紧跟一次真实用户操作（点暂停按钮 / 按空格）的 pause 才算「用户主动暂停」。
+          //   下面这些都同样会触发 pause 事件，但都不是用户意图：
+          //     · 窗口不可见时 Chromium 的省电/后台视频优化自动暂停
+          //     · 缓冲耗尽（waiting）期间内核自己暂停
+          //     · 起播阶段 autoplay 被拒
+          //   旧实现不加区分一律置 true，后果严重且隐蔽：
+          //   后台挂一阵 → Chromium 自动暂停 → 被记成「用户主动暂停」
+          //   → 看门狗从此对它彻底躺平、后台保活也被这个标记挡住
+          //   → 用户回到前台看到「解码失败」，只能手动点刷新。
           const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
-          if (video && !video.ended) userPausedRef.current = true;
+          if (!video || video.ended) return;
+          userPausedRef.current = Date.now() - lastUserInputAtRef.current < 800;
         });
       } catch {
         // ignore

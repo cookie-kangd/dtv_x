@@ -264,11 +264,28 @@ fn main() {
     // 关键修复：禁用 WebView2/Chromium 的后台节流（计时器节流、遮挡判定、渲染降级）。
     // 否则应用挂后台/最小化时 hls.js/flv.js 的拉流与保活计时器被冻结 → 直播断流卡住，
     // 必须切回前台手动刷新。此环境变量在 WebView2 控制器创建前设置即可生效。
+    //
+    // ★ v0.2.10 追加 --disable-background-video-optimization：
+    //   上面那组参数只挡住了「计时器节流 / 渲染进程后台化 / 遮挡判定」，
+    //   但 Chromium 另有一套独立的 **后台视频解码优化**（Chrome 61 引入）：
+    //   页面不可见约 10 秒后，它会主动把视频解码帧率降到 0（见 crbug 1218642）。
+    //   解码一停，MSE 的 SourceBuffer 只进不出 → 很快触及配额，
+    //   内核随即抛错，表现就是「挂在后台过一会就解码失败，手动刷新才好」。
+    //   这是后台播放失败的直接根因，前面的节流参数挡不住它。
+    //
+    // ★ 另外补 --autoplay-policy=no-user-gesture-required：
+    //   窗口从托盘唤回后，前端要主动 video.play() 把被系统暂停的播放恢复回来；
+    //   默认 autoplay 策略会因为没有用户手势而拒绝这次恢复，导致唤回后永久黑屏。
     #[cfg(target_os = "windows")]
     {
         env::set_var(
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-            "--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion",
+            "--disable-background-timer-throttling \
+             --disable-backgrounding-occluded-windows \
+             --disable-renderer-backgrounding \
+             --disable-background-video-optimization \
+             --autoplay-policy=no-user-gesture-required \
+             --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
         );
     }
     // Create a new HTTP client instance to be managed by Tauri
