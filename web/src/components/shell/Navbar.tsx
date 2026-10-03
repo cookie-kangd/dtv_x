@@ -115,7 +115,7 @@ export function Navbar({
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
-  const [updatePhase, setUpdatePhase] = useState<"idle" | "downloading" | "installing" | "error">("idle");
+  const [updatePhase, setUpdatePhase] = useState<"idle" | "downloading" | "installing" | "launched" | "error">("idle");
   const [updatePercent, setUpdatePercent] = useState<number>(0);
   const [updateMsg, setUpdateMsg] = useState<string>("");
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
@@ -123,7 +123,8 @@ export function Navbar({
   // 应用内更新：下载进度事件（Rust 侧 download_and_install_cmd 发出）
   useEffect(() => {
     const un = listen<{
-      phase: "downloading" | "installing" | "error";
+      // launched = 安装向导已启动且本应用仍存活（正常安装路径），按钮需恢复可点
+      phase: "downloading" | "installing" | "launched" | "error";
       percent: number;
       message?: string;
     }>("update-progress", (e) => {
@@ -145,15 +146,17 @@ export function Navbar({
     setUpdateMsg("正在连接下载源…");
     try {
       // Rust 侧行为：本地已有完整安装包 → 跳过下载直接进入安装；
-      // 否则下载完成后关闭文件句柄 → 延迟分离启动安装向导 → 本应用立即退出。
+      // 否则下载完成后关闭文件句柄 → 直接启动 NSIS 安装向导（不经 cmd，
+      // 因此不会闪黑窗）。已安装时由安装器自己关闭 DTV_X，本应用保持存活。
       await invoke("download_and_install_cmd", {
         url: versionInfo.url,
         version: versionInfo.version,
         size: versionInfo.size ?? null
       });
-      // 成功路径：Rust 侧会启动安装程序并退出应用
-      setUpdatePhase("installing");
-      setUpdateMsg("安装向导已启动，本应用即将退出");
+      // 兜底：正常情况下 Rust 的 update-progress 事件已经把状态改对了，
+      // 这里只处理事件因退出而丢失的情况。
+      setUpdatePhase((prev) => (prev === "downloading" ? "launched" : prev));
+      setUpdateMsg((prev) => prev || "安装向导已启动，请按提示完成安装");
     } catch (err) {
       setUpdatePhase("error");
       setUpdateMsg(typeof err === "string" ? err : String(err));
@@ -986,7 +989,7 @@ export function Navbar({
                   </ul>
                 ) : null}
 
-                {updatePhase === "downloading" || updatePhase === "installing" ? (
+                {updatePhase === "downloading" || updatePhase === "installing" || updatePhase === "launched" ? (
                   <div className={styles.updateProgressWrap}>
                     <div className={styles.updateProgressTrack}>
                       <div
@@ -995,9 +998,9 @@ export function Navbar({
                       />
                     </div>
                     <div className={styles.updateProgressText}>
-                      {updatePhase === "installing"
-                        ? updateMsg || "安装向导已启动，本应用即将退出"
-                        : `正在下载更新 ${updatePercent.toFixed(1)}%`}
+                      {updatePhase === "downloading"
+                        ? `正在下载更新 ${updatePercent.toFixed(1)}%`
+                        : updateMsg || "安装向导已启动，请按提示完成安装"}
                     </div>
                   </div>
                 ) : null}
@@ -1018,7 +1021,9 @@ export function Navbar({
                             ? "正在退出并启动安装…"
                             : updatePhase === "error"
                               ? "重试更新"
-                              : "立即更新"}
+                              : updatePhase === "launched"
+                                ? "再次启动安装向导"
+                                : "立即更新"}
                       </button>
                       <button
                         type="button"
