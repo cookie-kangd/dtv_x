@@ -345,16 +345,20 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
             for (let i = 0; i < prev.length; i += 1) {
               const a = prev[i];
               const b = normalized[i];
-              if (a.type !== b.type) {
+              // ★ 必须写成两个独立的 if 分支，不能合并成
+              //   `a.type === "streamer" && ...b.data.platform...`：
+              //   那样 TS 只对 a 完成了收窄，b 仍是
+              //   FollowedStreamer | FollowFolder联合类型，
+              //   访问 b.data.platform 直接报 TS2339。
+              if (a.type === "folder") {
+                if (b.type !== "folder" || a.data.id !== b.data.id) {
+                  same = false;
+                  break;
+                }
+              } else if (b.type !== "streamer") {
                 same = false;
                 break;
-              }
-              if (a.type === "folder" && a.data.id !== b.data.id) {
-                same = false;
-                break;
-              }
-              if (
-                a.type === "streamer" &&
+              } else if (
                 `${a.data.platform}:${a.data.id}` !== `${b.data.platform}:${b.data.id}`
               ) {
                 same = false;
