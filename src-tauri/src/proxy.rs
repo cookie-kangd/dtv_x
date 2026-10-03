@@ -490,8 +490,9 @@ pub async fn start_proxy(
             eprintln!("{}", msg);
             msg
         })?;
-    let server = server.run();
 
+    // ★ 不需要（也不能）调 .run()：HttpServer::bind() 返回的已经是
+    //   actix_web::dev::Server（已绑定、未启动），直接 handle()/await 即可。
     let server_handle_for_state = server.handle();
     *server_handle_state.0.lock().unwrap() = Some(server_handle_for_state);
 
@@ -533,6 +534,10 @@ pub async fn start_static_proxy_server(
     // ★ 这里必须用 fn 而不是闭包：闭包捕获了 stream_url_data_for_actix 会被move 走，
     //   只能调用一次（FnOnce），无法在「候选端口循环」里复用（E0382）。
     //   改成普通函数，每次调用各拿一份 clone，互不影响。
+    //
+    // ★ 注意 HttpServer::bind() 的返回类型：actix-web 4 中它直接返回
+    //   **actix_web::dev::Server**（已绑定、未启动），不是 HttpServer ——
+    //   所以这里既不能写 `-> io::Result<HttpServer>`，也不能再调 `.run()`（E0599/E0308）。
     fn build_server(bound_port: u16, store: StreamUrlStore) -> std::io::Result<actix_web::dev::Server> {
         let stream_url_data_for_actix = web::Data::new(store);
         HttpServer::new(move || {
@@ -621,8 +626,8 @@ pub async fn start_static_proxy_server(
     let base = format!("http://127.0.0.1:{}", bound_port);
     *static_proxy_base_cell().lock().unwrap() = Some(base.clone());
 
-    let server = server.run();
-
+    // ★ 不需要（也不能）再调 .run()：HttpServer::bind() 返回的已经是
+    //   actix_web::dev::Server，直接 await 它即启动。
     // Do NOT overwrite the main proxy server handle; run static proxy independently
 
     tauri::async_runtime::spawn(async move {
