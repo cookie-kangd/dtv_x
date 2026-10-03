@@ -478,12 +478,13 @@ pub async fn start_proxy(
     // ★ 取回操作系统实际分配的端口。
     //   find_free_port 现在传 0 让系统挑端口，所以必须用 addrs() 读回真实值，
     //   否则 proxy_url 里会带着端口 0，前端拿到 http://127.0.0.1:0/live.flv 直接失效。
+    //   注意：Server::addrs() 返回的已经是 std::net::SocketAddr，不需要（也没有）
+    //   as_std() 方法。
     let bound_port: u16 = server
         .addrs()
         .into_iter()
         .next()
-        .and_then(|addr| addr.as_std().ok())
-        .map(|std_addr| std_addr.port())
+        .map(|addr| addr.port())
         .ok_or_else(|| {
             let msg = "[Rust/proxy.rs] 无法获取代理服务器实际绑定的端口".to_string();
             eprintln!("{}", msg);
@@ -529,9 +530,11 @@ pub async fn start_static_proxy_server(
         return Ok(existing);
     }
 
-    let stream_url_data_for_actix = web::Data::new(stream_url_store.inner().clone());
-
-    let build_server = |bound_port: u16| {
+    // ★ 这里必须用 fn 而不是闭包：闭包捕获了 stream_url_data_for_actix 会被move 走，
+    //   只能调用一次（FnOnce），无法在「候选端口循环」里复用（E0382）。
+    //   改成普通函数，每次调用各拿一份 clone，互不影响。
+    fn build_server(bound_port: u16, store: StreamUrlStore) -> std::io::Result<actix_web::dev::Server> {
+        let stream_url_data_for_actix = web::Data::new(store);
         HttpServer::new(move || {
             let app_data_stream_url = stream_url_data_for_actix.clone();
             let app_data_reqwest_client = web::Data::new(
@@ -579,7 +582,7 @@ pub async fn start_static_proxy_server(
         })
         .keep_alive(Duration::from_secs(120))
         .bind(("127.0.0.1", bound_port))
-    };
+    }
 
     // 逐个候选端口尝试，直到 bind 成功。
     // 不再「遇到 AddrInUse 就假定已运行」—— 那正是错误 base 被永久缓存的源头。
@@ -587,7 +590,7 @@ pub async fn start_static_proxy_server(
     let mut bound_port = 0u16;
     let mut last_err: Option<std::io::Error> = None;
     for candidate in PORT_CANDIDATES {
-        match build_server(candidate) {
+        match build_server(candidate, stream_url_store.inner().clone()) {
             Ok(srv) => {
                 server = Some(srv);
                 bound_port = candidate;
