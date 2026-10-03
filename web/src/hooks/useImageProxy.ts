@@ -24,6 +24,19 @@ function setSharedProxyBase(nextBase: string) {
   }
 }
 
+/**
+ * 丢弃当前缓存的 base，让下一次 ensureProxyStarted 重新向Rust 申请。
+ *
+ * 背景：Rust 侧静态代理的幂等判断已改为「本进程是否启动过它」，
+ * 不再靠「端口能否连上」猜测（后者会把占用同端口的其它进程误认成我们的代理）。
+ * 但如果这里仍持有一个坏base，早退逻辑就会一直复用它、永不重试。
+ * 图片加载失败时调用它即可让整条链路重新自愈。
+ */
+export function invalidateSharedProxyBase() {
+  sharedEnsurePromise = null;
+  setSharedProxyBase("");
+}
+
 function subscribeSharedProxyBase(fn: () => void) {
   sharedSubscribers.add(fn);
   return () => {
@@ -45,7 +58,12 @@ export function useImageProxy() {
 
   const ensureProxyStarted = useCallback(async () => {
     try {
-      if (getSharedProxyBase()) return;
+      const current = getSharedProxyBase();
+      // 只信任「看起来确实是本地代理 base」的值。
+      // 万一拿到空串或明显异常的地址，宁可丢弃重试，也不要永久缓存一个坏 base
+      // —— 那会让全站封面/头像永久加载失败且无法自愈。
+      if (current && /^https?:\/\/127\.0\.0\.1:\d+\/?$/.test(current)) return;
+      if (current) invalidateSharedProxyBase();
       if (!sharedEnsurePromise) {
         sharedEnsurePromise = invoke<string>("start_static_proxy_server")
           .then((base) => {
