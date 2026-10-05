@@ -144,7 +144,7 @@ async fn image_proxy_handler(
 async fn flv_proxy_handler(
     _req: HttpRequest,
     stream_url_store: web::Data<StreamUrlStore>,
-    client: web::Data<Client>,
+    client: web::Data<StreamForwardClient>,
 ) -> impl Responder {
     let url = stream_url_store.url.lock().unwrap().clone();
     if url.is_empty() {
@@ -156,7 +156,11 @@ async fn flv_proxy_handler(
         url
     );
 
+    // ★ 必须用 StreamForwardClient（无总超时）：
+    //   这里转发的是无限长的直播流，任何总超时都会周期性掐断直播
+    //   （v0.2.8~v0.2.10 曾误用图片的 20s 超时 client，直播每 20 秒断一次）。
     let mut req = client
+        .0
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .header("Accept", "video/x-flv,application/octet-stream,*/*")
@@ -245,6 +249,43 @@ async fn flv_proxy_handler(
 /// 遵循系统代理的 HTTP 客户端（Twitch 等海外平台必须走系统代理，不能 no_proxy）
 #[derive(Clone)]
 pub struct SystemProxyHttpClient(pub Client);
+
+/// ★ 直播流转发专用 HTTP 客户端（/live.flv 回源用）。
+///
+/// **绝对不能设置 reqwest 的总 `.timeout()`**：
+/// reqwest 的 timeout 覆盖「连接 → 请求 → 响应体读完」全程。
+/// 直播流是一条无限长的流式响应，任何总超时都等于
+/// 「每隔 N 秒强制掐断一次直播」。
+///
+/// 这正是 v0.2.8~v0.2.10「网络稳定却一直转圈重连」的根因：
+/// 当时把图片 client 的超时从 2 小时收紧到 20 秒（修 actix worker 被挂住的
+/// 图片请求耗尽的问题），但 /live.flv 转发提取的 `web::Data<Client>`
+/// 与图片共用同一个类型实例 —— 结果直播流每 20 秒被强制掐断一次，
+/// 前端 flv.js 收不到数据 → 转圈 → 内核报断流 → 重连 → 又播 20 秒 → 循环。
+/// 表现为「正常看直播也会转圈然后进入重连」，且手动刷新能好（重连后又
+/// 能播 20 秒）。前端重连判据怎么改都治不好，因为流是真的断了。
+///
+/// 这里的保护只放在**连接阶段**（connect_timeout），连上之后想读多久读多久；
+/// 连接挂死由 tcp_keepalive 兜底。用独立的包装类型（而非裸 Client），
+/// 就是为了在类型层面杜绝「图片/流转发共用一个 Data<Client>」这种事故再发生。
+#[derive(Clone)]
+pub struct StreamForwardClient(pub Client);
+
+fn build_stream_forward_client() -> Client {
+    Client::builder()
+        .no_proxy()
+        .http1_only()
+        .gzip(false)
+        .brotli(false)
+        .no_deflate()
+        // 只保护「建立连接」阶段：回源 CDN 挂死时别把 worker 钉住太久
+        .connect_timeout(Duration::from_secs(15))
+        // 流式转发连接是长连接，用完即弃；留 1 条空闲给切换画质/软切换复用
+        .pool_max_idle_per_host(1)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .expect("failed to build stream forward client")
+}
 
 #[derive(Deserialize)]
 struct HlsQuery {
@@ -455,6 +496,10 @@ pub async fn start_proxy(
                 .build()
                 .expect("failed to build client"),
         );
+        // ★ 直播流转发专用 client：绝不能带总超时（详见类型定义处的注释）。
+        //   图片的 20s 超时一旦误用于 /live.flv，直播每 20 秒被掐断一次。
+        let app_data_stream_client =
+            web::Data::new(StreamForwardClient(build_stream_forward_client()));
         // 走系统代理的客户端（Twitch 等海外平台回源用）
         let app_data_system_client = web::Data::new(SystemProxyHttpClient(
             Client::builder()
@@ -468,6 +513,7 @@ pub async fn start_proxy(
         App::new()
             .app_data(app_data_stream_url)
             .app_data(app_data_reqwest_client)
+            .app_data(app_data_stream_client)
             .app_data(app_data_system_client)
             .wrap(actix_cors::Cors::permissive())
             .route("/live.flv", web::get().to(flv_proxy_handler))
@@ -567,6 +613,10 @@ pub async fn start_static_proxy_server(
                 .build()
                 .expect("failed to build client"),
         );
+        // ★ 直播流转发专用 client：绝不能带总超时（详见类型定义处的注释）。
+        //   图片的 20s 超时一旦误用于 /live.flv，直播每 20 秒被掐断一次。
+        let app_data_stream_client =
+            web::Data::new(StreamForwardClient(build_stream_forward_client()));
         // 走系统代理的客户端（Twitch 等海外平台回源用）
         let app_data_system_client = web::Data::new(SystemProxyHttpClient(
             Client::builder()
@@ -580,6 +630,7 @@ pub async fn start_static_proxy_server(
         App::new()
             .app_data(app_data_stream_url)
             .app_data(app_data_reqwest_client)
+            .app_data(app_data_stream_client)
             .app_data(app_data_system_client)
             .wrap(actix_cors::Cors::permissive())
             .route("/live.flv", web::get().to(flv_proxy_handler))
