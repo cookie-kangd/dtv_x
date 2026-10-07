@@ -1480,18 +1480,22 @@ export function MainPlayer({
        //   注意必须读 danmuEnabledRef：startDanmaku 的闭包里 isDanmuEnabled
        //   只在 useCallback 重建那一刻准确，而本函数正是被该依赖驱动重建的，
        //   直接用 ref 最保险，也顺手去掉 startDanmaku 对 isDanmuEnabled 的依赖。
-       if (!danmuEnabledRef.current) {
-         danmuBackendCtxRef.current = null;
-         return;
-       }
 
-       // 记下启动上下文：关闭开关时要靠它停后端，打开时要靠它原样重启。
+       // ★ 启动上下文必须在开关判断「之前」记录，且开关关闭时绝不能清空。
+       //   ctx 描述的是「当前这个房间的弹幕该怎么起」，与开关开还是关无关：
+       //   关掉开关只是暂停后端，房间没变，重新打开时要靠它原样恢复。
+       //   曾经在关闭分支里 `ctx = null`，结果「关闭 → 再打开」永远恢复不了
+       //   （打开时读到的 ctx 是 null，直接 return，弹幕再也回不来）。
        danmuBackendCtxRef.current = {
          sessionId,
          platform: platformToStart,
          backendRoomId: roomIdToStart,
          filterRoomId: roomIdToFilter || roomIdToStart
        };
+
+       if (!danmuEnabledRef.current) {
+         return;
+       }
 
        try {
          try {
@@ -2467,15 +2471,18 @@ export function MainPlayer({
       } catch {
         // ignore
       }
-      danmuBackendCtxRef.current = null;
+      // 注意：这里不能清 danmuBackendCtxRef —— 它记录的是「当前房间的弹幕
+      // 该怎么起」，清掉之后重新打开开关就无从恢复，弹幕会永久消失。
       void stopAllDanmakuBackends();
       return;
     }
 
-    // 打开：仅当播放器已经就绪且会话仍然有效时才重启。
-    // 若此刻正在取流/切房间，mountPlayer 会用新的上下文正常启动，这里不重复插手。
+    // 打开：按记录的上下文原样重启。
+    // 不再用 reloadInFlightRef 拦：取流期间用户打开开关也要生效。
+    // startDanmaku 自身是幂等的（开头先 stopAllDanmakuBackends），
+    // 且每次 await 后都用 isSessionActive 复核会话，与 mountPlayer 并发也安全。
     const ctx = danmuBackendCtxRef.current;
-    if (!ctx || !playerRef.current || reloadInFlightRef.current) return;
+    if (!ctx || !playerRef.current) return;
     if (!isSessionActive(ctx.sessionId)) return;
     void startDanmaku(
       ctx.sessionId,
