@@ -186,6 +186,39 @@ export const persistDanmuPreferences = (payload: { enabled: boolean; settings: D
   }
 };
 
+// 「用户是否手动切换过弹幕开关」的独立标记。
+//
+// ★ 为什么不能靠 loadDanmuPreferences() 是否非空来判断：
+//   MainPlayer 每次挂载都会 persistDanmuPreferences(...)，而子组件 effect 先于
+//   父组件执行 —— 等「全局默认弹幕开关」那个 effect 跑到时，localStorage 里
+//   必然已经被自己写进去一份偏好，于是 loadDanmuPreferences() 永远返回真对象，
+//   设置项 danmuDefaultOn 从此永久失效且无任何报错。
+//   用一个只由「用户手动点开关」写入的独立 key，才能诚实表达
+//   「用户是否表达过偏好」这件事。
+export const DANMU_ENABLED_OVERRIDE_KEY = 'dtv_danmu_enabled_override_v1';
+
+export const hasDanmuEnabledOverride = (): boolean => {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(DANMU_ENABLED_OVERRIDE_KEY) !== null;
+  } catch {
+    return false;
+  }
+};
+
+export const persistDanmuEnabledOverride = (enabled: boolean) => {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(DANMU_ENABLED_OVERRIDE_KEY, enabled ? '1' : '0');
+  } catch {
+    // ignore
+  }
+};
+
 export const loadDanmuKeywordBlockPreferences = (): DanmuKeywordBlockPreferences | null => {
   if (typeof window === 'undefined' || !window.localStorage) {
     return null;

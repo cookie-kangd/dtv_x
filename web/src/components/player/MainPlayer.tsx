@@ -16,10 +16,12 @@ import type { DanmuKeywordBlockPreferences, DanmuUserSettings } from "@/componen
 import {
   applyDanmuFontFamilyForOS,
   DANMU_BLOCK_KEYWORDS_CHANGED_EVENT,
+  hasDanmuEnabledOverride,
   ICONS,
   loadDanmuKeywordBlockPreferences,
   loadDanmuPreferences,
   loadStoredVolume,
+  persistDanmuEnabledOverride,
   persistDanmuKeywordBlockPreferences,
   persistDanmuPreferences,
   sanitizeDanmuArea,
@@ -290,11 +292,22 @@ export function MainPlayer({
     }
   }, [appSettings.hydrated, appSettings.settings.defaultQuality, platform]);
 
-  // 全局默认弹幕开关：仅当用户从未手动设置过弹幕偏好时生效
+  // 全局默认弹幕开关：仅当用户从未手动设置过弹幕偏好时生效。
+  //
+  // ★ v0.2.13 修复：旧实现用 loadDanmuPreferences() 是否非空来判断「用户是否
+  //   设置过偏好」，但本组件每次挂载都会 persistDanmuPreferences(...) 写盘，
+  //   子组件 effect 又先于父组件执行 —— 等这里跑到时 localStorage 里必然已经
+  //   有了自己写的偏好，于是 danmuDefaultOn 从此永久失效、且不报任何错。
+  //   现在改用独立标记 hasDanmuEnabledOverride()（只由用户手动点开关写入）。
   useEffect(() => {
     if (!appSettings.hydrated) return;
-    if (appSettings.settings.danmuDefaultOn) return;
-    if (loadDanmuPreferences()) return; // 用户已有持久化偏好，不覆盖
+    if (appSettings.settings.danmuDefaultOn) {
+      // 默认开启：仅在用户从未手动表达过偏好时把状态拉回开启。
+      if (!hasDanmuEnabledOverride()) setIsDanmuEnabled(true);
+      return;
+    }
+    // 默认关闭：同样只在用户未手动设置过时生效。
+    if (hasDanmuEnabledOverride()) return;
     setIsDanmuEnabled(false);
   }, [appSettings.hydrated, appSettings.settings.danmuDefaultOn]);
   const { ensureProxyStarted, getAvatarSrc } = useImageProxy();
@@ -474,10 +487,40 @@ export function MainPlayer({
   // 与「默认开启、只有用户主动关闭才关闭」的产品预期直接冲突。
   // 现在启动态恒为开启；用户手动关闭后本次运行内立即生效（由 ref + overlay 同步），
   // 字号/颜色/透明度等观感设置仍照常持久化。
-  const [isDanmuEnabled, setIsDanmuEnabled] = useState(true);
+  const [isDanmuEnabled, setIsDanmuEnabledState] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    // 用户手动切换过就沿用其选择；否则用默认开启，
+    // 待 SettingsProvider hydrate 后由下面的 effect 按 danmuDefaultOn 校正。
+    return hasDanmuEnabledOverride() ? loadDanmuPreferences()?.enabled !== false : true;
+  });
+  /**
+   * 用户手动切换弹幕开关的统一入口。
+   * 除了 setState，还要落下「用户表达过偏好」这个标记 ——
+   * 否则 danmuDefaultOn 会在下次进房时把它覆盖掉，开关等于没记。
+   */
+  const setIsDanmuEnabled = useCallback((next: boolean) => {
+    setIsDanmuEnabledState(next);
+    try {
+      persistDanmuEnabledOverride(next);
+    } catch {
+      // ignore
+    }
+  }, []);
   useEffect(() => {
     danmuEnabledRef.current = isDanmuEnabled;
   }, [isDanmuEnabled]);
+  // ★ 记录「本次会话已经启动过弹幕后端」所需的全部参数。
+  //   弹幕开关关闭时我们要停掉 Rust 侧的 WebSocket，打开时又要能原样重启，
+  //   所以必须把启动参数留存一份；用 ref 是为了不被重建播放器/切房间的中间态污染。
+  const danmuBackendCtxRef = useRef<null | {
+    sessionId: number;
+    platform: Platform;
+    backendRoomId: string;
+    filterRoomId: string;
+  }>(null);
+  // 弹幕开关 effect 的首帧跳过标记：首次挂载时后端的启停由
+  // mountPlayer → startDanmaku 按开关状态自行决定，不需要这里再插一脚。
+  const danmuToggleFirstRunRef = useRef(true);
   const [danmuSettings, setDanmuSettings] = useState<DanmuUserSettings>(() => {
     if (typeof window === "undefined") return DEFAULT_DANMU_SETTINGS;
     const stored = loadDanmuPreferences();
@@ -763,7 +806,12 @@ export function MainPlayer({
         opts?: { isAutoReconnect?: boolean }
       ) => Promise<void>)
   >(null);
-  const qualityReloadArmedRef = useRef(false);
+  // 上一次的画质/线路值：用于判断「是否真的发生了用户可见的切换」，
+  // 取代旧的布尔闩锁（那玩意会把进房时的默认值同步误判成用户切换）。
+  const lastQualityLineRef = useRef<{ quality: string | null; line: string | null }>({
+    quality: null,
+    line: null
+  });
   const reloadInFlightRef = useRef(false);
   const pendingReloadRef = useRef<null | {
     trigger: "refresh" | "quality" | "line";
@@ -1423,6 +1471,28 @@ export function MainPlayer({
        if (!roomIdToStart) return;
        if (!isSessionActive(sessionId)) return;
 
+       // ★ 弹幕开关关闭时根本不启动底层 WebSocket。
+       //   旧实现是「先无条件起 5 个平台的 WS + 心跳，再在投递前用 ref 拦掉」，
+       //   结果是：关掉弹幕后，5 条 WebSocket 仍在收包、仍在解码、仍逐条跨进程
+       //   emit danmaku-message 到前端（被 :1488 的判断丢掉），CPU/网络/内存
+       //   全都白付，唯一效果只是「看不见」。
+       //   这里提前返回，让开关真正决定底层资源的有无。
+       //   注意必须读 danmuEnabledRef：startDanmaku 的闭包里 isDanmuEnabled
+       //   只在 useCallback 重建那一刻准确，而本函数正是被该依赖驱动重建的，
+       //   直接用 ref 最保险，也顺手去掉 startDanmaku 对 isDanmuEnabled 的依赖。
+       if (!danmuEnabledRef.current) {
+         danmuBackendCtxRef.current = null;
+         return;
+       }
+
+       // 记下启动上下文：关闭开关时要靠它停后端，打开时要靠它原样重启。
+       danmuBackendCtxRef.current = {
+         sessionId,
+         platform: platformToStart,
+         backendRoomId: roomIdToStart,
+         filterRoomId: roomIdToFilter || roomIdToStart
+       };
+
        try {
          try {
            overlay?.clear?.();
@@ -1517,7 +1587,7 @@ export function MainPlayer({
       }
       unlistenRef.current.add(unlisten);
     },
-    [isDanmuEnabled, isSessionActive, stopAllDanmakuBackends, clearDanmakuListeners]
+    [isSessionActive, stopAllDanmakuBackends, clearDanmakuListeners]
   );
 
   const mountPlayer = useCallback(
@@ -1879,11 +1949,16 @@ export function MainPlayer({
       arrangeControlClusters(player);
 
       // danmu overlay
-      const overlay = createDanmuOverlay(player, danmuSettings, isDanmuEnabled) as DanmuOverlayInstance | null;
+      // ★ 读 ref 而非 state：mountPlayer 是一次性建播放器的动作，
+      //   把 isDanmuEnabled 挂成依赖会让「切一下弹幕开关」也重建 mountPlayer
+      //   身份，进而让 reloadStream 身份变化（虽然不会自动重取流，但纯属无谓抖动）。
+      //   开关的实时值由 danmuEnabledRef 提供，语义上更准确。
+      const danmuOnAtMount = danmuEnabledRef.current;
+      const overlay = createDanmuOverlay(player, danmuSettings, danmuOnAtMount) as DanmuOverlayInstance | null;
       danmuOverlayRef.current = overlay;
       try {
-        applyDanmuOverlayPreferences?.(overlay, danmuSettings, isDanmuEnabled, player.root as any);
-        syncDanmuEnabledState(overlay, danmuSettings, isDanmuEnabled, player.root as any);
+        applyDanmuOverlayPreferences?.(overlay, danmuSettings, danmuOnAtMount, player.root as any);
+        syncDanmuEnabledState(overlay, danmuSettings, danmuOnAtMount, player.root as any);
       } catch {
         // ignore
       }
@@ -1897,7 +1972,6 @@ export function MainPlayer({
       currentLine,
       currentQuality,
       danmuSettings,
-      isDanmuEnabled,
       isSessionActive,
       lineOptions,
       platform,
@@ -2366,6 +2440,52 @@ export function MainPlayer({
     }
   }, [danmuSettings, isDanmuEnabled]);
 
+  // ★ 弹幕开关真正控制底层资源的有无（双向）。
+  //
+  // 关闭：解绑前端监听器 + 停掉 Rust 侧全部 5 个平台弹幕 WebSocket 与心跳。
+  // 打开：按上次记录的启动上下文原样重启，用户不必刷新房间就能看到弹幕。
+  //
+  // 为什么必须双向：只做「关闭」会让「打开」变成死开关（后端已停，永远起不来）；
+  // 只做「打开」则第一次进房时若开关是关的，startDanmaku 里的提前返回
+  // 会让它再也起不来。两个方向都要接上。
+  //
+  // 幂等保护：startDanmaku 开头会 stopAllDanmakuBackends，所以这里
+  // 「先停再启」不会留下重复的 WebSocket。
+  useEffect(() => {
+    // 首次挂载不做事：那时 startDanmaku/mountPlayer 自己会按开关状态决定。
+    const isFirstRunRef = danmuToggleFirstRunRef;
+    if (isFirstRunRef.current) {
+      isFirstRunRef.current = false;
+      return;
+    }
+
+    if (!isDanmuEnabled) {
+      // 先解绑：否则停后端期间到达的最后几条消息还会被投进已清空的 overlay。
+      clearDanmakuListeners();
+      try {
+        danmuOverlayRef.current?.clear?.();
+      } catch {
+        // ignore
+      }
+      danmuBackendCtxRef.current = null;
+      void stopAllDanmakuBackends();
+      return;
+    }
+
+    // 打开：仅当播放器已经就绪且会话仍然有效时才重启。
+    // 若此刻正在取流/切房间，mountPlayer 会用新的上下文正常启动，这里不重复插手。
+    const ctx = danmuBackendCtxRef.current;
+    if (!ctx || !playerRef.current || reloadInFlightRef.current) return;
+    if (!isSessionActive(ctx.sessionId)) return;
+    void startDanmaku(
+      ctx.sessionId,
+      danmuOverlayRef.current,
+      ctx.platform,
+      ctx.backendRoomId,
+      ctx.filterRoomId
+    );
+  }, [isDanmuEnabled, clearDanmakuListeners, isSessionActive, startDanmaku, stopAllDanmakuBackends]);
+
   useEffect(() => {
     try {
       persistDanmuKeywordBlockPreferences(danmuKeywordBlock);
@@ -2393,10 +2513,20 @@ export function MainPlayer({
 
   useEffect(() => {
     // quality / line change triggers reload (debounced a bit)
-    if (!qualityReloadArmedRef.current) {
-      qualityReloadArmedRef.current = true;
-      return;
-    }
+    //
+    // ★ v0.2.13 修复：旧实现用「布尔闩锁」跳过挂载那一次，效果是把
+    //   「用户第一次真正切画质」这个动作给吞掉了。
+    //   因为进房时的默认值同步（:282 那段把 defaultQuality 写进 state）
+    //   也会走这个 effect，而闩锁在更早的空跑里已经被消耗掉，
+    //   于是默认值同步 → 触发一次完整 reloadStream → 停弹幕+停代理+重取流+重建播放器，
+    //   用户看到的是「刚进房间就自己又加载了一遍」。
+    //   现在改成记录上一次的画质/线路值：只有相对上次**真的变了**才重取流。
+    const prev = lastQualityLineRef.current;
+    if (prev.quality === currentQuality && prev.line === currentLine) return;
+    const isFirstSync = prev.quality === null;
+    lastQualityLineRef.current = { quality: currentQuality, line: currentLine };
+    // 首次同步是「把默认值落到 state」，不是用户操作，不该重取流。
+    if (isFirstSync) return;
     const id = window.setTimeout(() => void reloadStream("quality"), 80);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -1,6 +1,6 @@
 [package]
 name = "dtv_x"
-version = "0.2.12"
+version = "0.2.13"
 description = "DTV X - Live Stream Client"
 authors = ["cookie-kangd"]
 edition = "2021"
@@ -21,13 +21,13 @@ prost-build = "0.12"
 [dependencies]
 # tray-icon：系统托盘（关闭窗口最小化到托盘）；
 # image-png / image-ico：让 tauri 能解码打包图标，default_window_icon() 才有值、托盘才有图标
-tauri = { version = "2.12.0", features = ["macos-private-api", "tray-icon", "image-png", "image-ico"] }
-tauri-plugin-opener = "2.6.0"
+tauri = { version = "2.12.1", features = ["macos-private-api", "tray-icon", "image-png", "image-ico"] }
+tauri-plugin-opener = "2.7.0"
 # 单实例互斥：同一个 exe 只允许一个进程在跑。
 # 没有它时，窗口关到托盘后再次双击快捷方式会开出第二个 DTV_X：
 # 两份弹幕监听 + 两个静态图片代理（端口相同会AddrInUse）+ 两套 WebView2，内存直接翻倍。
 tauri-plugin-single-instance = "2.5.2"
-tauri-plugin-window-state = "2"
+tauri-plugin-window-state = "2.5.0"
 window-vibrancy = "0.7.1"
  serde = { version = "1.0", features = ["derive"] }
  serde_json = "1.0.117"
@@ -44,9 +44,10 @@ window-vibrancy = "0.7.1"
  percent-encoding = "2.1"
  serde_urlencoded = "0.7"
  reqwest = { version = "0.12", features = ["json", "stream", "cookies", "brotli", "gzip", "blocking"] }
- actix-web = "4"
- actix-cors = "0.7"
- awc = { version = "3.4.0", features = ["tls-rustls-0_22"] }
+actix-web = "4"
+actix-cors = "0.7"
+# v0.2.13 移除 awc：源码里已无任何 awc:: 引用（proxy.rs 早已改用 reqwest 流式转发），
+# 它是一整套 HTTP 客户端 + TLS 栈，白白拖长编译时间并增大安装包。
 bytes = "1"
 bytes04 = { package = "bytes", version = "0.4.12" }
 log = "0.4"
