@@ -457,11 +457,27 @@ export function MainPlayer({
   currentLineRef.current = currentLine;
   lineOptionsRef.current = lineOptions;
 
-  const [isDanmuEnabled, setIsDanmuEnabled] = useState(() => {
-    if (typeof window === "undefined") return true;
-    const stored = loadDanmuPreferences();
-    return stored?.enabled ?? true;
-  });
+  // ★ 弹幕开关的「实时值」镜像（ref 必须声明在 useState 之前，
+  //   否则会构成 TDZ 引用错误）。
+  //
+  // 弹幕消息监听器是在建播放器时注册一次的，生命周期长于开关的每一次切换。
+  // 若监听器直接闭包捕获 isDanmuEnabled，它会永远停留在注册那一刻的值：
+  // 进房间时若是关闭状态，用户之后手动打开也依然被判定为「不该显示弹幕」，
+  // 所有弹幕在投递前就被丢弃 —— 表现就是「手动打开开关也没有弹幕」。
+  // 必须通过 ref 读取最新值，让开关联动立即生效。
+  const danmuEnabledRef = useRef(true);
+
+  // ★ 弹幕默认开启：进入直播间一律默认显示弹幕。
+  //
+  // 原实现从 localStorage 恢复上次的 enabled。问题是这个开关的历史值
+  // 可能来自旧版本的各种误操作，一旦被关过一次，之后每次启动都是关闭状态 ——
+  // 与「默认开启、只有用户主动关闭才关闭」的产品预期直接冲突。
+  // 现在启动态恒为开启；用户手动关闭后本次运行内立即生效（由 ref + overlay 同步），
+  // 字号/颜色/透明度等观感设置仍照常持久化。
+  const [isDanmuEnabled, setIsDanmuEnabled] = useState(true);
+  useEffect(() => {
+    danmuEnabledRef.current = isDanmuEnabled;
+  }, [isDanmuEnabled]);
   const [danmuSettings, setDanmuSettings] = useState<DanmuUserSettings>(() => {
     if (typeof window === "undefined") return DEFAULT_DANMU_SETTINGS;
     const stored = loadDanmuPreferences();
@@ -1466,7 +1482,10 @@ export function MainPlayer({
           }
         }
 
-        if (isDanmuEnabled && overlay?.sendComment) {
+        // ★ 必须读 ref 而不是闭包里的 isDanmuEnabled：
+        //   监听器注册后不会随开关切换重新注册，闭包值会永远停在注册那一刻，
+        //   导致「手动打开开关后仍然一条弹幕都没有」。
+        if (danmuEnabledRef.current && overlay?.sendComment) {
           try {
             overlay.sendComment({
               id: msg.id,
