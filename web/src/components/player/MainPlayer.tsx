@@ -100,35 +100,108 @@ const RELOAD_HARD_TIMEOUT_MS = 20000;
 // 停止类命令是幂等的，超时后继续往下走是安全的（下次重连会再停一次）。
 const INVOKE_TIMEOUT_MS = 4000;
 
-// ===== 音频轨健康度守卫（详见 attachAudioTrackGuard 的注释）=====
-// 「有画面没声音、音量明明开着、点一下刷新就好」不是音量问题，而是
-// xgplayer-flv 的源缓冲只在第一帧数据时创建一次、之后永不重算导致的音频轨丢失。
-// 源缓冲创建后，再给内核一段确认时间；到期仍未解析出音频参数即判定音频轨丢失。
-const AUDIO_TRACK_GUARD_DELAY_MS = 6000;
-// 同一个直播间内最多自动重建几次音频轨。
+// ===== 音频输出健康度守卫（详见 attachAudioTrackGuard 的注释）=====
+// 「有画面没声音、音量明明开着、点一下刷新就好」不是音量问题，而是音频通道没建立起来。
+//
+// ★ 血泪教训：**绝不能用「内核是否解析出音频参数」当健康判据**。
+//   xgplayer-flv 的源缓冲只在第一帧数据时创建一次（_sourceCreated 闩锁），
+//   之后永不重算；音频参数哪怕晚一帧到，也没人会去补建音频源缓冲。
+//   此时 audioTrack.exist() 会是 true（参数确实解析到了），
+//   但音频源缓冲压根不存在 —— 用前者判定就会把「已坏」误判成「健康」而放过。
+//   所以这里一律用「事实判据」：音频源缓冲建没建、有没有数据、有没有真的解码出音频字节。
+const AUDIO_GUARD_INTERVAL_MS = 1000; // 观察节奏
+const AUDIO_GUARD_MAX_ROUNDS = 45; // 观察窗口总长（约 45s）
+const AUDIO_GUARD_GRACE_MS = 4000; // 画面起播后额外放宽的时间（刚起播时音频还没解码属正常）
+// 同一个直播间内最多自动修复几次。
 // 有上限才是安全的：万一上游确实是一路无音轨的流，也不会陷入反复重载。
 const AUDIO_TRACK_MAX_HEAL_ATTEMPTS = 2;
 
 /**
- * 读取 FLV 内核对「音频轨」的当前认知，用于判断音频轨是否真的没建立起来。
- *
- * · present : FLV 文件头声明了有音频轨（内核解析出的声明值）
- * · resolved: 已经解析出可解码的音频参数（codec / sampleRate / channelCount）
- *
- * 返回 null 表示拿不到（HLS 分支、插件尚未就绪或播放器已销毁）——此时一律不做判定。
+ * 读 xgplayer-flv 内核里「音频源缓冲」的真实状态。
+ * 返回 null 表示当前不是 FLV 分支（HLS）或拿不到内核实例。
  */
-const readFlvAudioTrackState = (player: any): { present: boolean; resolved: boolean } | null => {
+const readFlvAudioSourceState = (player: any): { created: boolean; hasData: boolean } | null => {
   try {
-    const flvPlugin = player?.getPlugin?.("flv") ?? player?.plugins?.flv ?? null;
-    const track = flvPlugin?.flv?._bufferService?._demuxer?.audioTrack ?? null;
-    if (!track) return null;
-    return {
-      present: !!track.present,
-      resolved: typeof track.exist === "function" ? !!track.exist() : false
-    };
+    const flv = player?.getPlugin?.("flv")?.flv ?? player?.plugins?.flv?.flv ?? null;
+    const mse = flv?._bufferService?._mse ?? null;
+    const map = mse?._sourceBuffer ?? null;
+    if (!mse || !map) return null;
+    // 内核用 TrackType 当键（值是 "video" / "audio"）。这里不硬编码，
+    // 顺便容错一次：万一上游改了键的写法，仍能按名字片段认出来。
+    let sb: any = map["audio"] ?? null;
+    if (!sb) {
+      for (const k of Object.keys(map)) {
+        if (String(k).toLowerCase().includes("audio")) {
+          sb = map[k];
+          break;
+        }
+      }
+    }
+    if (!sb) return { created: false, hasData: false };
+    let hasData = false;
+    try {
+      const b = sb.buffered;
+      hasData = !!b && b.length > 0 && b.end(b.length - 1) > 0;
+    } catch {
+      hasData = false;
+    }
+    return { created: true, hasData };
   } catch {
     return null;
   }
+};
+
+/**
+ * 「音频到底有没有在出声」的事实判据（FLV / HLS 通用）。
+ *
+ * decided = 是否已经能给出结论；alive = 结论是否为「音频正常」；
+ * hard    = 该结论是否为「结构性铁证」（可直接动手修复），
+ *           为 false 时需要连续多轮确认，避免把解码起步延迟误判成故障。
+ *
+ * 判据优先级：
+ *   1) FLV：音频源缓冲压根没创建 —— 结构性铁证，有画面也一定没声音；
+ *   2) Chromium/WebView2：webkitAudioDecodedByteCount（已解码音频字节数）
+ *      > 0 即真的在出声；视频已在解码而音频 0 字节 = 没声音；
+ *   3) 其余情况一律按「未决」处理、继续观察，绝不误判成故障。
+ */
+const readAudioOutputState = (
+  player: any
+): { decided: boolean; alive: boolean; hard: boolean; detail: string } => {
+  const flvState = readFlvAudioSourceState(player);
+  if (flvState && !flvState.created) {
+    return { decided: true, alive: false, hard: true, detail: "flv 音频源缓冲未创建" };
+  }
+
+  const video = (player?.video ?? null) as HTMLVideoElement | null;
+  if (video && typeof (video as any).webkitAudioDecodedByteCount === "number") {
+    const audioBytes = Number((video as any).webkitAudioDecodedByteCount) || 0;
+    const videoBytes =
+      typeof (video as any).webkitVideoDecodedByteCount === "number"
+        ? Number((video as any).webkitVideoDecodedByteCount) || 0
+        : 0;
+    if (audioBytes > 0) {
+      return { decided: true, alive: true, hard: false, detail: `已解码音频 ${audioBytes} 字节` };
+    }
+    if (videoBytes > 0 || (flvState && flvState.hasData)) {
+      return {
+        decided: true,
+        alive: false,
+        hard: false,
+        detail: `画面已解码 ${videoBytes} 字节但音频 0 字节`
+      };
+    }
+    return { decided: false, alive: false, hard: false, detail: "音视频均尚无解码数据（起播中）" };
+  }
+
+  if (flvState) {
+    return {
+      decided: true,
+      alive: flvState.hasData,
+      hard: false,
+      detail: flvState.hasData ? "flv 音频源缓冲已有数据" : "flv 音频源缓冲无数据"
+    };
+  }
+  return { decided: false, alive: false, hard: false, detail: "无可用判据" };
 };
 
 /**
@@ -837,7 +910,7 @@ export function MainPlayer({
     | ((
         trigger: "refresh" | "quality" | "line",
         overrides?: { quality?: string; line?: string | null },
-        opts?: { isAutoReconnect?: boolean }
+        opts?: { isAutoReconnect?: boolean; forceRebuild?: boolean }
       ) => Promise<void>)
   >(null);
   // 上一次的画质/线路值：用于判断「是否真的发生了用户可见的切换」，
@@ -850,7 +923,7 @@ export function MainPlayer({
   const pendingReloadRef = useRef<null | {
     trigger: "refresh" | "quality" | "line";
     overrides?: { quality?: string; line?: string | null };
-    opts?: { isAutoReconnect?: boolean };
+    opts?: { isAutoReconnect?: boolean; forceRebuild?: boolean };
   }>(null);
 
   const isSessionActive = useCallback((sessionId: number) => {
@@ -1246,7 +1319,7 @@ export function MainPlayer({
   }, [commitReconnectHealthy, notePlaybackProgress, scheduleReconnect]);
 
   /**
-   * ===== 音频轨健康度守卫：根治「刚进直播间有画面没声音、刷新一下才有声音」=====
+   * ===== 音频输出守卫：根治「刚进直播间有画面没声音、刷新一下才有声音」=====
    *
    * 结论先行：**这不是音量问题**。
    *   · player.volume / muted 是对 <video> 的直通代理（Player extends MediaProxy）；
@@ -1255,7 +1328,7 @@ export function MainPlayer({
    *   · 自定义音量控件也只会在用户拖动时写盘。
    * 所以「音量显示是开的」和「实际没声音」可以同时成立 —— 因为声音根本没被送进解码器。
    *
-   * 真正的根因在 xgplayer-flv 的 MSE 源缓冲创建时机上
+   * FLV 分支的根因在 xgplayer-flv 的 MSE 源缓冲创建时机上
    * （xgplayer-flv/es/flv/services/buffer-service.js · appendBuffer）：
    *
    *   if (!this._sourceCreated) {
@@ -1278,77 +1351,121 @@ export function MainPlayer({
    * 所以「刷新一下就有声音」——这正是用户观察到的现象，也正是本守卫要自动化的动作。
    *
    * 内核这一行为改不动（也不该在这里改），应用层唯一可靠的做法是：
-   * 发现「画面已经在放，但音频轨始终没建立」就自动执行一次与「手动点刷新」完全相同的
-   * 重载，把源缓冲整体重建。次数有上限，避免在真的没有音轨的流上反复重载。
+   * 发现「画面已经在放，但音频始终没有真的出声」就自动修复一次。
+   *
+   * ── 判定方式（v0.2.16 重写）──────────────────────────────────────────
+   * 上一版守卫用 `audioTrack.exist()`（内核是否已解析出音频参数）当健康判据，
+   * 这是错的：它只说明「参数解析到了」，完全不说明「音频源缓冲建了」。
+   * 参数晚到一帧的情形下 exist() 为 true、音频源缓冲却是空的，
+   * 于是被误判成健康而放过 —— 这是上一版没修好的直接原因。
+   *
+   * 现在改成**周期性事实判定**（1s 一次，最长约 45s）：
+   *   ① 先确认画面真的在放（未暂停 + readyState≥2 + currentTime>0），否则不算故障；
+   *   ② 画面起播后再给 4s 宽限期；
+   *   ③ 用 readAudioOutputState 取事实：音频源缓冲是否创建、是否已解码出音频字节。
+   * 只有拿到「确凿没声音」才动手，拿不准就继续观察，绝不误判。
+   *
+   * 另外保留了三条内核事件快路径（analyzedurationexceeded / 迟到的音频参数 / loadstart），
+   * 能提前定性时就不必等轮询。
+   *
+   * 修复动作分级：第 1 次走与「手动点刷新」完全相同的软切换路径；
+   * 第 2 次升级为彻底重建播放器（换掉内核与 demuxer，最强复位）。
+   * 次数有上限，避免在真的没有音轨的流上反复重载。
    */
   const attachAudioTrackGuard = useCallback(
     (player: any, sessionId: number) => {
       // ★ 全部用「本次挂载」的局部变量记账，不放到 ref 上：
       //   换播放器实例后旧值会污染新实例的判断。
-      let audioEstablished = false;
-      let sourceBuffersCreated = false;
-      let healFired = false;
-      let guardTimer: number | null = null;
-      // 画面还没真正跑起来时（起播慢/仍在缓冲）不算音频问题，允许再等几轮。
-      let probeRounds = 0;
+      let healed = false;
+      let rounds = 0;
+      let playStartedAt = 0;
+      let brokenStreak = 0;
+      let timer: number | null = null;
 
-      const clearGuardTimer = () => {
-        if (guardTimer !== null) {
-          window.clearTimeout(guardTimer);
-          guardTimer = null;
+      const clearTimer = () => {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+          timer = null;
         }
       };
 
       const heal = (reason: string) => {
-        if (healFired || !isSessionActive(sessionId)) return;
+        if (healed || !isSessionActive(sessionId)) return;
         if (audioHealAttemptsRef.current >= AUDIO_TRACK_MAX_HEAL_ATTEMPTS) {
           console.warn(
-            `[Player] 音频轨缺失（${reason}），已自动重建 ${AUDIO_TRACK_MAX_HEAL_ATTEMPTS} 次仍未恢复，停止重试`
+            `[Player] 音频未输出（${reason}），已自动修复 ${AUDIO_TRACK_MAX_HEAL_ATTEMPTS} 次仍未恢复，停止重试`
           );
           return;
         }
-        healFired = true;
-        clearGuardTimer();
+        healed = true;
+        clearTimer();
         audioHealAttemptsRef.current += 1;
+        const attempt = audioHealAttemptsRef.current;
+        // 第 1 次走「手动点刷新」那条路径（软切换，代价最小、不闪）；
+        // 第 2 次升级为彻底重建播放器 —— 换掉内核实例与 demuxer，是最强的复位。
+        const forceRebuild = attempt >= AUDIO_TRACK_MAX_HEAL_ATTEMPTS;
         console.warn(
-          `[Player] 检测到音频轨未建立（${reason}），自动重载以重建源缓冲` +
-            `（第 ${audioHealAttemptsRef.current}/${AUDIO_TRACK_MAX_HEAL_ATTEMPTS} 次）`
+          `[Player] 判定音频未输出（${reason}），自动修复（第 ${attempt}/${AUDIO_TRACK_MAX_HEAL_ATTEMPTS} 次` +
+            `${forceRebuild ? "，彻底重建播放器" : "，走刷新路径"}）`
         );
-        // 走的就是用户点「刷新」按钮的那条路径：重新取流 + 重建播放器，
-        // 从而让音频源缓冲有机会被重新创建。
-        void reloadStreamRef.current?.("refresh");
+        void reloadStreamRef.current?.("refresh", undefined, { forceRebuild });
       };
 
-      /** 源缓冲定型后，延迟确认一次音频轨是否真的建立了；画面没起播就再等一轮。 */
-      const armProbe = () => {
-        if (guardTimer !== null) return;
-        guardTimer = window.setTimeout(() => {
-          guardTimer = null;
-          if (!isSessionActive(sessionId) || audioEstablished || healFired) return;
+      const tick = () => {
+        timer = null;
+        if (!isSessionActive(sessionId) || healed) return;
 
-          // 只有「画面确实在放」才算音频轨丢失：
-          // 否则可能只是起播还没开始，不该误判成故障。
-          const video = playerRef.current?.video as HTMLVideoElement | undefined;
-          if (!video || video.paused || video.readyState < 2) {
-            probeRounds += 1;
-            if (probeRounds <= 5) armProbe();
+        const video = (playerRef.current?.video ?? null) as HTMLVideoElement | null;
+        const playing = !!video && !video.paused && video.readyState >= 2 && video.currentTime > 0;
+
+        // 画面还没真正跑起来（起播慢 / 仍在缓冲 / 被用户暂停）不算音频故障，
+        // 但也必须有尽头，避免无限空转。
+        if (!playing) {
+          rounds += 1;
+          if (rounds <= AUDIO_GUARD_MAX_ROUNDS) timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          return;
+        }
+
+        // 画面起播后先给一段宽限期：刚起播的瞬间音频还没开始解码属于正常。
+        if (!playStartedAt) playStartedAt = Date.now();
+        if (Date.now() - playStartedAt < AUDIO_GUARD_GRACE_MS) {
+          timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          return;
+        }
+
+        const state = readAudioOutputState(playerRef.current);
+        if (state.alive) {
+          // 确凿有声音：收工，并把本房间的自愈次数清零。
+          console.info(`[Player] 音频守卫：音频正常（${state.detail}）`);
+          audioHealAttemptsRef.current = 0;
+          return;
+        }
+        if (state.decided) {
+          // 结构性铁证（如音频源缓冲根本没建）立刻动手；
+          // 计数器类判据要求连续三轮都判「没声音」，避免把解码起步延迟误判成故障。
+          brokenStreak = state.hard ? 3 : brokenStreak + 1;
+          if (brokenStreak >= 3) {
+            heal(state.detail);
             return;
           }
+          timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          return;
+        }
+        brokenStreak = 0;
 
-          const trackState = readFlvAudioTrackState(playerRef.current as any);
-          if (trackState?.resolved) {
-            // 内核其实已经解析出音频参数了（只是事件没收到），不必重建
-            audioEstablished = true;
-            return;
-          }
-          const detail =
-            trackState === null
-              ? "音频轨未建立"
-              : trackState.present
-                ? "文件头声明有音频轨但始终未解析出参数"
-                : "有音频数据但缺少音频参数（AAC sequence header）";
-          heal(detail);
-        }, AUDIO_TRACK_GUARD_DELAY_MS);
+        // 判据还不足以定性：继续观察。
+        rounds += 1;
+        if (rounds <= AUDIO_GUARD_MAX_ROUNDS) {
+          timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          return;
+        }
+        // 观察窗口结束仍拿不到解码字节时，退回到源缓冲这一铁证做最后判断。
+        const flvState = readFlvAudioSourceState(playerRef.current);
+        if (flvState && !flvState.created) {
+          heal("观察窗口结束，flv 音频源缓冲始终未创建");
+        } else {
+          console.info(`[Player] 音频守卫：观察窗口结束，未发现音频异常（${state.detail}）`);
+        }
       };
 
       const onCoreEvent = (payload: any) => {
@@ -1364,49 +1481,40 @@ export function MainPlayer({
         // 内核此时会把源缓冲整体复位（_sourceCreated = false）——
         // 本守卫的记账必须跟着复位，否则软切换后新丢的音频轨不会被发现。
         if (eventName.endsWith("loadstart")) {
-          audioEstablished = false;
-          sourceBuffersCreated = false;
-          healFired = false;
-          probeRounds = 0;
-          clearGuardTimer();
+          healed = false;
+          rounds = 0;
+          playStartedAt = 0;
+          brokenStreak = 0;
+          clearTimer();
+          timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
           return;
         }
 
-        if (eventName.endsWith("metadataparsed")) {
-          if (payload?.type !== "audio") return;
-          audioEstablished = true;
-          audioHealAttemptsRef.current = 0;
-          clearGuardTimer();
-          // 音频参数在源缓冲创建**之后**才解析出来 → 这次创建漏掉了音频源缓冲，
-          // 且内核不会再补建（_sourceCreated 已经闩住）→ 必然无声，立即重建。
-          // （真机复现：事件序列 core.sourcebuffercreated -> core.metadataparsed{audio}，
-          //   同时 sourceBuffers 数量始终为 0。）
-          if (sourceBuffersCreated) {
+        // 内核为了等某个「声明存在却没解析出参数」的轨道，攒够了 analyzeDuration
+        // （默认 20s）的媒体数据仍然放弃 —— 这次建出的源缓冲必然缺音频，直接修复。
+        if (eventName.endsWith("analyzedurationexceeded")) {
+          heal("内核等待音频参数超时放弃");
+          return;
+        }
+
+        // 音频参数在源缓冲创建**之后**才解析出来：这次创建漏了音频源缓冲，
+        // 且内核不会再补建（_sourceCreated 已经闩住）→ 必然无声，立即修复。
+        if (eventName.endsWith("metadataparsed") && payload?.type === "audio") {
+          if (!readAudioOutputState(playerRef.current).alive) {
             heal("音频参数晚于源缓冲创建");
           }
-          return;
-        }
-
-        if (eventName.endsWith("sourcebuffercreated")) {
-          sourceBuffersCreated = true;
-          if (audioEstablished) return;
-          armProbe();
-          return;
-        }
-
-        if (eventName.endsWith("analyzedurationexceeded")) {
-          // 内核为了等某个「声明存在却没解析出参数」的轨道，攒够了 analyzeDuration
-          // （默认 20s）的媒体数据仍然放弃 —— 直接重建，别再干等。
-          heal("内核等待音视频轨超时放弃");
         }
       };
 
       try {
         player.on?.("core_event", onCoreEvent);
-        player.on?.("destroy", clearGuardTimer);
+        player.on?.("destroy", clearTimer);
       } catch {
         // ignore
       }
+
+      // 即使一个内核事件都没收到，也总有人去做事实判定。
+      timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
     },
     [isSessionActive]
   );
@@ -2001,13 +2109,13 @@ export function MainPlayer({
       }
       playbackKindRef.current = isHlsPlayback ? "hls" : "flv";
 
-      // ===== 音频轨健康度守卫（仅 FLV）=====
+      // ===== 音频输出守卫（FLV + HLS 通用）=====
       // ★ 必须在播放器刚建好、第一帧数据到达之前挂上：
-      //   丢音频轨这件事发生在「本次进房的第一次源缓冲创建」，
-      //   挂晚了就观察不到 SOURCEBUFFER_CREATED。
-      if (!isHlsPlayback) {
-        attachAudioTrackGuard(player, sessionId);
-      }
+      //   丢音频这件事发生在「本次进房的第一次源缓冲创建」，
+      //   挂晚了就观察不到内核事件，也来不及在起播前开始观察。
+      // ★ 这里不再区分 FLV/HLS：判定用的是「事实判据」，两者通用，
+      //   而且 B 站等平台会走 HLS —— 上一版只护 FLV，HLS 房间是完全没被覆盖的。
+      attachAudioTrackGuard(player, sessionId);
 
       try {
         const storedPlayerVolume = loadStoredVolume();
@@ -2207,7 +2315,7 @@ export function MainPlayer({
     async (
       _trigger: "refresh" | "quality" | "line",
       overrides?: { quality?: string; line?: string | null },
-      opts?: { isAutoReconnect?: boolean }
+      opts?: { isAutoReconnect?: boolean; forceRebuild?: boolean }
     ) => {
       if (reloadInFlightRef.current) {
         // 上一次取流是否已经明显挂死（远超正常耗时却仍未收尾）
@@ -2296,6 +2404,15 @@ export function MainPlayer({
         if (reconnectAttemptRef.current >= 2) {
           destroyPlayer();
         }
+      }
+
+      // ★ forceRebuild：音频守卫在第 2 次修复时要求「最强复位」。
+      //   丢掉播放器实例 = 换掉 flv 内核、FlvDemuxer 和整块 MSE，
+      //   比 switchURL 软切换（复用同一个内核与 demuxer）复位得彻底得多。
+      //   提前销毁后，下面各平台的 canSoftSwitch 判定必然为 false，
+      //   统一落到 mountPlayer 做全量重建。
+      if (opts?.forceRebuild) {
+        destroyPlayer();
       }
 
       const effectiveQuality = overrides?.quality ?? currentQuality;
