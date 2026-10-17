@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "url": "/",
+        "titleBarStyle": "Overlay",
+        "decorations": false,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 33
+        },
+        "transparent": false,
+        "title": "",
+        "fullscreen": false,
+        "resizable": true,
+        "width": 1440,
+        "height": 810,
+        "center": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --enable-features=CanvasOopRasterization --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding --renderer-process-limit=2 --js-flags=--max-old-space-size=512"
+      }
+    ]
+  }
+}

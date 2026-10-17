@@ -287,6 +287,7 @@ async fn resolve_douyu_url(ctx: &StreamRenewContext) -> Result<String, String> {
         &ctx.room_id,
         &ctx.quality,
         ctx.line.as_deref(),
+        None,
     )
     .await
     .map_err(|e| e.to_string())

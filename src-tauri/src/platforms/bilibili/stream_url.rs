@@ -14,6 +14,7 @@ pub async fn get_bilibili_live_stream_url_with_quality(
     payload: crate::platforms::common::GetStreamUrlPayload,
     quality: String,
     cookie: Option<String>,
+    line: Option<usize>,
 ) -> Result<crate::platforms::common::LiveStreamInfo, String> {
     let room_id = payload.args.room_id_str.clone();
     if room_id.trim().is_empty() {
@@ -85,9 +86,9 @@ pub async fn get_bilibili_live_stream_url_with_quality(
             ("room_id", room_id.to_string()),
             ("protocol", "0,1".to_string()),
             ("format", "0,1,2".to_string()),
-            // 与参考 Python 版本保持一致：codec 使用 0，platform 使用 html5
-            ("codec", "0".to_string()),
-            ("platform", "html5".to_string()),
+            // 同时取得 AVC 与 HEVC，使用网页端取流协议
+            ("codec", "0,1".to_string()),
+            ("platform", "web".to_string()),
             ("dolby", "5".to_string()),
         ];
         if let Some(q) = qn {
@@ -107,8 +108,45 @@ pub async fn get_bilibili_live_stream_url_with_quality(
         if !status.is_success() {
             return Err(format!("PlayInfo status: {} body: {}", status, text));
         }
-        serde_json::from_str::<Value>(&text)
-            .map_err(|e| format!("JSON parse failed: {} | body: {}", e, text))
+        let json = serde_json::from_str::<Value>(&text)
+            .map_err(|e| format!("JSON parse failed: {} | body: {}", e, text))?;
+        check_bilibili_response(&json, "PlayInfo")?;
+        Ok(json)
+    }
+
+    // 先确认开播状态：未开播时直接返回，不必再发取流请求。
+    let room_init_url = format!(
+        "https://api.live.bilibili.com/room/v1/Room/room_init?id={}",
+        room_id
+    );
+    let init_resp = client
+        .get(&room_init_url)
+        .send()
+        .await
+        .map_err(|e| format!("room_init failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("room_init HTTP failed: {}", e))?;
+    let init_text = init_resp
+        .text()
+        .await
+        .map_err(|e| format!("room_init read text failed: {}", e))?;
+    let init_json: Value = serde_json::from_str(&init_text)
+        .map_err(|e| format!("room_init json failed: {} | {}", e, init_text))?;
+    check_bilibili_response(&init_json, "room_init")?;
+    let live_status = bilibili_live_status(&init_json)?;
+    if live_status != 1 {
+        return Ok(crate::platforms::common::LiveStreamInfo {
+            title: init_json["data"]["title"].as_str().map(|s| s.to_string()),
+            anchor_name: init_json["data"]["uname"].as_str().map(|s| s.to_string()),
+            avatar: None,
+            stream_url: None,
+            status: Some(0),
+            error_message: None,
+            upstream_url: None,
+            available_streams: None,
+            normalized_room_id: None,
+            web_rid: None,
+        });
     }
 
     // 1) First request to get qn mapping
@@ -236,243 +274,30 @@ pub async fn get_bilibili_live_stream_url_with_quality(
         quality, selected_qn, selected_desc
     );
 
-    // Determine live status from room_init
-    let room_init_url = format!(
-        "https://api.live.bilibili.com/room/v1/Room/room_init?id={}",
-        room_id
-    );
-    let init_resp = client
-        .get(&room_init_url)
-        .send()
-        .await
-        .map_err(|e| format!("room_init failed: {}", e))?;
-    let init_text = init_resp
-        .text()
-        .await
-        .map_err(|e| format!("room_init read text failed: {}", e))?;
-    let init_json: Value = serde_json::from_str(&init_text)
-        .map_err(|e| format!("room_init json failed: {} | {}", e, init_text))?;
-    let live_status = init_json["data"]["live_status"].as_i64().unwrap_or(0);
-    if live_status != 1 {
-        return Ok(crate::platforms::common::LiveStreamInfo {
-            title: init_json["data"]["title"].as_str().map(|s| s.to_string()),
-            anchor_name: init_json["data"]["uname"].as_str().map(|s| s.to_string()),
-            avatar: None,
-            stream_url: None,
-            status: Some(0),
-            error_message: None,
-            upstream_url: None,
-            available_streams: None,
-            normalized_room_id: None,
-            web_rid: None,
-        });
-    }
-
     enum SelectedStream {
         Flv(String),
         Hls(String),
     }
 
-    fn parse_stream_variants(
-        playurl: &Value,
-        selected_desc: &Option<String>,
-        selected_qn: Option<i32>,
-    ) -> (Vec<StreamVariant>, Option<String>, Vec<String>) {
-        let mut variants: Vec<StreamVariant> = Vec::new();
-        let mut hls_candidates: Vec<String> = Vec::new();
-        let mut flv_candidate: Option<String> = None;
-
-        if let Some(streams) = playurl.get("stream").and_then(|v| v.as_array()) {
-            for stream_item in streams {
-                let protocol_name = stream_item
-                    .get("protocol_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(formats) = stream_item.get("format").and_then(|v| v.as_array()) {
-                    for format_item in formats {
-                        let format_name = format_item
-                            .get("format_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if let Some(codecs) = format_item.get("codec").and_then(|v| v.as_array()) {
-                            for codec_item in codecs {
-                                let base_url = codec_item
-                                    .get("base_url")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                if let Some(url_infos) =
-                                    codec_item.get("url_info").and_then(|v| v.as_array())
-                                {
-                                    for ui in url_infos {
-                                        let host =
-                                            ui.get("host").and_then(|v| v.as_str()).unwrap_or("");
-                                        let extra =
-                                            ui.get("extra").and_then(|v| v.as_str()).unwrap_or("");
-                                        let composed = format!("{}{}{}", host, base_url, extra);
-                                        if composed.is_empty() {
-                                            continue;
-                                        }
-
-                                        variants.push(StreamVariant {
-                                            url: composed.clone(),
-                                            format: Some(format_name.to_string()),
-                                            desc: selected_desc.clone(),
-                                            qn: selected_qn,
-                                            protocol: if protocol_name.is_empty() {
-                                                None
-                                            } else {
-                                                Some(protocol_name.clone())
-                                            },
-                                        });
-
-                                        let is_hls_format = matches!(
-                                            format_name,
-                                            "ts" | "fmp4" | "mp4" | "m4s" | "m3u8"
-                                        );
-                                        let is_hls_protocol = protocol_name.contains("hls");
-                                        if is_hls_format || is_hls_protocol {
-                                            hls_candidates.push(composed.clone());
-                                        }
-                                        if format_name == "flv" && flv_candidate.is_none() {
-                                            flv_candidate = Some(composed.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+    // 取流不再串行探测 CDN：一次性拿到该画质的全部候选，由前端按索引切换失败线路。
+    let playinfo_selected = request_playinfo(&client, &room_id, selected_qn).await?;
+    let selected_live_status = bilibili_live_status(&playinfo_selected)?;
+    let variants_for_response = parse_stream_variants(
+        &playinfo_selected["data"]["playurl_info"]["playurl"],
+        &selected_desc,
+        selected_qn,
+    );
+    let selected_stream = if selected_live_status == 1 {
+        select_stream_variant(&variants_for_response, line).map(|variant| {
+            if variant.format.as_deref() == Some("flv") {
+                SelectedStream::Flv(variant.url.clone())
+            } else {
+                SelectedStream::Hls(variant.url.clone())
             }
-        }
-
-        (variants, flv_candidate, hls_candidates)
-    }
-
-    async fn verify_hls_candidates(
-        client: &reqwest::Client,
-        room_id: &str,
-        candidates: &[String],
-    ) -> Option<String> {
-        for candidate in candidates.iter().take(4) {
-            match client.get(candidate).send().await {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        eprintln!(
-                            "[Bilibili] Verified HLS candidate for room {} -> {}",
-                            room_id, candidate
-                        );
-                        return Some(candidate.clone());
-                    } else {
-                        eprintln!(
-                            "[Bilibili] HLS candidate returned status {} for room {} -> {}",
-                            resp.status(),
-                            room_id,
-                            candidate
-                        );
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[Bilibili] Failed to probe HLS candidate for room {} -> {} ({})",
-                        room_id, candidate, err
-                    );
-                }
-            }
-        }
+        })
+    } else {
         None
-    }
-
-    const MAX_HLS_RETRY: usize = 3;
-    let mut selected_stream: Option<SelectedStream> = None;
-    let mut variants_for_response: Vec<StreamVariant> = Vec::new();
-    let mut fallback_hls_url: Option<String> = None;
-    let mut fallback_variants: Option<Vec<StreamVariant>> = None;
-
-    for attempt in 0..=MAX_HLS_RETRY {
-        let attempt_display = attempt + 1;
-        let playinfo_attempt = request_playinfo(&client, &room_id, selected_qn).await?;
-        let playurl_attempt = playinfo_attempt["data"]["playurl_info"]["playurl"].clone();
-        let (variants, flv_candidate, hls_candidates) =
-            parse_stream_variants(&playurl_attempt, &selected_desc, selected_qn);
-
-        variants_for_response = variants.clone();
-
-        if let Some(flv_url) = flv_candidate {
-            eprintln!(
-                "[Bilibili] Attempt {} obtained FLV stream for room {}, stop retrying",
-                attempt_display, room_id
-            );
-            selected_stream = Some(SelectedStream::Flv(flv_url));
-            break;
-        }
-
-        if hls_candidates.is_empty() {
-            eprintln!(
-                "[Bilibili] Attempt {} returned no HLS candidates for room {}",
-                attempt_display, room_id
-            );
-            if attempt == MAX_HLS_RETRY {
-                break;
-            }
-            continue;
-        }
-
-        let (preferred_candidates, other_candidates): (Vec<String>, Vec<String>) = hls_candidates
-            .into_iter()
-            .partition(|url| url.contains("d1--cn"));
-
-        if let Some(url) = verify_hls_candidates(&client, &room_id, &preferred_candidates).await {
-            eprintln!(
-                "[Bilibili] Selected HLS stream containing 'd1--cn' on attempt {} for room {}",
-                attempt_display, room_id
-            );
-            selected_stream = Some(SelectedStream::Hls(url));
-            break;
-        }
-
-        if fallback_hls_url.is_none() {
-            if let Some(url) = verify_hls_candidates(&client, &room_id, &other_candidates).await {
-                fallback_hls_url = Some(url.clone());
-                fallback_variants = Some(variants.clone());
-            }
-        }
-
-        if attempt == MAX_HLS_RETRY {
-            if let Some(url) = fallback_hls_url.clone() {
-                eprintln!(
-                    "[Bilibili] Using non 'd1--cn' HLS stream after {} attempts for room {}",
-                    attempt_display, room_id
-                );
-                selected_stream = Some(SelectedStream::Hls(url));
-                if let Some(fallback) = fallback_variants.clone() {
-                    variants_for_response = fallback;
-                }
-            } else if let Some(url) =
-                verify_hls_candidates(&client, &room_id, &other_candidates).await
-            {
-                eprintln!(
-                    "[Bilibili] Final attempt picked non 'd1--cn' HLS stream for room {}",
-                    room_id
-                );
-                selected_stream = Some(SelectedStream::Hls(url));
-                variants_for_response = variants.clone();
-            }
-        }
-    }
-
-    if selected_stream.is_none() {
-        if let Some(url) = fallback_hls_url.clone() {
-            eprintln!(
-                "[Bilibili] Falling back to cached non 'd1--cn' HLS stream for room {}",
-                room_id
-            );
-            selected_stream = Some(SelectedStream::Hls(url));
-            if let Some(fallback) = fallback_variants.clone() {
-                variants_for_response = fallback;
-            }
-        }
-    }
+    };
 
     let selected_stream = match selected_stream {
         Some(stream) => stream,
@@ -482,8 +307,12 @@ pub async fn get_bilibili_live_stream_url_with_quality(
                 anchor_name: init_json["data"]["uname"].as_str().map(|s| s.to_string()),
                 avatar: None,
                 stream_url: None,
-                status: Some(2),
-                error_message: Some("未找到可用的直播流地址".to_string()),
+                status: Some(if selected_live_status == 1 { 2 } else { 0 }),
+                error_message: if selected_live_status == 1 {
+                    Some("未找到可用的直播流地址".to_string())
+                } else {
+                    None
+                },
                 upstream_url: None,
                 available_streams: Some(variants_for_response),
                 normalized_room_id: None,
@@ -555,5 +384,210 @@ pub async fn get_bilibili_live_stream_url_with_quality(
                 web_rid: None,
             })
         }
+    }
+}
+
+/// B 站接口用 code/message 表达业务错误。把它当普通响应解析会让
+/// “接口错误”退化成“没有流地址”，最终被上层误判成主播未开播。
+fn check_bilibili_response(json: &Value, api: &str) -> Result<(), String> {
+    let code = json
+        .get("code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("{} 响应缺少业务状态码", api))?;
+    if code != 0 {
+        let message = json
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("接口错误");
+        return Err(format!("{} 错误 {}：{}", api, code, message));
+    }
+    Ok(())
+}
+
+fn bilibili_live_status(json: &Value) -> Result<i64, String> {
+    match json["data"]["live_status"].as_i64() {
+        Some(status @ 0..=2) => Ok(status),
+        _ => Err("B站响应缺少有效直播状态".to_string()),
+    }
+}
+
+/// 收集该画质下的全部候选流：跳过非法地址、按 AVC 优先排序、
+/// 普通 CDN 保持接口顺序而 mcdn 只作备用。
+fn parse_stream_variants(
+    playurl: &Value,
+    selected_desc: &Option<String>,
+    selected_qn: Option<i32>,
+) -> Vec<StreamVariant> {
+    let mut variants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(streams) = playurl.get("stream").and_then(Value::as_array) {
+        for stream in streams {
+            let protocol = stream
+                .get("protocol_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if let Some(formats) = stream.get("format").and_then(Value::as_array) {
+                for format in formats {
+                    let format_name = format
+                        .get("format_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !matches!(format_name, "flv" | "ts" | "fmp4" | "mp4" | "m4s" | "m3u8") {
+                        continue;
+                    }
+                    if let Some(codecs) = format.get("codec").and_then(Value::as_array) {
+                        // xgplayer 对 HEVC 的支持不稳定，avc 必须排在前面。
+                        let mut codecs: Vec<_> = codecs.iter().collect();
+                        codecs.sort_by_key(|codec| codec["codec_name"].as_str() != Some("avc"));
+                        for codec in codecs {
+                            let base = codec.get("base_url").and_then(Value::as_str).unwrap_or("");
+                            if base.is_empty() {
+                                continue;
+                            }
+                            if let Some(infos) = codec.get("url_info").and_then(Value::as_array) {
+                                for info in infos {
+                                    let host =
+                                        info.get("host").and_then(Value::as_str).unwrap_or("");
+                                    let extra =
+                                        info.get("extra").and_then(Value::as_str).unwrap_or("");
+                                    let composed = format!("{}{}{}", host, base, extra);
+                                    let valid = url::Url::parse(&composed)
+                                        .map(|url| {
+                                            matches!(url.scheme(), "http" | "https")
+                                                && url.host_str().is_some()
+                                        })
+                                        .unwrap_or(false);
+                                    if !valid || !seen.insert(composed.clone()) {
+                                        continue;
+                                    }
+                                    variants.push(StreamVariant {
+                                        url: composed,
+                                        format: Some(format_name.to_string()),
+                                        desc: selected_desc.clone(),
+                                        qn: selected_qn,
+                                        protocol: if protocol.is_empty() {
+                                            None
+                                        } else {
+                                            Some(protocol.to_string())
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    variants.sort_by_key(|variant| variant.url.contains("mcdn"));
+    variants
+}
+
+fn select_stream_variant(
+    variants: &[StreamVariant],
+    line: Option<usize>,
+) -> Option<&StreamVariant> {
+    variants.get(line.unwrap_or(0)).or_else(|| variants.first())
+}
+
+#[cfg(test)]
+mod bilibili_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ordinary_cdns_keep_api_order_and_mcdn_is_deduplicated_backup() {
+        let playurl = json!({"stream": [{"protocol_name": "http_stream", "format": [{"format_name": "flv", "codec": [{"codec_name": "avc", "base_url": "/live.flv", "url_info": [
+            {"host": "http://mcdn.example.com", "extra": ""},
+            {"host": "http://z.example.com", "extra": ""},
+            {"host": "http://a.example.com", "extra": ""},
+            {"host": "http://z.example.com", "extra": ""}
+        ]}]}]}]});
+        let variants = parse_stream_variants(&playurl, &None, Some(10000));
+        assert_eq!(
+            variants.iter().map(|v| v.url.as_str()).collect::<Vec<_>>(),
+            vec![
+                "http://z.example.com/live.flv",
+                "http://a.example.com/live.flv",
+                "http://mcdn.example.com/live.flv"
+            ]
+        );
+    }
+
+    #[test]
+    fn avc_precedes_hevc_without_discarding_backup() {
+        let playurl = json!({"stream": [{"protocol_name": "http_stream", "format": [{"format_name": "flv", "codec": [
+            {"codec_name": "hevc", "base_url": "/hevc.flv", "url_info": [{"host": "https://hevc.example.com", "extra": ""}]},
+            {"codec_name": "avc", "base_url": "/avc.flv", "url_info": [{"host": "https://avc.example.com", "extra": ""}]}
+        ]}]}]});
+        let variants = parse_stream_variants(&playurl, &None, Some(10000));
+        assert_eq!(
+            variants.iter().map(|v| v.url.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://avc.example.com/avc.flv",
+                "https://hevc.example.com/hevc.flv"
+            ]
+        );
+    }
+
+    #[test]
+    fn api_errors_and_missing_live_status_are_not_offline() {
+        assert!(
+            check_bilibili_response(&json!({"code": -400, "message": "请求失败"}), "PlayInfo")
+                .is_err()
+        );
+        assert!(check_bilibili_response(&json!({}), "room_init").is_err());
+        assert!(check_bilibili_response(&json!({"code": 0}), "PlayInfo").is_ok());
+        assert!(bilibili_live_status(&json!({"data": {}})).is_err());
+        assert!(bilibili_live_status(&json!({"data": {"live_status": 9}})).is_err());
+        assert_eq!(
+            bilibili_live_status(&json!({"data": {"live_status": 0}})).unwrap(),
+            0
+        );
+        assert_eq!(
+            bilibili_live_status(&json!({"data": {"live_status": 1}})).unwrap(),
+            1
+        );
+        assert_eq!(
+            bilibili_live_status(&json!({"data": {"live_status": 2}})).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn line_index_selects_hls_and_preserves_quality_metadata() {
+        let playurl = json!({"stream": [
+            {"protocol_name": "http_stream", "format": [{"format_name": "flv", "codec": [{"codec_name": "avc", "base_url": "/live.flv", "url_info": [{"host": "http://flv.example.com", "extra": "?token=1"}]}]}]},
+            {"protocol_name": "http_hls", "format": [{"format_name": "fmp4", "codec": [{"codec_name": "avc", "base_url": "/live.m3u8", "url_info": [{"host": "http://hls.example.com", "extra": "?token=2"}]}]}]}
+        ]});
+        let variants = parse_stream_variants(&playurl, &Some("高清".into()), Some(400));
+        let selected = select_stream_variant(&variants, Some(1)).unwrap();
+        assert_eq!(selected.url, "http://hls.example.com/live.m3u8?token=2");
+        assert_eq!(selected.format.as_deref(), Some("fmp4"));
+        assert_eq!(selected.protocol.as_deref(), Some("http_hls"));
+        assert_eq!(selected.desc.as_deref(), Some("高清"));
+        assert_eq!(selected.qn, Some(400));
+        assert_eq!(
+            select_stream_variant(&variants, None).unwrap().url,
+            "http://flv.example.com/live.flv?token=1"
+        );
+        assert_eq!(
+            select_stream_variant(&variants, Some(99)).unwrap().url,
+            "http://flv.example.com/live.flv?token=1"
+        );
+        assert!(select_stream_variant(&[], Some(0)).is_none());
+    }
+
+    #[test]
+    fn malformed_candidates_do_not_hide_valid_urls() {
+        let playurl = json!({"stream": [{"protocol_name": "http_stream", "format": [{"format_name": "flv", "codec": [
+            {"base_url": "/live.flv", "url_info": [{"host": "null", "extra": ""}, {"host": "", "extra": ""}, {"host": "https://valid.example.com", "extra": ""}]},
+            {"base_url": "", "url_info": [{"host": "https://empty.example.com", "extra": ""}]}
+        ]}]}]});
+        let variants = parse_stream_variants(&playurl, &None, None);
+        assert_eq!(
+            variants.iter().map(|v| v.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://valid.example.com/live.flv"]
+        );
     }
 }

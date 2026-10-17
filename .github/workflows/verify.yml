@@ -1,0 +1,91 @@
+name: Verify (compile + tests)
+
+# 只做校验，不产出安装包、不创建 Release。
+# 发布走 windows-build.yml（推 tag 或手动触发）。
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  frontend:
+    name: 前端（类型 / 测试 / 构建）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: 安装依赖
+        run: pnpm install
+
+      - name: 类型检查
+        run: pnpm -C web exec tsc --noEmit -p tsconfig.json
+
+      - name: 单元测试
+        run: pnpm -C web test
+
+      - name: 生产构建
+        run: pnpm -C web build
+
+  rust:
+    name: Rust（cargo check / cargo test）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf (Windows)
+        run: |
+          choco install protoc --no-progress -y
+          echo "C:\ProgramData\chocolatey\lib\protoc\tools" >> $env:GITHUB_PATH
+
+      - name: Set rusty_v8 archive (Windows)
+        run: |
+          echo "RUSTY_V8_ARCHIVE=https://github.com/denoland/rusty_v8/releases/download/v0.93.1/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz" >> $env:GITHUB_ENV
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      # tauri-build 会读 tauri.conf.json 的 frontendDist，先把前端产物建出来。
+      - name: 构建前端产物
+        run: |
+          pnpm install
+          pnpm -C web build
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --all-targets
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test

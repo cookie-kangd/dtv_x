@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose, Engine as _};
 use bytes04::Bytes;
+use futures_util::future::join_all;
 use md5::{Digest, Md5};
 use rand::Rng;
 use regex::Regex;
@@ -44,6 +45,7 @@ pub struct HuyaUnifiedResponse {
     pub is_live: bool,
     pub flv_tx_urls: Vec<HuyaUnifiedStreamEntry>,
     pub selected_url: Option<String>,
+    pub candidate_urls: Vec<String>,
 }
 
 fn md5_hex(input: &str) -> String {
@@ -79,16 +81,6 @@ fn url_encode_component(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>()
 }
 
-fn enforce_https(url: &str) -> String {
-    if url.starts_with("https://") {
-        url.to_string()
-    } else if url.starts_with("http://") {
-        format!("https://{}", &url["http://".len()..])
-    } else {
-        url.to_string()
-    }
-}
-
 fn rotl32_by8_in_i64(value: i64) -> i64 {
     let low = (value as u64 & 0xFFFF_FFFF) as u32;
     let rotated = low.rotate_left(8) as i64;
@@ -103,7 +95,10 @@ fn build_huya_anti_code(
     anti_code: &str,
 ) -> Result<String, String> {
     let sanitized = anti_code.replace("&amp;", "&");
-    let trimmed = sanitized.trim_start_matches(|c| c == '?' || c == '&');
+    let trimmed = sanitized.trim().trim_start_matches(|c| c == '?' || c == '&');
+    if trimmed.is_empty() {
+        return Err("虎牙当前线路缺少播放鉴权".to_string());
+    }
     let params = parse_query(trimmed);
 
     let Some(fm_raw) = params.get("fm").cloned() else {
@@ -602,6 +597,7 @@ struct WebStreamCandidate {
     stream_name: String,
     presenter_uid: i64,
     cdn: String,
+    flv_anti_code: String,
 }
 
 #[derive(Clone, Debug)]
@@ -624,15 +620,18 @@ async fn fetch_profile_room(
     headers.insert(REFERER, HeaderValue::from_static("https://www.huya.com/"));
     headers.insert(USER_AGENT, HeaderValue::from_static(DESKTOP_UA));
 
-    let resp = client.get(&url).headers(headers).send().await?;
+    let resp = client
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await?
+        .error_for_status()?;
     let text = resp.text().await?;
     let v: Value = serde_json::from_str(&text)?;
 
-    let status_code = v.get("status").and_then(|x| x.as_i64()).unwrap_or(0);
-    if status_code != 200 {
-        return Ok(v);
-    }
-
+    // 区分「接口异常」与「明确关播」：业务错误码或缺失直播数据必须报错，
+    // 否则会把接口抖动当成主播没开播（关注列表整片变灰）。
+    validate_profile_room(&v).map_err(|message| -> Box<dyn Error + Send + Sync> { message.into() })?;
     Ok(v)
 }
 
@@ -642,6 +641,29 @@ fn parse_i64_lossy(v: Option<&Value>) -> i64 {
         Some(Value::String(s)) => s.parse::<i64>().unwrap_or(0),
         _ => 0,
     }
+}
+
+fn profile_room_is_offline(profile: &Value) -> bool {
+    profile
+        .get("data")
+        .and_then(|data| data.get("liveStatus"))
+        .and_then(Value::as_str)
+        == Some("OFF")
+}
+
+fn validate_profile_room(profile: &Value) -> Result<(), String> {
+    let status_code = parse_i64_lossy(profile.get("status"));
+    if status_code != 200 {
+        return Err(format!("虎牙房间接口返回业务错误：{status_code}"));
+    }
+    let data = profile
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "虎牙房间接口缺少房间数据".to_string())?;
+    if !profile_room_is_offline(profile) && data.get("stream").and_then(Value::as_object).is_none() {
+        return Err("虎牙房间接口缺少直播数据，无法判断开播状态".to_string());
+    }
+    Ok(())
 }
 
 fn extract_room_detail(profile: &Value) -> RoomDetail {
@@ -656,7 +678,10 @@ fn extract_room_detail(profile: &Value) -> RoomDetail {
     }
 
     let data = profile.get("data").unwrap_or(&Value::Null);
-    let stream_ok = data.get("stream").is_some();
+    // 关播时接口仍可能带 stream 字段（轮播场景），必须同时排除 liveStatus=OFF。
+    // 另外 data.get("stream") 为 Some(Value::Null) 也不能算有直播数据。
+    let stream_ok =
+        !profile_room_is_offline(profile) && data.get("stream").and_then(Value::as_object).is_some();
 
     let title = data
         .get("liveData")
@@ -700,8 +725,8 @@ fn extract_room_detail(profile: &Value) -> RoomDetail {
 }
 
 fn extract_stream_candidates(profile: &Value) -> Result<Vec<WebStreamCandidate>, String> {
-    let status_code = profile.get("status").and_then(|x| x.as_i64()).unwrap_or(0);
-    if status_code != 200 {
+    validate_profile_room(profile)?;
+    if profile_room_is_offline(profile) {
         return Ok(Vec::new());
     }
     let data = profile.get("data").ok_or_else(|| "missing data".to_string())?;
@@ -750,6 +775,12 @@ fn extract_stream_candidates(profile: &Value) -> Result<Vec<WebStreamCandidate>,
                 stream_name: stream_name.to_string(),
                 presenter_uid,
                 cdn,
+                // 页面自带的 sFlvAntiCode：原生 WUP 鉴权失败时作为后备凭据。
+                flv_anti_code: item
+                    .get("sFlvAntiCode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             },
         ));
     }
@@ -926,11 +957,104 @@ fn build_flv_tx_urls(base_url: &str, hd: i32, sd: i32) -> Vec<HuyaUnifiedStreamE
     entries
 }
 
+// 关注列表和搜索只需要房间元信息，不执行播放线路解析或 WUP 鉴权。
+fn extract_room_metadata(profile: &Value) -> Result<HuyaUnifiedResponse, String> {
+    validate_profile_room(profile)?;
+    let detail = extract_room_detail(profile);
+    Ok(HuyaUnifiedResponse {
+        title: detail.title,
+        nick: detail.nick,
+        avatar: detail.avatar180,
+        introduction: None,
+        profileRoom: None,
+        is_live: detail.status,
+        flv_tx_urls: Vec::new(),
+        selected_url: None,
+        candidate_urls: Vec::new(),
+    })
+}
+
+/// 组装单条线路的播放地址：优先用原生 WUP 鉴权，失败则回退到页面自带凭据。
+/// 保留上游给出的协议（多数虎牙 FLV CDN 只监听 http，强制 https 会直接连不上）。
+fn build_candidate_base_url(
+    candidate: &WebStreamCandidate,
+    native_token: Option<&str>,
+) -> Result<String, String> {
+    let native_anti = native_token.map(|token| {
+        build_huya_anti_code(&candidate.stream_name, candidate.presenter_uid, token)
+    });
+    let anti = match native_anti {
+        Some(Ok(anti)) => anti,
+        _ => build_huya_anti_code(
+            &candidate.stream_name,
+            candidate.presenter_uid,
+            &candidate.flv_anti_code,
+        )?,
+    };
+    Ok(format!(
+        "{}/{}.flv?{}&codec=264",
+        candidate.flv_url.trim_end_matches('/'),
+        candidate.stream_name,
+        anti
+    ))
+}
+
+async fn resolve_candidate_base_url(
+    client: &reqwest::Client,
+    candidate: &WebStreamCandidate,
+) -> Result<String, String> {
+    // 单条线路的原生鉴权必须及时超时，否则会拖住整批并发解析。
+    let token = match tokio::time::timeout(
+        Duration::from_secs(8),
+        huya_get_cdn_token_info_ex(client, &candidate.flv_url, &candidate.stream_name),
+    )
+    .await
+    {
+        Ok(Ok(token)) => Some(token),
+        _ => {
+            eprintln!("[虎牙] {} 原生鉴权失败，使用页面后备", candidate.cdn);
+            None
+        }
+    };
+    let result = build_candidate_base_url(candidate, token.as_deref());
+    if let Err(error) = &result {
+        eprintln!("[虎牙] {} 线路解析失败：{}", candidate.cdn, error);
+    }
+    result
+}
+
+/// 过滤失败线路、把首选线路提到最前，并对完全相同的地址去重。
+fn collect_candidate_base_urls(
+    resolved: Vec<Result<String, String>>,
+    preferred_index: usize,
+) -> Vec<String> {
+    let mut successful: Vec<(usize, String)> = resolved
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, result)| result.ok().map(|url| (index, url)))
+        .collect();
+    if let Some(position) = successful
+        .iter()
+        .position(|(index, _)| *index == preferred_index)
+    {
+        let preferred = successful.remove(position);
+        successful.insert(0, preferred);
+    }
+    let mut urls = Vec::new();
+    for (_, url) in successful {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
 #[tauri::command]
 pub async fn get_huya_unified_cmd(
     room_id: String,
     quality: Option<String>,
     line: Option<String>,
+    metadata_only: Option<bool>,
     follow_http: State<'_, FollowHttpClient>,
 ) -> Result<HuyaUnifiedResponse, String> {
     let client = &follow_http.0.inner;
@@ -938,8 +1062,14 @@ pub async fn get_huya_unified_cmd(
     let profile = fetch_profile_room(client, &room_id)
         .await
         .map_err(|e| e.to_string())?;
+    if metadata_only.unwrap_or(false) {
+        return extract_room_metadata(&profile);
+    }
     let detail = extract_room_detail(&profile);
     let candidates = extract_stream_candidates(&profile)?;
+    if candidates.is_empty() && !profile_room_is_offline(&profile) {
+        return Err("虎牙房间接口未返回可用直播线路，请稍后重试".to_string());
+    }
     let web_stream = HuyaWebStreamData {
         is_live: !candidates.is_empty(),
         candidates,
@@ -959,69 +1089,39 @@ pub async fn get_huya_unified_cmd(
     let selection = pick_stream_url(&web_stream.candidates, ratio, preferred_line.as_deref());
     let selected_index = match selection {
         Some((_, idx)) => idx,
-        None => {
-            return Ok(HuyaUnifiedResponse {
-                title: detail.title.clone(),
-                nick: detail.nick.clone(),
-                avatar: detail.avatar180.clone(),
-                introduction: None,
-                profileRoom: None,
-                is_live: detail.status || web_stream.is_live,
-                flv_tx_urls: Vec::new(),
-                selected_url: None,
-            });
-        }
+        None => return extract_room_metadata(&profile),
     };
 
-    let Some(selected_candidate) = web_stream.candidates.get(selected_index) else {
-        return Ok(HuyaUnifiedResponse {
-            title: detail.title.clone(),
-            nick: detail.nick.clone(),
-            avatar: detail.avatar180.clone(),
-            introduction: None,
-            profileRoom: None,
-            is_live: detail.status || web_stream.is_live,
-            flv_tx_urls: Vec::new(),
-            selected_url: None,
-        });
-    };
-
-    // pure_live-master: token = getCdnTokenInfoEx(streamName, flvUrl) -> buildAntiCode(token)
-    let token = huya_get_cdn_token_info_ex(
-        client,
-        &selected_candidate.flv_url,
-        &selected_candidate.stream_name,
+    // 并行解析所有线路的播放地址：同画质下保留多条备用，交给前端按索引切换，
+    // 单条线路鉴权失败不再导致整个房间取流失败。
+    let resolved = join_all(
+        web_stream
+            .candidates
+            .iter()
+            .map(|candidate| resolve_candidate_base_url(client, candidate)),
     )
-    .await?;
-    let anti = build_huya_anti_code(
-        &selected_candidate.stream_name,
-        selected_candidate.presenter_uid,
-        &token,
-    )?;
+    .await;
+    let base_urls = collect_candidate_base_urls(resolved, selected_index);
+    let base_url = base_urls
+        .first()
+        .ok_or_else(|| "虎牙所有线路均缺少有效播放鉴权".to_string())?;
+    let candidate_urls: Vec<String> = base_urls
+        .iter()
+        .map(|url| match ratio {
+            Some(r) => format!("{}&ratio={}", url, r),
+            None => url.clone(),
+        })
+        .collect();
+    let selected_url = candidate_urls.first().cloned();
 
-    let base_url = enforce_https(&format!(
-        "{}/{}.flv?{}&codec=264",
-        selected_candidate.flv_url.trim_end_matches('/'),
-        selected_candidate.stream_name,
-        anti
-    ));
-
-    let selected_url = match ratio {
-        Some(r) => format!("{}&ratio={}", base_url, r),
-        None => base_url.clone(),
-    };
-
-    let tx_entries = build_flv_tx_urls(&base_url, hd, sd);
+    let tx_entries = build_flv_tx_urls(base_url, hd, sd);
     let is_live = detail.status || web_stream.is_live;
     println!(
-        "[Huya] requested quality: {:?}, resolved ratio: {:?}, preferred line: {:?}, selected line: {:?}",
+        "[虎牙] 请求画质：{:?}，码率：{:?}，首选线路：{:?}，可用线路数：{}",
         quality,
         ratio,
         preferred_line,
-        web_stream
-            .candidates
-            .get(selected_index)
-            .map(|c| c.cdn.clone())
+        candidate_urls.len()
     );
 
     Ok(HuyaUnifiedResponse {
@@ -1032,8 +1132,158 @@ pub async fn get_huya_unified_cmd(
         profileRoom: None,
         is_live,
         flv_tx_urls: tx_entries,
-        selected_url: Some(selected_url),
+        selected_url,
+        candidate_urls,
     })
 }
 #[allow(dead_code)]
 const HEARTBEAT_BASE64: &str = "ABQdAAwsNgBM"; // same as Python
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_profile_is_an_error_instead_of_an_offline_room() {
+        let profile = serde_json::json!({"status": 503, "msg": "service unavailable"});
+        assert!(extract_stream_candidates(&profile).is_err());
+    }
+
+    #[test]
+    fn incomplete_success_response_is_not_an_offline_room() {
+        for data in [serde_json::json!({}), serde_json::json!({"liveStatus": "ON"})] {
+            let profile = serde_json::json!({"status": 200, "data": data});
+            assert!(extract_stream_candidates(&profile).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_offline_response_has_no_live_stream() {
+        let profile = serde_json::json!({
+            "status": 200,
+            "data": {"liveStatus": "OFF", "stream": {}}
+        });
+        assert!(extract_stream_candidates(&profile).unwrap().is_empty());
+        assert!(!extract_room_detail(&profile).status);
+    }
+
+    #[test]
+    fn room_metadata_does_not_require_playback_authentication() {
+        let profile = serde_json::json!({
+            "status": 200,
+            "data": {"liveStatus": "ON", "stream": {},
+                "profileInfo": {"nick": "主播", "avatar180": "头像"},
+                "liveData": {"introduction": "标题"}}
+        });
+        let metadata = extract_room_metadata(&profile).unwrap();
+        assert!(metadata.is_live);
+        assert_eq!(metadata.nick.as_deref(), Some("主播"));
+        assert_eq!(metadata.avatar.as_deref(), Some("头像"));
+        assert_eq!(metadata.title.as_deref(), Some("标题"));
+        assert!(metadata.candidate_urls.is_empty());
+        assert!(metadata.selected_url.is_none());
+        assert!(metadata.flv_tx_urls.is_empty());
+    }
+
+    #[test]
+    fn room_metadata_preserves_offline_and_rejects_invalid_responses() {
+        let offline = serde_json::json!({"status": 200, "data": {"liveStatus": "OFF"}});
+        assert!(!extract_room_metadata(&offline).unwrap().is_live);
+        for profile in [
+            serde_json::json!({"status": 503}),
+            serde_json::json!({"status": 200, "data": {}}),
+        ] {
+            assert!(extract_room_metadata(&profile).is_err());
+        }
+    }
+
+    fn candidate(page_anti_code: &str) -> WebStreamCandidate {
+        WebStreamCandidate {
+            flv_url: "http://tx.flv.huya.com/src".to_string(),
+            stream_name: "stream".to_string(),
+            presenter_uid: 12345,
+            cdn: "TX".to_string(),
+            flv_anti_code: page_anti_code.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_anti_code_is_not_a_playable_credential() {
+        for anti_code in ["", " ", "?&"] {
+            assert!(build_huya_anti_code("stream", 12345, anti_code).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_native_token_uses_page_credential_and_preserves_http() {
+        let url =
+            build_candidate_base_url(&candidate("wsSecret=page&wsTime=abcdef"), None).unwrap();
+        assert_eq!(
+            url,
+            "http://tx.flv.huya.com/src/stream.flv?wsSecret=page&wsTime=abcdef&codec=264"
+        );
+    }
+
+    #[test]
+    fn empty_or_invalid_native_token_uses_page_credential() {
+        for token in ["", " ", "fm=invalid&wsTime=abcdef&fs=1"] {
+            let url =
+                build_candidate_base_url(&candidate("wsSecret=page&wsTime=abcdef"), Some(token))
+                    .unwrap();
+            assert!(url.contains("wsSecret=page&wsTime=abcdef"));
+        }
+    }
+
+    #[test]
+    fn valid_native_token_is_preferred_over_page_credential() {
+        let url = build_candidate_base_url(
+            &candidate("wsSecret=page&wsTime=abcdef"),
+            Some("wsSecret=native&wsTime=abcdef"),
+        )
+        .unwrap();
+        assert!(url.contains("wsSecret=native&wsTime=abcdef"));
+        assert!(!url.contains("wsSecret=page"));
+    }
+
+    #[test]
+    fn encoded_page_credential_is_rebuilt_after_native_failure() {
+        let page_anti_code =
+            "fm=cHJlZml4XyQwXyQxXyQyXyQz&wsTime=abcdef&fs=1&t=103&ctype=huya_wap";
+        let url = build_candidate_base_url(&candidate(page_anti_code), None).unwrap();
+        let params = parse_query(url.split_once('?').unwrap().1);
+        assert_eq!(params.get("uid").map(String::as_str), Some("12345"));
+        assert_eq!(params.get("wsTime").map(String::as_str), Some("abcdef"));
+        assert_eq!(params.get("codec").map(String::as_str), Some("264"));
+        assert_eq!(params.get("wsSecret").unwrap().len(), 32);
+    }
+
+    #[test]
+    fn missing_page_and_native_credentials_do_not_create_playable_url() {
+        assert!(build_candidate_base_url(&candidate(""), None).is_err());
+    }
+
+    #[test]
+    fn preferred_cdn_moves_first_while_other_cdns_keep_order_and_duplicates_are_removed() {
+        let resolved = vec![
+            Ok("tx".to_string()),
+            Err("bad".to_string()),
+            Ok("al".to_string()),
+            Ok("tx".to_string()),
+            Ok("hs".to_string()),
+        ];
+        assert_eq!(
+            collect_candidate_base_urls(resolved, 2),
+            vec!["al", "tx", "hs"]
+        );
+    }
+
+    #[test]
+    fn failed_preferred_cdn_does_not_discard_other_cdns() {
+        let resolved = vec![
+            Ok("tx".to_string()),
+            Err("bad".to_string()),
+            Ok("hs".to_string()),
+        ];
+        assert_eq!(collect_candidate_base_urls(resolved, 1), vec!["tx", "hs"]);
+    }
+}

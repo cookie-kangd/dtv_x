@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct BetardRoomInfo {
     room_id: Option<Value>,
     show_status: Option<Value>,
+    #[serde(rename = "videoLoop")]
+    video_loop: Option<Value>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -157,18 +159,22 @@ impl DouYu {
             .header("Referer", format!("https://www.douyu.com/{}", self.rid))
             .send()
             .await?
+            .error_for_status()?
             .json::<BetardResponse>()
             .await?;
 
         let room = json.room.ok_or("Missing room data")?;
         let room_id_value = room.room_id.ok_or("Missing room_id")?;
         let room_id = value_to_string(&room_id_value).ok_or("Invalid room_id")?;
+        // 状态字段缺失说明接口异常，不能默认成「没开播」。
         let show_status = room
             .show_status
             .as_ref()
             .and_then(value_to_i32)
-            .unwrap_or(0);
-        Ok((room_id, show_status == 1))
+            .ok_or("房间响应缺少有效直播状态")?;
+        // videoLoop=1 是轮播（重播录像），不算直播中。
+        let is_record = room.video_loop.as_ref().and_then(value_to_i32) == Some(1);
+        Ok((room_id, show_status == 1 && !is_record))
     }
 
     async fn get_h5_enc(&self, room_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -179,6 +185,7 @@ impl DouYu {
             .header("Referer", format!("https://www.douyu.com/{}", room_id))
             .send()
             .await?
+            .error_for_status()?
             .json::<Value>()
             .await?;
 
@@ -225,6 +232,7 @@ impl DouYu {
             .body(payload)
             .send()
             .await?
+            .error_for_status()?
             .json::<Value>()
             .await?;
 
@@ -252,12 +260,7 @@ impl DouYu {
             })
             .unwrap_or_default();
 
-        let mut cdns_sorted = cdns;
-        cdns_sorted.sort_by(|a, b| {
-            let a_is_scdn = a.starts_with("scdn");
-            let b_is_scdn = b.starts_with("scdn");
-            (a_is_scdn, a).cmp(&(b_is_scdn, b))
-        });
+        let cdns_sorted = order_cdns(cdns);
 
         let variants = data
             .get("multirates")
@@ -302,8 +305,11 @@ impl DouYu {
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Referer", format!("https://www.douyu.com/{}", room_id))
             .body(payload)
+            // 单线路及时超时，给播放器看门狗之前的备用线路请求留出时间。
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await?
+            .error_for_status()?
             .json::<Value>()
             .await?;
 
@@ -317,35 +323,23 @@ impl DouYu {
         }
 
         let data = json.get("data").ok_or("No data field in response")?;
-        let rtmp_url = data
-            .get("rtmp_url")
-            .and_then(|v| v.as_str())
-            .ok_or("No rtmp_url field")?;
-        let rtmp_live = data
-            .get("rtmp_live")
-            .and_then(|v| v.as_str())
-            .ok_or("No rtmp_live field")?;
-        let rtmp_live = decode_html_entities(rtmp_live).to_string();
-        Ok(format!("{}/{}", rtmp_url, rtmp_live))
+        compose_douyu_url(data)
     }
 
-    fn select_cdn(requested: Option<&str>, available: &[String]) -> String {
-        if let Some(cdn) = requested {
-            let trimmed = cdn.trim();
-            if !trimmed.is_empty() {
-                let target = trimmed.to_ascii_lowercase();
-                if let Some(hit) = available
-                    .iter()
-                    .find(|item| item.to_ascii_lowercase() == target)
-                {
-                    return hit.clone();
-                }
-            }
-        }
-        available
-            .first()
-            .cloned()
-            .unwrap_or_else(|| normalize_douyu_cdn(requested).to_string())
+    async fn get_play_url_with_fallback(
+        &self,
+        room_id: &str,
+        sign_data: &str,
+        rate: i32,
+        requested: Option<&str>,
+        available: &[String],
+        candidate_index: Option<usize>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let cdns = cdn_candidates(requested, available, candidate_index);
+        first_playable_url(&cdns, |cdn| async move {
+            self.get_play_url(room_id, sign_data, rate, &cdn).await
+        })
+        .await
     }
 
     pub async fn get_real_url(&self, cdn: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -365,8 +359,14 @@ impl DouYu {
             .map(|variant| variant.rate)
             .max()
             .unwrap_or(0);
-        let selected_cdn = Self::select_cdn(cdn, &play_info.cdns);
-        self.get_play_url(&real_room_id, &sign_data, best_rate, &selected_cdn)
+        self.get_play_url_with_fallback(
+            &real_room_id,
+            &sign_data,
+            best_rate,
+            cdn,
+            &play_info.cdns,
+            None,
+        )
             .await
     }
 
@@ -374,6 +374,7 @@ impl DouYu {
         &self,
         quality: &str,
         cdn: Option<&str>,
+        candidate_index: Option<usize>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let (real_room_id, is_live) = self.fetch_room_detail().await?;
         if !is_live {
@@ -392,9 +393,15 @@ impl DouYu {
             "[Douyu Stream URL] Requested quality '{}', resolved rate {} (variants: {:?})",
             quality, selected_rate, play_info.variants
         );
-        let selected_cdn = Self::select_cdn(cdn, &play_info.cdns);
-        self.get_play_url(&real_room_id, &sign_data, selected_rate, &selected_cdn)
-            .await
+        self.get_play_url_with_fallback(
+            &real_room_id,
+            &sign_data,
+            selected_rate,
+            cdn,
+            &play_info.cdns,
+            candidate_index,
+        )
+        .await
     }
 
     fn resolve_rate_for_quality(quality: &str, variants: &[DouyuRateVariant]) -> Option<i32> {
@@ -501,6 +508,82 @@ impl DouYu {
     }
 }
 
+/// 整理接口返回的 CDN 列表：去掉空值与重复项，保持接口原有顺序，
+/// 只把 scdn 系列排到最后作为备用线路。
+fn order_cdns(cdns: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<_> = cdns
+        .into_iter()
+        .filter(|cdn| !cdn.trim().is_empty() && seen.insert(cdn.clone()))
+        .collect();
+    ordered.sort_by_key(|cdn| cdn.starts_with("scdn"));
+    ordered
+}
+
+/// 生成本次取流的线路尝试顺序：手动首选排最前，自动恢复按索引轮换。
+fn cdn_candidates(
+    requested: Option<&str>,
+    available: &[String],
+    candidate_index: Option<usize>,
+) -> Vec<String> {
+    let mut candidates = order_cdns(available.to_vec());
+    if let Some(target) = requested.map(str::trim).filter(|cdn| !cdn.is_empty()) {
+        if let Some(index) = candidates
+            .iter()
+            .position(|cdn| cdn.eq_ignore_ascii_case(target))
+        {
+            let preferred = candidates.remove(index);
+            candidates.insert(0, preferred);
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(normalize_douyu_cdn(requested).to_string());
+    }
+    // 自动恢复按实际 API 候选轮换，索引 0 保留手动首选。
+    let offset = candidate_index.unwrap_or(0) % candidates.len();
+    candidates.rotate_left(offset);
+    candidates
+}
+
+/// 依次尝试候选线路，返回第一条成功的地址；全部失败时汇总各自的错误。
+async fn first_playable_url<F, Fut>(
+    cdns: &[String],
+    mut fetch: F,
+) -> Result<String, Box<dyn std::error::Error>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, Box<dyn std::error::Error>>>,
+{
+    let mut errors = Vec::new();
+    for cdn in cdns {
+        match fetch(cdn.clone()).await {
+            Ok(url) => return Ok(url),
+            Err(error) => errors.push(format!("{}：{}", cdn, error)),
+        }
+    }
+    Err(format!("斗鱼所有线路取流失败：{}", errors.join("；")).into())
+}
+
+/// 拼装播放地址，并校验结果确实是可用的 http/https 绝对地址。
+fn compose_douyu_url(data: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    let host = data
+        .get("rtmp_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("斗鱼播放响应缺少有效主机")?;
+    let stream = data
+        .get("rtmp_live")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("斗鱼播放响应缺少有效流地址")?;
+    let composed = format!("{}/{}", host, decode_html_entities(stream));
+    let parsed = url::Url::parse(&composed)?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("斗鱼播放响应包含非法地址".into());
+    }
+    Ok(composed)
+}
+
 pub async fn get_stream_url(
     room_id: &str,
     cdn: Option<&str>,
@@ -514,8 +597,123 @@ pub async fn get_stream_url_with_quality(
     room_id: &str,
     quality: &str,
     cdn: Option<&str>,
+    candidate_index: Option<usize>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let douyu = DouYu::new(room_id).await?;
-    let url = douyu.get_real_url_with_quality(quality, cdn).await?;
+    let url = douyu
+        .get_real_url_with_quality(quality, cdn, candidate_index)
+        .await?;
     Ok(url)
+}
+
+#[cfg(test)]
+mod douyu_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_cdns_keep_api_order_and_scdn_is_backup() {
+        let cdns = ["scdn1", "ws-h5", "ali-h5", "ws-h5", "scdn2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(order_cdns(cdns), vec!["ws-h5", "ali-h5", "scdn1", "scdn2"]);
+    }
+
+    #[test]
+    fn preferred_cdn_is_first_then_remaining_api_order() {
+        let cdns = vec!["ws-h5".into(), "ali-h5".into(), "scdn1".into()];
+        assert_eq!(
+            cdn_candidates(Some("ALI-H5"), &cdns, None),
+            vec!["ali-h5", "ws-h5", "scdn1"]
+        );
+        assert_eq!(
+            cdn_candidates(Some("scdn1"), &cdns, None),
+            vec!["scdn1", "ws-h5", "ali-h5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cdn_falls_back_without_requesting_later_successful_lines() {
+        let cdns = vec!["失败".into(), "可用".into(), "备用".into()];
+        let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = attempted.clone();
+        let result = first_playable_url(&cdns, move |cdn| {
+            record.lock().unwrap().push(cdn.clone());
+            async move {
+                if cdn == "失败" {
+                    Err("线路错误".into())
+                } else {
+                    Ok("http://example.com/live.flv".into())
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "http://example.com/live.flv");
+        assert_eq!(*attempted.lock().unwrap(), vec!["失败", "可用"]);
+    }
+
+    #[tokio::test]
+    async fn all_failed_cdns_report_errors() {
+        let cdns = vec!["线路一".into(), "线路二".into()];
+        let result = first_playable_url(&cdns, |cdn| async move {
+            Err(format!("{}接口不可用", cdn).into())
+        })
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("线路一接口不可用"));
+        assert!(error.contains("线路二接口不可用"));
+    }
+
+    #[test]
+    fn missing_cdns_keep_default_and_unknown_preference_uses_api_first() {
+        assert_eq!(cdn_candidates(None, &[], None), vec!["ws-h5"]);
+        assert_eq!(cdn_candidates(Some("tct-h5"), &[], None), vec!["tct-h5"]);
+        assert_eq!(
+            cdn_candidates(Some("未知"), &["ali-h5".into(), "ws-h5".into()], None),
+            vec!["ali-h5", "ws-h5"]
+        );
+    }
+
+    #[test]
+    fn reconnect_rotates_real_api_cdns_including_scdn_backup() {
+        let cdns = vec!["ws-h5".into(), "scdn1".into()];
+        assert_eq!(
+            cdn_candidates(Some("ws-h5"), &cdns, Some(0)),
+            vec!["ws-h5", "scdn1"]
+        );
+        assert_eq!(
+            cdn_candidates(Some("ws-h5"), &cdns, Some(1)),
+            vec!["scdn1", "ws-h5"]
+        );
+        assert_eq!(
+            cdn_candidates(Some("ws-h5"), &cdns, Some(2)),
+            vec!["ws-h5", "scdn1"]
+        );
+        assert_eq!(
+            cdn_candidates(Some("scdn1"), &cdns, None),
+            vec!["scdn1", "ws-h5"]
+        );
+        assert_eq!(
+            cdn_candidates(Some("scdn1"), &cdns, Some(1)),
+            vec!["ws-h5", "scdn1"]
+        );
+        assert_eq!(cdn_candidates(None, &[], Some(9)), vec!["ws-h5"]);
+    }
+
+    #[test]
+    fn malformed_play_urls_are_errors_and_http_is_preserved() {
+        for data in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"rtmp_url": "null", "rtmp_live": "null"}),
+            serde_json::json!({"rtmp_url": "https://example.com", "rtmp_live": ""}),
+        ] {
+            assert!(compose_douyu_url(&data).is_err());
+        }
+        let data = serde_json::json!({"rtmp_url": "http://example.com", "rtmp_live": "live.flv?a=1&amp;b=2"});
+        assert_eq!(
+            compose_douyu_url(&data).unwrap(),
+            "http://example.com/live.flv?a=1&b=2"
+        );
+    }
 }

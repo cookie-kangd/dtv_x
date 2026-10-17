@@ -10,7 +10,8 @@ export async function getBilibiliStreamConfig(
   roomId: string,
   quality: string = '原画',
   cookie?: string,
-): Promise<{ streamUrl: string, streamType: string | undefined }> {
+  candidateIndex: number = 0,
+): Promise<{ streamUrl: string, streamType: string | undefined, candidateCount: number }> {
   if (!roomId) {
     throw new Error('房间ID未提供');
   }
@@ -26,37 +27,38 @@ export async function getBilibiliStreamConfig(
         payload: payloadData,
         quality,
         cookie: effectiveCookie || null,
+        line: candidateIndex,
       });
       result = fetched;
 
-      // 若后端返回错误，统一按“未开播”处理（除非明确包含未开播字样）
+      // 接口错误保留原始原因，只有确定离线才终止重试。
       if (result.error_message) {
         const msg = result.error_message.trim();
         if (msg.includes('未开播')) {
           throw new Error(msg);
         }
-        throw new Error('主播未开播或无法获取直播流');
+        throw new Error(msg);
       }
 
       // 根据返回的状态判断是否在线（B 站约定 status === 1 为在线）
-      if (typeof result.status !== 'undefined' && result.status !== 1) {
+      if (result.status != null && result.status !== 1) {
         throw new Error('主播未开播');
       }
 
-      // 无播放地址也按未开播处理
+      // 在线但地址为空属于取流失败。
       if (!result.stream_url) {
-        throw new Error('主播未开播或无法获取直播流');
+        throw new Error('未获取到有效的直播流');
       }
 
       break;
     } catch (e: any) {
-      const msg = (e?.message || '').trim();
+      const msg = String(e?.message || e || '').trim();
       const looksOffline = msg.includes('未开播') || msg.includes('房间不存在') || msg.includes('不存在');
       if (looksOffline) {
-        throw new Error(msg || '主播未开播或无法获取直播流');
+        throw new Error(msg || '直播流获取失败');
       }
       if (attempt >= MAX_ATTEMPTS) {
-        throw new Error(msg || '主播未开播或无法获取直播流');
+        throw new Error(msg || '直播流获取失败');
       }
       await new Promise((resolve) => setTimeout(resolve, 450));
     }
@@ -135,7 +137,7 @@ export async function getBilibiliStreamConfig(
     streamType = 'flv';
   }
 
-  return { streamUrl, streamType };
+  return { streamUrl, streamType, candidateCount: result.available_streams?.length || 1 };
 }
 
 // 统一的 Rust 弹幕事件负载（与 Douyin/Douyu/Huya 保持一致）

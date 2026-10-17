@@ -71,18 +71,24 @@ async fn get_stream_url_with_quality_cmd(
     room_id: String,
     quality: String,
     line: Option<String>,
+    candidate_index: Option<usize>,
 ) -> Result<String, String> {
-    platforms::douyu::get_stream_url_with_quality(&room_id, &quality, line.as_deref())
-        .await
-        .map_err(|e| {
-            eprintln!(
-                "[Rust Error] Failed to get stream URL with quality {} for room {}: {}",
-                quality,
-                room_id,
-                e.to_string()
-            );
-            format!("Failed to get stream URL with quality: {}", e.to_string())
-        })
+    platforms::douyu::get_stream_url_with_quality(
+        &room_id,
+        &quality,
+        line.as_deref(),
+        candidate_index,
+    )
+    .await
+    .map_err(|e| {
+        eprintln!(
+            "[Rust Error] Failed to get stream URL with quality {} for room {}: {}",
+            quality,
+            room_id,
+            e.to_string()
+        );
+        format!("Failed to get stream URL with quality: {}", e.to_string())
+    })
 }
 
 // Legacy Huya stream URL command removed in favor of unified command

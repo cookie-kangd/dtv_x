@@ -13,6 +13,7 @@ export async function getHuyaStreamConfig(
   roomId: string,
   quality: string = '原画',
   line?: string | null,
+  candidateIndex: number = 0,
 ): Promise<{
   streamUrl: string;
   streamType: string | undefined;
@@ -20,6 +21,7 @@ export async function getHuyaStreamConfig(
   anchorName?: string | null;
   avatar?: string | null;
   isLive?: boolean | null;
+  candidateCount: number;
 }> {
   logger.debug('[HuyaPlayerHelper] getHuyaStreamConfig', { roomId, quality, line });
   const MAX_ATTEMPTS = 2; // 最多重试一次
@@ -30,10 +32,18 @@ export async function getHuyaStreamConfig(
       logger.debug('[HuyaPlayerHelper] getHuyaStreamConfig result', result);
 
       if (result && result.flv_tx_urls && Array.isArray(result.flv_tx_urls)) {
-        const upstreamStreamUrl = pickHuyaUrlByQuality(result.flv_tx_urls, quality) || result.flv_tx_urls[0]?.url;
-        if (!upstreamStreamUrl) throw new Error('主播未开播或无法获取直播流');
+        if (result.is_live === false) throw new Error('主播未开播');
+        // 后端已按画质解析出同画质的全部可用线路，由这里按候选索引挑选；
+        // 只有后端没给出候选时才回退到旧的质量表。
+        const candidates: string[] = (result.candidate_urls || []).filter(
+          (url: unknown) => typeof url === 'string' && url
+        );
+        const upstreamStreamUrl = candidates.length
+          ? candidates[candidateIndex % candidates.length]
+          : result.selected_url || pickHuyaUrlByQuality(result.flv_tx_urls, quality) || result.flv_tx_urls[0]?.url;
+        if (!upstreamStreamUrl) throw new Error('未获取到有效的虎牙直播流');
 
-        const sanitizedUpstream = enforceHttps(upstreamStreamUrl);
+        const sanitizedUpstream = upstreamStreamUrl;
         const streamType = inferStreamType(sanitizedUpstream);
 
         // 对齐 pure_live：虎牙播放需要稳定的 UA/Referer/Origin；WebView 无法给 FLV 请求加自定义 Header，走本地 proxy 注入。
@@ -57,14 +67,15 @@ export async function getHuyaStreamConfig(
           anchorName: result?.nick ?? null,
           avatar: result?.avatar ?? null,
           isLive: typeof result?.is_live === 'boolean' ? result.is_live : null,
+          candidateCount: candidates.length || 1,
         };
       }
 
       // 数据异常或为空，一般意味着未开播或房间详情获取失败
-      throw new Error('主播未开播或获取虎牙房间详情失败');
+      throw new Error('获取虎牙房间详情失败');
     } catch (error: any) {
-      const msg = (error?.message || '').trim();
-      const looksOffline = msg.includes('未开播') || msg.includes('房间') || msg.includes('不存在');
+      const msg = String(error?.message || error || '').trim();
+      const looksOffline = msg.includes('未开播') || msg.includes('房间不存在') || msg.includes('不存在');
 
       // 未开播属于正常业务分支：避免刷 error 日志
       if (looksOffline) {
@@ -78,7 +89,7 @@ export async function getHuyaStreamConfig(
       }
 
       if (attempt >= MAX_ATTEMPTS) {
-        throw new Error('主播未开播或无法获取直播流');
+        throw new Error(msg || '虎牙直播流获取失败');
       }
 
       await new Promise((resolve) => setTimeout(resolve, 450));
@@ -208,14 +219,6 @@ export async function stopHuyaDanmaku(currentUnlistenFn: (() => void) | null): P
 function pickHuyaUrlByQuality(entries: HuyaUnifiedEntry[], quality: string): string | undefined {
   const target = entries.find((e) => e.quality === quality);
   return target?.url;
-}
-
-function enforceHttps(url: string): string {
-  if (!url) return url;
-  if (url.startsWith('http://')) {
-    return url.replace('http://', 'https://');
-  }
-  return url;
 }
 
 function inferStreamType(url: string): string | undefined {

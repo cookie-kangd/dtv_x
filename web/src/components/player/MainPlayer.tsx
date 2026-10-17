@@ -571,6 +571,9 @@ export function MainPlayer({
     typeof window === "undefined" ? null : resolveStoredLine(platform, lineOptionsByPlatform[platform] ?? [])
   );
   const currentQualityRef = useRef(currentQuality);
+  // 同画质备用线路：自动重连时按索引换下一条，而不是死磕已经失效的 CDN。
+  const streamCandidateIndexRef = useRef(0);
+  const streamCandidateCountRef = useRef(1);
   const currentLineRef = useRef(currentLine);
   const lineOptionsRef = useRef<LineOption[]>(lineOptions);
   currentQualityRef.current = currentQuality;
@@ -2357,6 +2360,8 @@ export function MainPlayer({
       // 非自动重连（切房间/切画质/用户点刷新）视为「重新开始」：重置退避与所有重连相关状态；
       // 自动重连必须保留计数，否则永远到不了上限、会无限重试拖垮自己和服务器。
       if (!opts?.isAutoReconnect) {
+        streamCandidateIndexRef.current = 0;
+        streamCandidateCountRef.current = 1;
         autoReconnectModeRef.current = false;
         reconnectAttemptRef.current = 0;
         reconnectBlockedRef.current = false;
@@ -2372,6 +2377,10 @@ export function MainPlayer({
         userPausedRef.current = false;
         clearReconnectTimer();
         setReconnectNotice(null);
+      } else {
+        // 刷新凭据后尝试下一条同画质线路，不持续重试失效的 CDN。
+        streamCandidateIndexRef.current =
+          (streamCandidateIndexRef.current + 1) % streamCandidateCountRef.current;
       }
 
       setIsLoadingStream(true);
@@ -2451,7 +2460,13 @@ export function MainPlayer({
           } catch {
             // ignore meta fetch failures
           }
-          const { streamUrl, streamType } = await getDouyuStreamConfig(roomId, effectiveQuality, resolvedLine);
+          const { streamUrl, streamType } = await getDouyuStreamConfig(
+            roomId,
+            effectiveQuality,
+            resolvedLine,
+            // 斗鱼的候选线路由后端保证同画质，直接按重连次数轮换即可。
+            opts?.isAutoReconnect ? reconnectAttemptRef.current : 0
+          );
           if (!isSessionActive(sessionId)) return;
           setPlayerIsLive(true);
           const nextIsHls = (streamType || "").toLowerCase() === "hls" || streamUrl.toLowerCase().includes(".m3u8");
@@ -2517,12 +2532,14 @@ export function MainPlayer({
           }
         } else if (platform === Platform.HUYA) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
-          const { streamUrl, streamType, title, anchorName, avatar, isLive } = await getHuyaStreamConfig(
+          const { streamUrl, streamType, title, anchorName, avatar, isLive, candidateCount } = await getHuyaStreamConfig(
             roomId,
             effectiveQuality,
-            resolvedLine
+            resolvedLine,
+            streamCandidateIndexRef.current
           );
           if (!isSessionActive(sessionId)) return;
+          streamCandidateCountRef.current = candidateCount;
           setPlayerTitle(title ?? null);
           setPlayerAnchorName(anchorName ?? null);
           setPlayerAvatar(avatar ?? null);
@@ -2563,8 +2580,14 @@ export function MainPlayer({
           } catch {
             // ignore meta fetch failures
           }
-          const { streamUrl, streamType } = await getBilibiliStreamConfig(roomId, effectiveQuality, cookie || undefined);
+          const { streamUrl, streamType, candidateCount } = await getBilibiliStreamConfig(
+            roomId,
+            effectiveQuality,
+            cookie || undefined,
+            streamCandidateIndexRef.current
+          );
           if (!isSessionActive(sessionId)) return;
+          streamCandidateCountRef.current = candidateCount;
           setPlayerIsLive(true);
           const nextIsHls = (streamType || "").toLowerCase() === "hls" || streamUrl.toLowerCase().includes(".m3u8");
           const nextKind: "hls" | "flv" = nextIsHls ? "hls" : "flv";

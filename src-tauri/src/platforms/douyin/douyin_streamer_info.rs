@@ -1,6 +1,8 @@
 use crate::platforms::common::http_client::HttpClient;
 use crate::platforms::common::{FollowHttpClient, GetStreamUrlPayload, LiveStreamInfo};
-use crate::platforms::douyin::web_api::{fetch_room_data, normalize_douyin_live_id, DouyinRoomData};
+use crate::platforms::douyin::web_api::{
+    fetch_room_data, normalize_douyin_live_id, room_status, DouyinRoomData,
+};
 use tauri::command;
 use tauri::State;
 
@@ -33,10 +35,7 @@ pub async fn fetch_douyin_streamer_info(
         Ok(DouyinRoomData { room }) => {
             let web_rid = super::douyin_streamer_detail::extract_web_rid(&room)
                 .unwrap_or_else(|| normalized_id.clone());
-            let status = room
-                .get("status")
-                .and_then(|v| v.as_i64())
-                .unwrap_or_default() as i32;
+            let status = room_status(&room).unwrap_or_default();
             let title = room
                 .get("title")
                 .and_then(|v| v.as_str())

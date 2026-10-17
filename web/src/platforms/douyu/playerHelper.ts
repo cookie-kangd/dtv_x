@@ -6,6 +6,7 @@ export async function getDouyuStreamConfig(
   roomId: string,
   quality: string = '原画',
   line?: string | null,
+  candidateIndex: number = 0,
 ): Promise<{ streamUrl: string, streamType: string | undefined }> {
   let finalStreamUrl: string | null = null;
   let streamType: string | undefined = undefined;
@@ -17,17 +18,21 @@ export async function getDouyuStreamConfig(
         roomId: roomId,
         quality: quality,
         line: line ?? null,
+        candidateIndex,
       });
       
       if (streamUrl) {
-        finalStreamUrl = enforceHttps(streamUrl);
+        // 保留服务端给出的协议：斗鱼直链多为 http，代理层回源不受影响，
+        // 强行改成 https 反而会在部分 CDN 上直接连不上。
+        finalStreamUrl = streamUrl;
         streamType = 'flv';
         break;
       } else {
         throw new Error('斗鱼直播流地址获取为空。');
       }
     } catch (e: any) {
-      console.error(`[DouyuPlayerHelper] 获取斗鱼直播流失败 (尝试 ${attempt}/${MAX_STREAM_FETCH_ATTEMPTS}):`, e.message);
+      const errorMessage = String(e?.message || e || '未知错误');
+      console.error(`[DouyuPlayerHelper] 获取斗鱼直播流失败 (尝试 ${attempt}/${MAX_STREAM_FETCH_ATTEMPTS}):`, errorMessage);
       const offlineOrInvalidRoomMessages = [
         '主播未开播',
         '房间不存在',
@@ -37,7 +42,7 @@ export async function getDouyuStreamConfig(
         'error code 102',
       ];
 
-      const errorMessageLowerCase = e.message?.toLowerCase() || '';
+      const errorMessageLowerCase = errorMessage.toLowerCase();
       const isDefinitivelyOffline = offlineOrInvalidRoomMessages.some(msg => errorMessageLowerCase.includes(msg.toLowerCase()));
 
       if (isDefinitivelyOffline) {
@@ -46,7 +51,7 @@ export async function getDouyuStreamConfig(
       }
 
       if (attempt === MAX_STREAM_FETCH_ATTEMPTS) {
-        throw new Error(`获取斗鱼直播流失败 (尝试 ${MAX_STREAM_FETCH_ATTEMPTS} 次后): ${e.message}`);
+        throw new Error(`获取斗鱼直播流失败 (尝试 ${MAX_STREAM_FETCH_ATTEMPTS} 次后): ${errorMessage}`);
       }
       await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); 
     }
@@ -84,13 +89,4 @@ export async function stopDouyuProxy(): Promise<void> {
     console.error('[DouyuPlayerHelper] Error stopping proxy server:', e);
     douyuProxyActive = false;
   }
-}
-
-function enforceHttps(url: string): string {
-  if (!url) return url;
-  if (url.startsWith('https://')) return url;
-  if (url.startsWith('http://')) {
-    return `https://${url.slice('http://'.length)}`;
-  }
-  return url;
 }

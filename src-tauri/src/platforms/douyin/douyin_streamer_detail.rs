@@ -3,7 +3,7 @@ use crate::platforms::common::types::StreamVariant;
 use crate::platforms::common::GetStreamUrlPayload;
 use crate::platforms::common::LiveStreamInfo as CommonLiveStreamInfo;
 use crate::platforms::douyin::web_api::{
-    choose_flv_stream, fetch_room_data, normalize_douyin_live_id, DouyinRoomData,
+    choose_flv_stream, fetch_room_data, normalize_douyin_live_id, room_status, DouyinRoomData,
     DEFAULT_USER_AGENT,
 };
 use crate::proxy::ProxyServerHandle;
@@ -86,10 +86,8 @@ pub async fn get_douyin_live_stream_url_with_quality(
         .map(|s| s.to_string())
         .unwrap_or_else(|| normalized_id.clone());
     let web_rid = extract_web_rid(&room).unwrap_or_else(|| normalized_id.clone());
-    let status = room
-        .get("status")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_default() as i32;
+    // 状态缺失/非法时直接报错：以前兜底成 0，接口抖动会被显示成「主播未开播」。
+    let status = room_status(&room)?;
     let title = room
         .get("title")
         .and_then(|v| v.as_str())
