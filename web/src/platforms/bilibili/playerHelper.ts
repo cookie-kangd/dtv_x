@@ -11,7 +11,7 @@ export async function getBilibiliStreamConfig(
   quality: string = '原画',
   cookie?: string,
   candidateIndex: number = 0,
-): Promise<{ streamUrl: string, streamType: string | undefined, candidateCount: number }> {
+): Promise<{ streamUrl: string, streamType: string | undefined, candidateUrls: string[], candidateCount: number }> {
   if (!roomId) {
     throw new Error('房间ID未提供');
   }
@@ -137,7 +137,13 @@ export async function getBilibiliStreamConfig(
     streamType = 'flv';
   }
 
-  return { streamUrl, streamType, candidateCount: result.available_streams?.length || 1 };
+  // v0.3.1：把同画质候选线路列表一并返回，供自动重连的「秒级换线」使用
+  // （旧实现只返回数量，列表被丢掉，于是每次换线都等价于一次完整重建播放器）。
+  const candidateUrls = (result.available_streams || [])
+    .map((variant: StreamVariant) => variant?.url)
+    .filter((url: unknown): url is string => typeof url === 'string' && !!url);
+
+  return { streamUrl, streamType, candidateUrls, candidateCount: candidateUrls.length || 1 };
 }
 
 // 统一的 Rust 弹幕事件负载（与 Douyin/Douyu/Huya 保持一致）

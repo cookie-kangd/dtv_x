@@ -58,7 +58,17 @@ const qualityOptions = ["原画", "高清", "标清"] as const;
 //   重连成功（playing）即代表故障已结束，预算当场回满；
 //   之后偶发的短暂卡顿应交回播放器内核自愈（disconnectRetryCount），
 //   若连内核都救不回来，那说明是真的又断了一次 —— 但那要等免打扰期过后才算数。
-const RECONNECT_COOLDOWN_MS = 20000;
+// ★ v0.3.1：20s → 8s。
+//   20s 免打扰期的副作用是把「内核刚自愈完的第二次断流」挡在门外：内核 5s 自愈成功
+//   → 开启 20s 免打扰 → 8s 又断一次 → 只记 deferred → 要等窗口到期才补排，
+//   用户实际等了 28 秒才看到第一次重连。网页版虎牙/斗鱼在这个场景是 1~2s 恢复。
+//   8s 足够覆盖一次正常的「内核自愈 + 缓冲重建」，又不至于让第二次真断流等太久。
+//   若仍担心误判，下面的「补偿补排 3s 上限」是更精准的闸门（见 watchdog）。
+const RECONNECT_COOLDOWN_MS = 8000;
+// ★ v0.3.1 新增：免打扰期内暂存（deferred）的重连请求，最多再等这么久就补排。
+//   免打扰期的目的是「别把内核自愈当成故障」，但它不该让「窗口内真的又断了」等满全程。
+//   有了这个上限，即便把 RECONNECT_COOLDOWN_MS 调大，最坏也只多等 3s。
+const RECONNECT_DEFERRED_MAX_WAIT_MS = 3000;
 const RECONNECT_MAX_ATTEMPTS = 6;
 // 退避阶梯（刻意比教科书实现保守，起步 3s 而非 1s）：
 //   1) 斗鱼/虎牙/B站的取流接口都有频控，秒级密集重取流极易被判异常而直接拒绝 ——
@@ -86,7 +96,22 @@ const STALL_CHECK_INTERVAL_MS = 3000;
 // 增长停止（且播放头也不动）持续超过 STALL_STUCK_MS 才是真断流。
 // 用 30s 是因为要留足一整个 GOP + 关键帧间隔的余量；
 // 再短就会在网络轻微抖动时误报，反而制造 endless 重连。
+// ★ v0.3.1：判据从「一刀切 30s」改为「双通道」：
+//   · 快通道（STALL_STUCK_FAST_MS）：内核已经抛 error / 已判定 maxReaderInterval 断流，
+//     说明内核自己都放弃这条链路了，应用层必须立刻接管，不能再等 30s。
+//     这一项把「真断流」的发现时间从 30s 压到 3s，是追上网页版观感最直接的一步。
+//   · 慢通道（STALL_STUCK_MS）：没有任何错误信号的纯假死，仍然 30s 防误判
+//     （主播画面静止 / 极低帧率时 buffered 可以合法地长时间不动）。
+// 注意：内核侧的 disconnectRetryCount:10 + maxReaderInterval:30000 已经扛掉了
+// 30s 内的抖动，应用层不必再用同一个 30s 去重复防误判。
+const STALL_STUCK_FAST_MS = 3000;
 const STALL_STUCK_MS = 30000;
+// 内核报错后，多久之内仍然算「新鲜故障」（超过则回落到慢通道）。
+const KERNEL_ERROR_FAST_WINDOW_MS = 5000;
+// ★ v0.3.1 新增：自动重连的前几次走「秒级换线」（switchURL 已拿到的同画质候选地址），
+//   不重新取流、不重建播放器。只给前两次 —— 再往后说明不是单条线路的问题，
+//   必须重新取流刷新时效凭据。
+const FAST_LINE_SWITCH_MAX_ATTEMPTS = 2;
 // ===== 重连活性兜底（根治「自动重连若干次后就一直转圈」）=====
 // 事件驱动的重连有一个致命弱点：链条上任何一环静默失败（守卫吞掉请求、
 // await 永不返回），就再也没有人来推进下一次重连。因此必须由一个独立于
@@ -112,6 +137,10 @@ const INVOKE_TIMEOUT_MS = 4000;
 const AUDIO_GUARD_INTERVAL_MS = 1000; // 观察节奏
 const AUDIO_GUARD_MAX_ROUNDS = 45; // 观察窗口总长（约 45s）
 const AUDIO_GUARD_GRACE_MS = 4000; // 画面起播后额外放宽的时间（刚起播时音频还没解码属正常）
+// ★ v0.3.1 新增：起播前的等待预算与起播后的观察预算拆开。
+//   旧实现两处共用一个 rounds 计数器，慢起播的房间（弱网/CDN 慢）会把观察预算
+//   消耗在「还没起播」上，等画面真的出来时已经没剩几轮了 —— 音频故障反而漏判。
+const AUDIO_GUARD_START_ROUNDS = 90; // 起播前最多等约 90s
 // 同一个直播间内最多自动修复几次。
 // 有上限才是安全的：万一上游确实是一路无音轨的流，也不会陷入反复重载。
 const AUDIO_TRACK_MAX_HEAL_ATTEMPTS = 2;
@@ -148,6 +177,88 @@ const readFlvAudioSourceState = (player: any): { created: boolean; hasData: bool
     return { created: true, hasData };
   } catch {
     return null;
+  }
+};
+
+/**
+ * ★ v0.3.1 新增：「音频源缓冲漏建」的最轻量修复。
+ *
+ * 背景见 attachAudioTrackGuard 的注释：音频源缓冲只会在第一次 appendBuffer 时
+ * 按 audioTrack.exist() 决定建不建，且 `_sourceCreated` 只置一次、此后永不重算。
+ * 手动点刷新之所以有效，是因为它走 flv.load() → _reset() 把 _sourceCreated 复位后
+ * 重新决定一次。
+ *
+ * 这里把「手动刷新」里真正起作用的那个动作单独拆出来：
+ * 只复位 bufferService（_sourceCreated / _needInitSegment / _discontinuity）
+ * 并重新 bind media，让下一次 appendBuffer 重新决定 source ——
+ * **不重新取流、不停弹幕、不停代理、不重建播放器**。
+ *
+ * 这样做有两个直接收益：
+ *   1) 用户感知从「等几十秒重连」变成「闪一下就有声音」；
+ *   2) 音频自愈与自动重连两条链路被解耦 —— 音频故障不再受重连退避的影响。
+ *
+ * 实现依据（xgplayer-flv@3.0.26 · es/flv/services/buffer-service.js）：
+ *   reset(reuseMse = false) {
+ *     if (this._mse && !reuseMse) {
+ *       await this._mse.unbindMedia();
+ *       await this._mse.bindMedia(this.flv.media);
+ *     }
+ *     this._needInitSegment = true;
+ *     this._discontinuity = true;
+ *     this._contiguous = false;
+ *     this._sourceCreated = false;      // ★ 就是这一行
+ *     this._initSegmentId = "";
+ *     this.resetSeamlessSwitchStats();
+ *   }
+ * 所有字段名均已对照 3.0.26 源码核实；不同小版本若改名，下面的探测会失败并
+ * 自动回落到原有的 reloadStream 分级路径，不会把播放器搞坏。
+ *
+ * 返回 true 表示「已触发内核复位」；false 表示当前不是 FLV 分支 / 拿不到实例，
+ * 调用方应回落到原有修复路径。
+ */
+const resetFlvAudioSourceBuffer = (player: any): boolean => {
+  try {
+    const flv = player?.getPlugin?.("flv")?.flv ?? player?.plugins?.flv?.flv ?? null;
+    if (!flv) return false;
+    const bufferService = flv?._bufferService ?? null;
+    if (!bufferService || typeof bufferService.reset !== "function") return false;
+    // 只认「音频源缓冲确实没建」这一种病灶，避免在健康流上做无谓复位。
+    const mse = bufferService._mse ?? null;
+    const sourceMap = mse?._sourceBuffer ?? null;
+    if (mse && sourceMap) {
+      const hasAudioSource = Object.keys(sourceMap).some((k) =>
+        String(k).toLowerCase().includes("audio")
+      );
+      if (hasAudioSource) return false;
+    }
+
+    // ★ 刻意**不**调用 bufferService.reset()，也**不**手动设 _needInitSegment。
+    //
+    // 为什么不调 reset()：
+    //   reset() 内部会走 mse.unbindMedia() + mse.bindMedia()，而 bindMedia 会
+    //   `new MediaSource()`、重新设 media.src 并 media.load()
+    //   （xgplayer-streaming-shared es/mse.js · bindMedia 第 268-302 行）——
+    //   已缓冲的视频数据会被全部丢弃、画面必然中断重新起播。那已经不是
+    //   「闪一下」，而是用户可见的明显卡顿，比原来的手动刷新好不了多少。
+    //
+    // 为什么不手动设 _needInitSegment = true：
+    //   buffer-service.js 第 365 行的守卫是
+    //   `if (this._needInitSegment && !remuxResult.videoInitSegment && !remuxResult.audioInitSegment) return;`
+    //   一旦置了它却碰上「这一次 remux 两个 init segment 都没产出」，
+    //   整次 appendBuffer 会空转、不 append 任何数据，反而拖慢恢复。
+    //
+    // 正确做法：只清闩锁与 init segment 指纹。
+    //   下一次 appendBuffer 时第 323-327 行会发现 `newId !== this._initSegmentId`，
+    //   由内核**自己**把 _needInitSegment 置 true 并补发 init segment ——
+    //   这是内核的原生路径，不需要我们去猜它的内部时序。
+    bufferService._sourceCreated = false;
+    bufferService._initSegmentId = "";
+
+    console.info("[Player] 音频守卫：已复位 FLV 源缓冲创建闩锁，等待重建音频轨");
+    return true;
+  } catch (e) {
+    console.warn("[Player] 音频守卫：复位 FLV 源缓冲失败，回落到重取流路径", e);
+    return false;
   }
 };
 
@@ -488,6 +599,12 @@ export function MainPlayer({
   const reconnectCooldownUntilRef = useRef(0);
   // 连续「取流阶段」失败次数（取流成功即清零）——用于对取不到流的房间及时止损
   const fetchFailStreakRef = useRef(0);
+  // ★ v0.3.1 新增：内核最近一次「明确报错/自判断流」的时刻。
+  //   看门狗用它走「快通道」：内核都放弃了这条链路，应用层不该再等慢通道的 30s。
+  //   0 表示「内核从未报过错」，看门狗会走原有的 30s 慢判据（防误判能力不变）。
+  const kernelGaveUpAtRef = useRef(0);
+  // ★ v0.3.1 新增：暂存（deferred）重连请求的时刻，用于「补偿补排 3s 上限」。
+  const reconnectDeferredAtRef = useRef(0);
   // 是否处于「自动重连重建」模式：用于让 destroyPlayer 保留全屏态
   const autoReconnectModeRef = useRef(false);
   // 一旦确认「主播未开播 / 房间不存在」就置位，阻断自动重连（否则会对着下播的房间空转）；
@@ -574,6 +691,10 @@ export function MainPlayer({
   // 同画质备用线路：自动重连时按索引换下一条，而不是死磕已经失效的 CDN。
   const streamCandidateIndexRef = useRef(0);
   const streamCandidateCountRef = useRef(1);
+  // ★ v0.3.1 新增：把候选线路列表本身存下来（旧实现只存了一个数量，
+  //   列表被丢掉了，于是「换线」只能靠重新取流拿到，代价是完整重建播放器）。
+  //   有了列表，前两次重连可以直接 switchURL 秒级换线，完全不重新取流。
+  const streamCandidateUrlsRef = useRef<string[]>([]);
   const currentLineRef = useRef(currentLine);
   const lineOptionsRef = useRef<LineOption[]>(lineOptions);
   currentQualityRef.current = currentQuality;
@@ -1031,6 +1152,11 @@ export function MainPlayer({
     //   结果是永久黑屏、只能手动刷新。暂存后由看门狗在窗口到期时捡起来补排。
     if (Date.now() < reconnectCooldownUntilRef.current) {
       reconnectDeferredRef.current = true;
+      // ★ v0.3.1：必须同时记录暂存时刻。
+      //   看门狗的「补排最多再等 3s」用的是这个时间戳；若只置 deferred 而不记时，
+      //   截止时间会退化成 epoch+3s（恒为过去），免打扰期会被完全绕过 ——
+      //   那正好会复活「网络稳定却一直重连」的老问题。
+      reconnectDeferredAtRef.current = Date.now();
       return;
     }
 
@@ -1041,6 +1167,7 @@ export function MainPlayer({
       //   于是这次重连请求被守卫静默吞掉，之后没有任何人再发起下一次 —— 链条当场断裂。
       //   现在改为记下请求，等本次取流结束后由 finally 补偿调度。
       reconnectDeferredRef.current = true;
+      reconnectDeferredAtRef.current = Date.now();
       return;
     }
 
@@ -1171,9 +1298,23 @@ export function MainPlayer({
       //   旧实现不检查就补排 → 每次内核自愈都会在 20s 后引发一次完整重取流，
       //   这正是「网络稳定却持续重连」的第二条独立路径：
       //   内核重试 → error → 暂存 → 20s 后无条件补排 → 重建播放器 → 又抖一下 → 循环。
+      // ★ v0.3.1：补排时机从「等满免打扰期」改为「免打扰期 与 暂存后 3s 二者取先」。
+      //   免打扰期的目的是别把内核自愈当成故障，但它不该让「窗口内真的又断了」
+      //   也等满全程。有了这个上限，二次断流的恢复时间从 28s 降到 ~8s 或 ~3s。
+      //
+      //   时间戳缺失（0）时必须退回「只看免打扰期」的老语义：
+      //   否则 Math.min(cooldown, 0 + 3000) 恒等于 3000，截止点永远是过去，
+      //   免打扰期会被完全绕过 —— 那会复活「网络稳定却一直重连」的老问题。
+      const deferredDeadline =
+        reconnectDeferredAtRef.current > 0
+          ? Math.min(
+              reconnectCooldownUntilRef.current,
+              reconnectDeferredAtRef.current + RECONNECT_DEFERRED_MAX_WAIT_MS
+            )
+          : reconnectCooldownUntilRef.current;
       const deferredDue =
         reconnectDeferredRef.current &&
-        now >= reconnectCooldownUntilRef.current &&
+        now >= deferredDeadline &&
         !reloadInFlightRef.current &&
         reconnectTimerRef.current === null;
       if (deferredDue) {
@@ -1293,12 +1434,21 @@ export function MainPlayer({
         }
         // 缓冲不涨 + 画面不动 → 累计静止时长
         const stillSince = bCur.at || now;
-        if (now - stillSince >= STALL_STUCK_MS) {
+        // ★ v0.3.1：双通道阈值。
+        //   · 内核刚报过错（5s 内）→ 它自己都放弃了这条链路，3s 就接管；
+        //   · 否则（纯假死、无任何错误信号）→ 保持 30s，防误判能力不变。
+        const kernelErrorFresh =
+          kernelGaveUpAtRef.current > 0 && now - kernelGaveUpAtRef.current < KERNEL_ERROR_FAST_WINDOW_MS;
+        const effectiveStallMs = kernelErrorFresh ? STALL_STUCK_FAST_MS : STALL_STUCK_MS;
+        if (now - stillSince >= effectiveStallMs) {
           console.warn(
-            `[Player] 缓冲与播放头均无变化超过 ${STALL_STUCK_MS / 1000}s，判定断流`
+            `[Player] 缓冲与播放头均无变化超过 ${effectiveStallMs / 1000}s，判定断流` +
+              `${kernelErrorFresh ? "（内核已报错，走快通道）" : ""}`
           );
           lastBufferedRef.current = { end: bufferedEnd, at: now };
           lastProgressRef.current = { time: video.currentTime, at: now };
+          // 用完即清：避免同一次陈旧报错让后续每次判定都走快通道。
+          kernelGaveUpAtRef.current = 0;
           scheduleReconnect("画面断流");
         }
         return;
@@ -1380,7 +1530,9 @@ export function MainPlayer({
       // ★ 全部用「本次挂载」的局部变量记账，不放到 ref 上：
       //   换播放器实例后旧值会污染新实例的判断。
       let healed = false;
-      let rounds = 0;
+      // v0.3.1：起播前 / 起播后两套独立预算，互不挤占（见 tick 内注释）。
+      let roundsPlaying = 0;
+      let roundsStarting = 0;
       let playStartedAt = 0;
       let brokenStreak = 0;
       let timer: number | null = null;
@@ -1404,6 +1556,38 @@ export function MainPlayer({
         clearTimer();
         audioHealAttemptsRef.current += 1;
         const attempt = audioHealAttemptsRef.current;
+
+        // ★ v0.3.1：优先走「轻量内核复位」，成功就不必惊动整条重连链路。
+        //   这一步只复位 FLV 源缓冲创建闩锁，不重新取流、不停弹幕、不停代理、
+        //   不重建播放器 —— 用户感知是「闪一下就有声音」而不是「转圈几十秒」。
+        //   只有它失败（非 FLV 分支 / 内核字段名不匹配 / 复位后仍未建音频源）时，
+        //   才回落到下面原有的分级路径。
+        if (resetFlvAudioSourceBuffer(playerRef.current)) {
+          // 复位已生效：内核会在下一次 appendBuffer 时重新决定 source。
+          // 这里留一小段观察时间，若音频源缓冲仍未建出，再升级到重取流。
+          healed = false;
+          clearTimer();
+          timer = window.setTimeout(() => {
+            if (!isSessionActive(sessionId) || healed) return;
+            const after = readFlvAudioSourceState(playerRef.current);
+            const stillBroken = !!after && !after.created;
+            if (stillBroken) {
+              console.warn("[Player] 音频守卫：轻量复位后音频源缓冲仍未创建，升级为重取流");
+              healed = true;
+              clearTimer();
+              void reloadStreamRef.current?.("refresh", undefined, { forceRebuild: true });
+              return;
+            }
+            // 复位有效：收回本次计数（轻量修复不该消耗用户的修复预算），继续观察。
+            audioHealAttemptsRef.current = Math.max(0, audioHealAttemptsRef.current - 1);
+            healed = false;
+            playStartedAt = Date.now();
+            brokenStreak = 0;
+            timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          }, 3000);
+          return;
+        }
+
         // 第 1 次走「手动点刷新」那条路径（软切换，代价最小、不闪）；
         // 第 2 次升级为彻底重建播放器 —— 换掉内核实例与 demuxer，是最强的复位。
         const forceRebuild = attempt >= AUDIO_TRACK_MAX_HEAL_ATTEMPTS;
@@ -1424,8 +1608,13 @@ export function MainPlayer({
         // 画面还没真正跑起来（起播慢 / 仍在缓冲 / 被用户暂停）不算音频故障，
         // 但也必须有尽头，避免无限空转。
         if (!playing) {
-          rounds += 1;
-          if (rounds <= AUDIO_GUARD_MAX_ROUNDS) timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          // ★ v0.3.1：起播前用独立的、更宽的预算。
+          //   旧实现与「已起播的观察」共用一个计数器，慢起播的房间（弱网/CDN 慢）
+          //   会把预算耗在等待上，等画面真出来时已没剩几轮，音频故障反而漏判。
+          roundsStarting += 1;
+          if (roundsStarting <= AUDIO_GUARD_START_ROUNDS) {
+            timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+          }
           return;
         }
 
@@ -1444,9 +1633,16 @@ export function MainPlayer({
           return;
         }
         if (state.decided) {
-          // 结构性铁证（如音频源缓冲根本没建）立刻动手；
-          // 计数器类判据要求连续三轮都判「没声音」，避免把解码起步延迟误判成故障。
-          brokenStreak = state.hard ? 3 : brokenStreak + 1;
+          // ★ v0.3.1：结构性铁证（音频源缓冲根本没建）立即动手，不再多等一个 tick。
+          //   旧代码写成 `brokenStreak = state.hard ? 3 : brokenStreak + 1` 后
+          //   由下面的 `>= 3` 判断，等于 hard 判据也要再等一轮才触发，
+          //   白白多出 1s；而这个病灶第一轮就能定性，没有误判风险。
+          if (state.hard) {
+            heal(state.detail);
+            return;
+          }
+          // 计数器类判据仍要求连续三轮，避免把解码起步延迟误判成故障。
+          brokenStreak += 1;
           if (brokenStreak >= 3) {
             heal(state.detail);
             return;
@@ -1457,8 +1653,8 @@ export function MainPlayer({
         brokenStreak = 0;
 
         // 判据还不足以定性：继续观察。
-        rounds += 1;
-        if (rounds <= AUDIO_GUARD_MAX_ROUNDS) {
+        roundsPlaying += 1;
+        if (roundsPlaying <= AUDIO_GUARD_MAX_ROUNDS) {
           timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
           return;
         }
@@ -1485,7 +1681,8 @@ export function MainPlayer({
         // 本守卫的记账必须跟着复位，否则软切换后新丢的音频轨不会被发现。
         if (eventName.endsWith("loadstart")) {
           healed = false;
-          rounds = 0;
+          roundsPlaying = 0;
+          roundsStarting = 0;
           playStartedAt = 0;
           brokenStreak = 0;
           clearTimer();
@@ -2147,6 +2344,10 @@ export function MainPlayer({
         player.on?.("error", (err: any) => {
           if (!isSessionActive(sessionId)) return;
           const detail = (err && (err.errorType || err.type || err.errorCode || err.message)) || "unknown";
+          // ★ v0.3.1：无论是否在免打扰期内，都记下「内核刚刚报过错」。
+          //   看门狗据此走快通道（3s 而非 30s）—— 内核自己都放弃这条链路了，
+          //   应用层再等 30s 只会让用户干看着转圈。这是追上网页版观感最关键的一步。
+          kernelGaveUpAtRef.current = Date.now();
           // 免打扰期内不立刻重连：内核的 disconnectRetryCount 重试过程中也会抛 error，
           // 若不拦，内核每重试一次就被应用层判成「故障」→ 疯狂叠加重连。
           // 但要记下 deferred —— 若这次 error 是真断流（而非内核重试），
@@ -2154,6 +2355,7 @@ export function MainPlayer({
           if (Date.now() < reconnectCooldownUntilRef.current) {
             console.info("[Player] 免打扰期内暂缓处理内核错误（优先交给内核自愈）:", detail);
             reconnectDeferredRef.current = true;
+            reconnectDeferredAtRef.current = Date.now();
             return;
           }
           console.warn("[Player] 播放错误事件，准备自动重连:", err);
@@ -2171,6 +2373,10 @@ export function MainPlayer({
         // 看门狗每 30 秒就判定「重连链条停滞」补一次，表现为「重连一次后无限重连」。
         player.on?.("playing", () => {
           if (!isSessionActive(sessionId)) return;
+          // ★ v0.3.1：恢复播放即作废此前的「内核报错」记录。
+          //   否则一次早已自愈的旧报错会让看门狗的快通道长期生效，
+          //   把后续正常的静止画面误判成断流。
+          kernelGaveUpAtRef.current = 0;
           // 恢复播放 = 用户（或内核自愈）解除了暂停
           userPausedRef.current = false;
           notePlaybackProgress();
@@ -2314,6 +2520,80 @@ export function MainPlayer({
     ]
   );
 
+  /**
+   * ★ v0.3.1 新增：自动重连的「秒级换线」快路径。
+   *
+   * 为什么不直接重取流：虎牙/斗鱼/B 站的播放地址都带时效 token，重连确实需要重新取流；
+   * 但**同一次取流返回的候选线路本来就是多条同画质地址**（虎牙后端一次
+   * `get_huya_unified_cmd` 就并行解析了全部线路），前端却只用了第一条、把列表丢了。
+   * 线路抖动时，换一条候选地址往往立刻就能恢复，根本不需要惊动取流接口。
+   *
+   * 本函数的策略：
+   *   · 仅在「自动重连的前两次」启用（reconnectAttemptRef < 2）；
+   *   · 必须有可用的候选列表、且当前播放器支持 switchURL、且播放类型一致；
+   *   · 成功后只做最小动作：换 URL + 复位内核报错记录，不动弹幕、不动代理、不重建播放器。
+   *
+   * 返回 true 表示「已接管本次重连」，调用方应直接收尾，不要再走完整取流流程。
+   */
+  const tryFastLineSwitch = (): boolean => {
+    if (reconnectAttemptRef.current >= FAST_LINE_SWITCH_MAX_ATTEMPTS) return false;
+    const urls = streamCandidateUrlsRef.current;
+    if (urls.length < 2) return false;
+    const player = playerRef.current;
+    if (!player || typeof player.switchURL !== "function") return false;
+    if (!danmuOverlayRef.current) return false;
+    if (!playbackKindRef.current) return false;
+
+    const nextIndex = (streamCandidateIndexRef.current + 1) % urls.length;
+    const nextUrl = urls[nextIndex];
+    if (!nextUrl) return false;
+    // 新地址与当前地址相同 → 换不出意义，交给完整取流去刷新凭据。
+    const currentUrl = (player as any).url ?? (player as any).currentUrl ?? "";
+    if (currentUrl && String(currentUrl) === nextUrl) return false;
+
+    // 换线前后都保持 FLV/HLS 一致，否则软切换语义不成立。
+    // 判 kind 时不能只靠 URL 后缀：B 站的候选地址常是不带 .flv/.m3u8 后缀的
+    // （形如 /live-bvc/xxx），只靠后缀会把它们全判成 flv，导致 HLS 播放时
+    // 每次都被这个守卫拦下、秒级换线对 B 站完全失效。
+    // 因此：URL 明确是 .m3u8 → hls；URL 明确是 .flv → flv；
+    // 后缀判不出来时，沿用当前播放类型（同一次取流返回的候选本就是同协议的同画质线路）。
+    const lowerUrl = nextUrl.toLowerCase();
+    const nextKind: "hls" | "flv" = lowerUrl.includes(".m3u8")
+      ? "hls"
+      : lowerUrl.includes(".flv")
+        ? "flv"
+        : playbackKindRef.current;
+    if (playbackKindRef.current !== nextKind) return false;
+
+    streamCandidateIndexRef.current = nextIndex;
+    console.info(
+      `[Player] 自动重连：走秒级换线（第 ${nextIndex + 1}/${urls.length} 条同画质候选），不重新取流`
+    );
+    try {
+      const ret = (player as any).switchURL(nextUrl, { seamless: false });
+      // ★ 回落只依赖 reject，绝不依赖 resolve：
+      //   switchURL 成功时可能长时间不 resolve（它在等新流起播），
+      //   若把回落逻辑挂在 resolve 之后就永远等不到，重连链会当场断裂。
+      //   真正的兜底由看门狗承担（缓冲不增长 + 内核报错 → 快通道 3s 接管）。
+      if (ret && typeof ret.then === "function") {
+        void ret.catch((e: any) => {
+          console.warn("[Player] 秒级换线被拒，回落到完整取流", e);
+          // 回落后把索引退回一格，避免完整取流时又跳过一条候选线路。
+          streamCandidateIndexRef.current = nextIndex;
+          void reloadStreamRef.current?.("refresh", undefined, { isAutoReconnect: true });
+        });
+      }
+      // 换线成功即认为本次故障已尝试处置：作废陈旧的内核报错，避免看门狗
+      // 在换线后的起播缓冲期立刻又走快通道判一次断流。
+      kernelGaveUpAtRef.current = 0;
+      notePlaybackProgress();
+      return true;
+    } catch (e) {
+      console.warn("[Player] 秒级换线异常，回落到完整取流", e);
+      return false;
+    }
+  };
+
   const reloadStream = useCallback(
     async (
       _trigger: "refresh" | "quality" | "line",
@@ -2341,6 +2621,7 @@ export function MainPlayer({
           } else {
             // 取流中：记下这次重连请求，等本次取流结束后补偿调度（不能丢弃，见 scheduleReconnect 注释）
             reconnectDeferredRef.current = true;
+            reconnectDeferredAtRef.current = Date.now();
             return;
           }
         } else {
@@ -2362,11 +2643,13 @@ export function MainPlayer({
       if (!opts?.isAutoReconnect) {
         streamCandidateIndexRef.current = 0;
         streamCandidateCountRef.current = 1;
+        streamCandidateUrlsRef.current = [];
         autoReconnectModeRef.current = false;
         reconnectAttemptRef.current = 0;
         reconnectBlockedRef.current = false;
         reconnectGaveUpRef.current = false;
         reconnectDeferredRef.current = false;
+        reconnectDeferredAtRef.current = 0;
         reconnectRoundStartRef.current = 0;
         fetchFailStreakRef.current = 0;
         // 用户主动操作 = 明确表示「我要重新开始」，直接给一段免打扰期。
@@ -2378,6 +2661,25 @@ export function MainPlayer({
         clearReconnectTimer();
         setReconnectNotice(null);
       } else {
+        // ★ v0.3.1：前两次重连优先「秒级换线」—— 直接用已拿到的同画质候选地址
+        //   switchURL，不重新取流、不停弹幕、不停代理、不重建播放器。
+        //   这条路径的耗时是「一次 HTTP 重连 + MSE 重新 open」，与网页版同量级（1~3s），
+        //   而原来的做法每次都要完整重建播放器（秒级起步，加上退避就是几十秒）。
+        //   只有在拿不到候选列表、或已经连续失败两次之后，才回落到下面的完整取流。
+        const fastLineSwitched = tryFastLineSwitch();
+        if (fastLineSwitched) {
+          // ★ 必须复位自动重连模式标记。
+          //   这个 return 位于 try/finally 之外，不会走到 finally 里的
+          //   `autoReconnectModeRef.current = false`。若不在这里补一刀，
+          //   该标记会残留为 true，导致下一次 destroyPlayer 误以为还在自动重连、
+          //   错误地保留全屏态（用户切房间/切画质时被踢不出全屏）。
+          autoReconnectModeRef.current = false;
+          reloadInFlightRef.current = false;
+          reloadStartedAtRef.current = 0;
+          setIsLoadingStream(false);
+          setReconnectNotice(null);
+          return;
+        }
         // 刷新凭据后尝试下一条同画质线路，不持续重试失效的 CDN。
         streamCandidateIndexRef.current =
           (streamCandidateIndexRef.current + 1) % streamCandidateCountRef.current;
@@ -2532,7 +2834,7 @@ export function MainPlayer({
           }
         } else if (platform === Platform.HUYA) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
-          const { streamUrl, streamType, title, anchorName, avatar, isLive, candidateCount } = await getHuyaStreamConfig(
+          const { streamUrl, streamType, title, anchorName, avatar, isLive, candidateCount, candidateUrls } = await getHuyaStreamConfig(
             roomId,
             effectiveQuality,
             resolvedLine,
@@ -2540,6 +2842,10 @@ export function MainPlayer({
           );
           if (!isSessionActive(sessionId)) return;
           streamCandidateCountRef.current = candidateCount;
+          // v0.3.1：把候选线路列表存下来，供自动重连的「秒级换线」快路径使用。
+          if (Array.isArray(candidateUrls) && candidateUrls.length) {
+            streamCandidateUrlsRef.current = candidateUrls;
+          }
           setPlayerTitle(title ?? null);
           setPlayerAnchorName(anchorName ?? null);
           setPlayerAvatar(avatar ?? null);
@@ -2580,7 +2886,7 @@ export function MainPlayer({
           } catch {
             // ignore meta fetch failures
           }
-          const { streamUrl, streamType, candidateCount } = await getBilibiliStreamConfig(
+          const { streamUrl, streamType, candidateCount, candidateUrls } = await getBilibiliStreamConfig(
             roomId,
             effectiveQuality,
             cookie || undefined,
@@ -2588,6 +2894,10 @@ export function MainPlayer({
           );
           if (!isSessionActive(sessionId)) return;
           streamCandidateCountRef.current = candidateCount;
+          // v0.3.1：保存同画质候选列表，供自动重连的「秒级换线」使用。
+          if (Array.isArray(candidateUrls) && candidateUrls.length) {
+            streamCandidateUrlsRef.current = candidateUrls;
+          }
           setPlayerIsLive(true);
           const nextIsHls = (streamType || "").toLowerCase() === "hls" || streamUrl.toLowerCase().includes(".m3u8");
           const nextKind: "hls" | "flv" = nextIsHls ? "hls" : "flv";

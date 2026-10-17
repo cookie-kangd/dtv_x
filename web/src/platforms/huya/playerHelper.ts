@@ -9,6 +9,13 @@ export interface HuyaUnifiedEntry { quality: string; bitRate: number; url: strin
 
 let huyaProxyActive = false;
 
+/**
+ * v0.3.1：额外返回同画质的全部候选线路地址。
+ *
+ * 用途：自动重连时前端可以直接 switchURL 秒级换线，不必重新走一遍取流 + 重建播放器
+ * （旧实现只把 candidateCount 传了出来，列表本身被丢掉，于是每次「换线」都等价于
+ * 一次完整重建，观感就是转圈很久）。
+ */
 export async function getHuyaStreamConfig(
   roomId: string,
   quality: string = '原画',
@@ -17,6 +24,7 @@ export async function getHuyaStreamConfig(
 ): Promise<{
   streamUrl: string;
   streamType: string | undefined;
+  candidateUrls: string[];
   title?: string | null;
   anchorName?: string | null;
   avatar?: string | null;
@@ -63,6 +71,7 @@ export async function getHuyaStreamConfig(
         return {
           streamUrl: finalStreamUrl,
           streamType,
+          candidateUrls: candidates,
           title: result?.title ?? null,
           anchorName: result?.nick ?? null,
           avatar: result?.avatar ?? null,
