@@ -356,3 +356,43 @@ ul {
   font-size: 0.72rem;
   color: var(--error-color, #f87171);
 }
+
+/* ===== v0.3.2 主题强调色配色 =====
+   参考上游 v4.1.0 的多套配色思路，但只覆盖强调色三变量：
+   底色、表面、文字仍由 [data-theme="light|dark"] 定义，
+   因此可与既有的「亮色 / 暗色 / 跟随系统」模式叠加生效。
+   这些规则置于文件末尾，与 [data-theme] 块特异性相同（:root + 1 属性），靠顺序覆盖。
+   默认配色 classic 不定义规则，保持 v0.3.1 及之前的外观完全不变。 */
+:root[data-palette="lime"] {
+  --accent: #d8ff4f;
+  --accent-hover: #c2e840;
+  --accent-glow: rgba(216, 255, 79, 0.32);
+  --accent-text: #10140a;
+}
+:root[data-palette="cyan"] {
+  --accent: #22d3ee;
+  --accent-hover: #0891b2;
+  --accent-glow: rgba(34, 211, 238, 0.32);
+}
+:root[data-palette="violet"] {
+  --accent: #a78bfa;
+  --accent-hover: #7c3aed;
+  --accent-glow: rgba(167, 139, 250, 0.32);
+}
+:root[data-palette="amber"] {
+  --accent: #ffab5c;
+  --accent-hover: #ea7317;
+  --accent-glow: rgba(255, 171, 92, 0.32);
+  --accent-text: #1a1006;
+}
+:root[data-palette="rose"] {
+  --accent: #fb7185;
+  --accent-hover: #e11d48;
+  --accent-glow: rgba(251, 113, 133, 0.32);
+}
+:root[data-palette="mono"] {
+  --accent: #e5e5e5;
+  --accent-hover: #a3a3a3;
+  --accent-glow: rgba(229, 229, 229, 0.28);
+  --accent-text: #18181b;
+}

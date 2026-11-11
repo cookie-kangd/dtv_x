@@ -144,6 +144,12 @@ const AUDIO_GUARD_START_ROUNDS = 90; // 起播前最多等约 90s
 // 同一个直播间内最多自动修复几次。
 // 有上限才是安全的：万一上游确实是一路无音轨的流，也不会陷入反复重载。
 const AUDIO_TRACK_MAX_HEAL_ATTEMPTS = 2;
+// ★ v0.3.2：轻量复位后的验证节奏与上限。
+//   v0.3.1 固定等 3s，且只检查「SourceBuffer 是否建出」——既识别不了
+//   「缓冲建了但里面没有音频字节」，也会把「内核尚未就绪、判据返回 null」
+//   误当成修复成功。守卫于是收工，用户只能靠手动刷新。
+const AUDIO_HEAL_VERIFY_MS = 1500;
+const AUDIO_HEAL_VERIFY_ROUNDS = 3;
 
 /**
  * 读 xgplayer-flv 内核里「音频源缓冲」的真实状态。
@@ -1544,7 +1550,7 @@ export function MainPlayer({
         }
       };
 
-      const heal = (reason: string) => {
+      const heal = (reason: string, hard = false) => {
         if (healed || !isSessionActive(sessionId)) return;
         if (audioHealAttemptsRef.current >= AUDIO_TRACK_MAX_HEAL_ATTEMPTS) {
           console.warn(
@@ -1563,34 +1569,48 @@ export function MainPlayer({
         //   只有它失败（非 FLV 分支 / 内核字段名不匹配 / 复位后仍未建音频源）时，
         //   才回落到下面原有的分级路径。
         if (resetFlvAudioSourceBuffer(playerRef.current)) {
-          // 复位已生效：内核会在下一次 appendBuffer 时重新决定 source。
-          // 这里留一小段观察时间，若音频源缓冲仍未建出，再升级到重取流。
+          // ★ v0.3.2：清闩锁只能救「音频参数晚到一帧」，救不了「这一段流压根没下发
+          //   AAC sequence header」（CDN 半路接入）。后者正是手动刷新才有效的病灶：
+          //   刷新会重建连接，让 CDN 从带音频头的起点重新发流。
+          //   因此验证标准必须是「真的有音频输出」，而不是「SourceBuffer 建出来了」。
           healed = false;
           clearTimer();
-          timer = window.setTimeout(() => {
+          let verifyRounds = 0;
+          const verify = () => {
             if (!isSessionActive(sessionId) || healed) return;
-            const after = readFlvAudioSourceState(playerRef.current);
-            const stillBroken = !!after && !after.created;
-            if (stillBroken) {
-              console.warn("[Player] 音频守卫：轻量复位后音频源缓冲仍未创建，升级为重取流");
+            const after = readAudioOutputState(playerRef.current);
+            if (after.decided && after.alive) {
+              // 复位有效：收回本次计数（轻量修复不该消耗用户的修复预算），继续观察。
+              audioHealAttemptsRef.current = Math.max(0, audioHealAttemptsRef.current - 1);
+              healed = false;
+              playStartedAt = Date.now();
+              brokenStreak = 0;
+              timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
+              return;
+            }
+            verifyRounds += 1;
+            // 确凿仍无音频，或连续多次都无法定性 —— 直接重建播放连接，
+            // 等价于用户手动刷新，但由守卫自动完成，无需用户介入。
+            if ((after.decided && !after.alive) || verifyRounds >= AUDIO_HEAL_VERIFY_ROUNDS) {
+              console.warn(
+                `[Player] 音频守卫：轻量复位后仍无音频输出（${after.detail}），重建播放连接`
+              );
               healed = true;
               clearTimer();
               void reloadStreamRef.current?.("refresh", undefined, { forceRebuild: true });
               return;
             }
-            // 复位有效：收回本次计数（轻量修复不该消耗用户的修复预算），继续观察。
-            audioHealAttemptsRef.current = Math.max(0, audioHealAttemptsRef.current - 1);
-            healed = false;
-            playStartedAt = Date.now();
-            brokenStreak = 0;
-            timer = window.setTimeout(tick, AUDIO_GUARD_INTERVAL_MS);
-          }, 3000);
+            timer = window.setTimeout(verify, AUDIO_HEAL_VERIFY_MS);
+          };
+          timer = window.setTimeout(verify, AUDIO_HEAL_VERIFY_MS);
           return;
         }
 
         // 第 1 次走「手动点刷新」那条路径（软切换，代价最小、不闪）；
         // 第 2 次升级为彻底重建播放器 —— 换掉内核实例与 demuxer，是最强的复位。
-        const forceRebuild = attempt >= AUDIO_TRACK_MAX_HEAL_ATTEMPTS;
+        // ★ v0.3.2：结构性铁证（音频源缓冲未创建）说明这一段流缺 AAC sequence header，
+        //   switchURL 软切换复用同一内核与 demuxer，换不掉这个病灶，第一次就该全量重建。
+        const forceRebuild = hard || attempt >= AUDIO_TRACK_MAX_HEAL_ATTEMPTS;
         console.warn(
           `[Player] 判定音频未输出（${reason}），自动修复（第 ${attempt}/${AUDIO_TRACK_MAX_HEAL_ATTEMPTS} 次` +
             `${forceRebuild ? "，彻底重建播放器" : "，走刷新路径"}）`
@@ -1618,6 +1638,17 @@ export function MainPlayer({
           return;
         }
 
+        // ★ v0.3.2：结构性铁证不受起播宽限期约束。
+        //   「音频源缓冲压根没建」与「音频解码起步慢」是两回事：前者无论等多久
+        //   都不会有声音。v0.3.1 让它和计数器类判据一起等满 4s 宽限，正是
+        //   「刚进房没声音、刷新一下就好」仍偶发的主因之一 —— 用户往往等不到
+        //   守卫动手就已经去点刷新了。
+        const earlyState = readAudioOutputState(playerRef.current);
+        if (earlyState.decided && !earlyState.alive && earlyState.hard) {
+          heal(earlyState.detail + "（起播早期铁证）", true);
+          return;
+        }
+
         // 画面起播后先给一段宽限期：刚起播的瞬间音频还没开始解码属于正常。
         if (!playStartedAt) playStartedAt = Date.now();
         if (Date.now() - playStartedAt < AUDIO_GUARD_GRACE_MS) {
@@ -1638,7 +1669,7 @@ export function MainPlayer({
           //   由下面的 `>= 3` 判断，等于 hard 判据也要再等一轮才触发，
           //   白白多出 1s；而这个病灶第一轮就能定性，没有误判风险。
           if (state.hard) {
-            heal(state.detail);
+            heal(state.detail, true);
             return;
           }
           // 计数器类判据仍要求连续三轮，避免把解码起步延迟误判成故障。
@@ -1690,10 +1721,27 @@ export function MainPlayer({
           return;
         }
 
+        // ★ v0.3.2：源缓冲创建完成，是判定「这一路流缺音频」的最早时刻。
+        //   v0.3.1 只有 1s 轮询 + 4s 宽限，进房最初几秒无人判定；而 CDN 半路接入
+        //   （首段没下发 AAC sequence header）恰恰在这一刻就已定型。
+        //   延后 600ms 是等内核把两条 source 都建完，避免把「音频晚到」误判成缺失；
+        //   即便误判，下面的轻量复位也会在验证阶段被判为「本来就有声音」而收回。
+        if (eventName.endsWith("sourcebuffercreated")) {
+          window.setTimeout(() => {
+            if (!isSessionActive(sessionId) || healed) return;
+            const st = readFlvAudioSourceState(playerRef.current);
+            if (st && !st.created) {
+              clearTimer();
+              heal("源缓冲创建时即缺音频轨（首段缺 AAC sequence header）", true);
+            }
+          }, 600);
+          return;
+        }
+
         // 内核为了等某个「声明存在却没解析出参数」的轨道，攒够了 analyzeDuration
         // （默认 20s）的媒体数据仍然放弃 —— 这次建出的源缓冲必然缺音频，直接修复。
         if (eventName.endsWith("analyzedurationexceeded")) {
-          heal("内核等待音频参数超时放弃");
+          heal("内核等待音频参数超时放弃", true);
           return;
         }
 
@@ -1701,7 +1749,7 @@ export function MainPlayer({
         // 且内核不会再补建（_sourceCreated 已经闩住）→ 必然无声，立即修复。
         if (eventName.endsWith("metadataparsed") && payload?.type === "audio") {
           if (!readAudioOutputState(playerRef.current).alive) {
-            heal("音频参数晚于源缓冲创建");
+            heal("音频参数晚于源缓冲创建", true);
           }
         }
       };

@@ -9,7 +9,7 @@ import { m, AnimatePresence } from "framer-motion";
 import { Info, LogIn, LogOut, MonitorSmartphone, Settings as SettingsIcon, SlidersHorizontal, Wrench, X } from "lucide-react";
 
 import { useBilibiliCookie } from "@/platforms/bilibili/useBilibiliCookie";
-import { useTheme } from "@/state/theme/ThemeProvider";
+import { PALETTE_OPTIONS, useTheme, type ColorPalette } from "@/state/theme/ThemeProvider";
 import { ALL_PLATFORM_IDS, useAppSettings } from "@/state/settings/SettingsProvider";
 
 import styles from "./SettingsModal.module.css";
@@ -258,6 +258,23 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
                         <option value="light">亮色</option>
                         <option value="dark">暗色</option>
                         <option value="system">跟随系统</option>
+                      </select>
+                    </div>
+                    <div className={styles.row}>
+                      <div className={styles.rowText}>
+                        <div className={styles.rowName}>主题配色</div>
+                        <div className={styles.rowDesc}>6 套强调色，与明暗模式叠加生效</div>
+                      </div>
+                      <select
+                        className={styles.select}
+                        value={theme.palette}
+                        onChange={(e) => theme.setPalette(e.target.value as ColorPalette)}
+                      >
+                        {PALETTE_OPTIONS.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.name}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </>
