@@ -226,7 +226,6 @@ pub fn apply_stream_headers(
     let builder = builder
         .header("User-Agent", default_ua)
         .header("Accept", "video/x-flv,application/octet-stream,*/*")
-        .header("Range", "bytes=0-")
         .header("Connection", "keep-alive");
 
     if url.contains("huya.com") || url.contains("hy-cdn.com") || url.contains("huyaimg.com") {

@@ -1416,6 +1416,27 @@ export function MainPlayer({
         return;
       }
 
+      // ===== 追帧：落后 live edge 太远时跳到缓冲末尾 =====
+      // 直播播放器一旦因网络抖动落后 live edge，会一直维持这个延迟不回头。
+      // 其他直播软件（网页版虎牙/斗鱼）会在落后时 seek 追上。
+      // 只在缓冲确实有数据、播放器确实在播、且落后超过阈值时才追，
+      // 追到 buffered.end() − 2s 处（保留 2s 缓冲吸收后续抖动）。
+      // 6s 阈值是刻意保守的：正常直播的缓冲余量在 1~5s 之间，
+      // 超过 6s 说明确实积累了额外延迟，值得用一次跳换来归位。
+      if (playing && bufferedEnd > 0 && video.currentTime > 0) {
+        const behindLiveEdge = bufferedEnd - video.currentTime;
+        if (behindLiveEdge > 6) {
+          const target = Math.max(0, bufferedEnd - 2);
+          console.info(
+            `[Player] 追帧：落后 live edge ${behindLiveEdge.toFixed(1)}s，跳至 ${target.toFixed(1)}s`
+          );
+          video.currentTime = target;
+          lastProgressRef.current = { time: target, at: now };
+          lastBufferedRef.current = { end: bufferedEnd, at: now };
+          return;
+        }
+      }
+
       // ===== ★ 主判据：缓冲是否仍在增长 =====
       // 还在增长 = 收流解码链路全通 = 一切正常，哪怕画面完全静止。
       if (bufferedEnd >= 0) {
@@ -2316,9 +2337,15 @@ export function MainPlayer({
           cors: true,
           autoCleanupSourceBuffer: true,
           enableWorker: true,
-          stashInitialSize: 128,
-          lazyLoad: true,
-          lazyLoadMaxDuration: 30,
+          // ★ 128 → 384（xgplayer-flv 默认值）。
+          //   128KB 只有约 0.5~1 秒的抖动余量，网络微波动就掉帧；
+          //   384KB 是库的默认值，牺牲 ~0.3s 起播时间换稳定缓冲，值得。
+          stashInitialSize: 384,
+          // ★ 直播禁用 lazyLoad。
+          //   lazyLoad 在缓冲达到阈值时暂停拉流、低于阈值恢复——对直播形成
+          //   锯齿状缓冲，产生周期性微卡顿。直播数据以 1x 实时速率到达，
+          //   缓冲天然稳定在 1~5 秒，无需懒加载。VOD 场景该选项才有意义。
+          lazyLoad: false,
           deferLoadAfterSourceOpen: true,
           // ===== 弱网 / 断流重连（关键修复）=====
           // xgplayer-flv 的 disconnectRetryCount 默认是 0 —— 也就是「直播流一旦断开就再也不重试」，
